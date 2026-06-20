@@ -45,6 +45,7 @@ variable-length segment is future work).
 - `unwrap()` / `expect()` are banned. Propagate errors with the `?` operator.
 - No `unsafe` (the codebase currently has none).
 - Comment only non-obvious WHY. Do not write WHAT.
+- **Write all code comments in English** (doc comments and inline comments alike).
 
 ### Storage-layer notes
 - Page size is **fixed at 4096 bytes**.
