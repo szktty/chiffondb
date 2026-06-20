@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "start": {
+    "type": "Node",
+    "label": "User",
+    "key": "id",
+    "value": "user_alice"
+  },
+  "steps": [
+    {
+      "action": "OutEdges",
+      "label": "OWNS",
+      "filter": null
+    },
+    {
+      "action": "OutNodes",
+      "label": "Project",
+      "filter": {
+        "property": "isArchived",
+        "operator": "Equals",
+        "value": false
+      }
+    }
+  ],
+  "collect": {
+    "type": "Nodes",
+    "properties": ["id", "title"]
+  }
+}

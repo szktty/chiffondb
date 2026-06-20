@@ -1,0 +1,62 @@
+// Whitespace and comments are skipped automatically
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }
+
+// --- Top level ---
+schema = { SOI ~ definition* ~ EOI }
+
+definition = { node_def | edge_def }
+
+// --- Node definition ---
+node_def = {
+    "node" ~ ident ~ type_params? ~ extends_clause? ~ "{" ~ field_def* ~ "}"
+}
+
+extends_clause = { "extends" ~ ident }
+
+// --- Edge definition ---
+edge_def = {
+    "edge" ~ ident ~ generic_params? ~ "{" ~ edge_from ~ edge_to ~ props_block? ~ "}"
+}
+
+edge_from = { "from" ~ ":" ~ type_expr }
+edge_to   = { "to"   ~ ":" ~ type_expr }
+
+props_block = { "props" ~ ":" ~ "{" ~ field_def* ~ "}" }
+
+// --- Field definition ---
+field_def = { ident ~ ":" ~ type_expr }
+
+// --- Type expressions ---
+type_expr = {
+    vector_type
+  | list_type
+  | map_type
+  | node_ref_type
+  | edge_ref_type
+  | primitive_type
+  | ident
+}
+
+primitive_type = {
+    "Int" | "Float" | "Boolean" | "DateTime" | "String" | "Json" | "Blob"
+}
+
+vector_type   = { "Vector" ~ "<" ~ integer ~ ">" }
+list_type     = { "List"   ~ "<" ~ type_expr ~ ">" }
+map_type      = { "Map"    ~ "<" ~ type_expr ~ "," ~ type_expr ~ ">" }
+node_ref_type = { "NodeRef" ~ "<" ~ ident ~ ">" }
+edge_ref_type = { "EdgeRef" ~ "<" ~ ident ~ ">" }
+
+// --- Generics ---
+// For nodes: type parameters like <K, V> (without bounds)
+type_params = { "<" ~ type_param ~ ("," ~ type_param)* ~ ">" }
+type_param  = { ident }
+
+// For edges: bounded type parameters like <T: BoundType>
+generic_params = { "<" ~ bound_param ~ ("," ~ bound_param)* ~ ">" }
+bound_param    = { ident ~ (":" ~ ident)? }
+
+// --- Primitives ---
+ident   = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+integer = @{ ASCII_DIGIT+ }

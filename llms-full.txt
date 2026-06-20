@@ -1,0 +1,1287 @@
+# ChiffonDB Complete Reference
+
+Version: 2026-06-20
+Tests: 270
+
+---
+
+## 1. Overview
+
+ChiffonDB is an **embedded, schema-driven graph DBMS** designed for code implementation by
+LLM/AI agents, targeting consumer desktop and mobile applications. Written in pure Rust.
+
+### Design highlights
+
+- **Single file (.chiffon)**: all data in one file. Easy to distribute and back up.
+- **Schema-driven**: type/field names not present in the schema can be detected at compile time.
+  Eliminates hallucination.
+- **Crash-safe**: writes go through a WAL (Write-Ahead Log). Data survives power loss.
+- **Multiple labels**: nodes/edges can carry multiple types (labels).
+- **In-memory mode**: `open_in_memory()` runs entirely in memory without creating a file.
+- **Low memory footprint (bounded)**: all on-disk data (property/blob pages and topology
+  node/edge records) is read and written through a fixed-size LRU page cache (SQLite-pcache
+  style), with no in-memory index that grows with the data. Resident memory plateaus at the
+  cache budget regardless of database size (default 4 MiB, configurable via
+  `open_with_max_memory` / `create_with_max_memory`).
+
+### Crate layout
+
+```
+chiffondb/        Public crate: library + CLI binary (the `chiffon` command)
+chiffondb-core/   Storage / schema / traversal engine (library)
+```
+
+---
+
+## 2. Schema DSL
+
+Schema files use the `.graph` extension. UTF-8 text.
+
+### 2.1 Node definition
+
+```
+node User {
+    id: String
+    name: String
+    isActive: Boolean
+    score: Float
+    createdAt: DateTime
+    tags: List<String>
+    metadata: Json
+}
+```
+
+### 2.2 Edge definition
+
+```
+edge OWNS {
+    from: User
+    to: Project
+    props: {
+        role: String
+        grantedAt: DateTime
+    }
+}
+```
+
+The `props` block may be omitted when an edge has no properties.
+
+### 2.3 Edge with generics
+
+```
+edge AUTHORED<T: User> {
+    from: T
+    to: Document
+    props: {
+        contributionScore: Float
+    }
+}
+```
+
+### 2.4 Inheritance
+
+```
+node Admin extends User {
+    permissions: List<String>
+}
+```
+
+### 2.5 Type list
+
+| Type | Description | JSON representation |
+|------|-------------|---------------------|
+| `String` | UTF-8 text | `"hello"` |
+| `Int` | i64 integer | `42` |
+| `Float` | f64 floating point | `3.14` |
+| `Boolean` | boolean | `true` / `false` |
+| `DateTime` | UNIX milliseconds (i64) | `1700000000000` |
+| `Json` | arbitrary JSON value | `{"key": "val"}` |
+| `Blob` | binary (Base64) | `"base64string"` |
+| `List<T>` | array of primitives | `[1, 2, 3]` |
+| `Map<K, V>` | key-value map | `{"a": 1}` |
+| `Vector<N>` | N-dimensional vector (reserved) | - |
+| `NodeRef<T>` | reference to a node of a given type | RecordId |
+| `EdgeRef<T>` | reference to an edge of a given type | RecordId |
+
+### 2.6 Schema change policy
+
+**Allowed changes (validation passes on apply):**
+- Adding node/edge types
+- Adding fields (existing records have that field empty)
+- Removing fields (existing data stays in the property page but is ignored on read)
+
+**Forbidden changes (error on apply):**
+- Changing a field's type
+- Renaming a type
+- Changing an edge's `from`/`to`
+
+`schema_version` is incremented on each schema change.
+
+### 2.7 Multiple labels
+
+Nodes/edges can carry multiple types (labels).
+
+```
+# Insert a node that is both User and Admin
+insert_node_with_label_names(primary: "User", additional: ["Admin"], props: {...})
+
+# Add/remove labels later
+add_node_label_by_name(rid, "Admin")
+remove_node_label_by_name(rid, "Admin")
+```
+
+---
+
+## 3. CLI commands
+
+### 3.1 Basic syntax
+
+```
+chiffon <subcommand> [options]
+```
+
+### 3.2 Command list
+
+#### `chiffon init`
+
+Create a new DB file.
+
+```bash
+chiffon init --db path/to/mydb.chiffon
+```
+
+#### `chiffon schema apply`
+
+Apply a schema file to the DB. Errors on a change-policy violation.
+
+```bash
+chiffon schema apply --db mydb.chiffon --schema schema.graph
+```
+
+#### `chiffon schema show`
+
+Show the currently applied schema.
+
+```bash
+chiffon schema show --db mydb.chiffon
+```
+
+#### `chiffon node add`
+
+Insert a node.
+
+```bash
+chiffon node add --db mydb.chiffon --type User --props '{"id":"u1","name":"Alice"}'
+```
+
+Example output:
+```
+Node inserted: page=1 slot=0
+```
+
+#### `chiffon edge add`
+
+Insert an edge. Specify the source/destination nodes by RecordId.
+
+```bash
+chiffon edge add \
+  --db mydb.chiffon \
+  --type OWNS \
+  --from-page 1 --from-slot 0 \
+  --to-page 1 --to-slot 1 \
+  --props '{"role":"owner"}'
+```
+
+#### `chiffon query`
+
+Run a JSON AST query and return the result.
+
+```bash
+chiffon query --db mydb.chiffon --json query.json
+chiffon query --db mydb.chiffon --json -          # read from stdin
+```
+
+Output (Rows):
+```json
+{
+  "success": true,
+  "results": [{"id": "p1", "title": "Alpha"}]
+}
+```
+
+Output (Count):
+```json
+{
+  "success": true,
+  "count": 42
+}
+```
+
+#### `chiffon info`
+
+Show metadata about a DB file.
+
+```bash
+chiffon info --db mydb.chiffon
+```
+
+Example output:
+```
+File: mydb.chiffon
+Version: 1
+Page size: 4096 bytes
+Total pages: 128
+Schema version: 3
+```
+
+#### `chiffon import`
+
+Bulk-import nodes/edges from a CSV or JSON file.
+
+```bash
+chiffon import --db mydb.chiffon --format csv nodes.csv
+chiffon import --db mydb.chiffon --format csv --id-prop id edges.csv
+chiffon import --db mydb.chiffon --format json data.json
+chiffon import --db mydb.chiffon --format json -   # read from stdin
+```
+
+| Option | Description |
+|--------|-------------|
+| `--format csv\|json` | input format (required) |
+| `--id-prop <prop>` | the node property an edge's `:FROM`/`:TO` references (default: `id`) |
+
+#### `chiffon export`
+
+Export nodes/edges to a CSV or JSON file.
+
+```bash
+chiffon export --db mydb.chiffon --format csv --type User --out users.csv
+chiffon export --db mydb.chiffon --format json --out data.json
+chiffon export --db mydb.chiffon --format json   # to stdout
+```
+
+| Option | Description |
+|--------|-------------|
+| `--format csv\|json` | output format (required) |
+| `--type <type>` | target type name (required for CSV; if omitted for JSON, exports all data) |
+| `--out <file>` | output file path (stdout if omitted) |
+
+---
+
+## 4. Traversal queries (JSON AST)
+
+A query is passed as a JSON object via a file or stdin.
+
+### 4.1 Basic structure
+
+```json
+{
+  "version": 1,
+  "bindings": {},
+  "start": { ... },
+  "steps": [ ... ],
+  "collect": { ... }
+}
+```
+
+### 4.2 start (specifying the start node)
+
+#### Start from a specific node
+
+```json
+"start": {
+  "type": "Node",
+  "label": "User",
+  "key": "id",
+  "value": "user_123"
+}
+```
+
+#### Start from all nodes of a type
+
+```json
+"start": {
+  "type": "AllNodes",
+  "label": "User",
+  "key": "",
+  "value": null
+}
+```
+
+#### Use a bind variable
+
+```json
+"bindings": { "uid": "user_123" },
+"start": {
+  "type": "Node",
+  "label": "User",
+  "key": "id",
+  "value": { "$bind": "uid" }
+}
+```
+
+### 4.3 steps (traversal steps)
+
+Each step specifies its behavior via the `action` field. All fields are optional (specify only
+what you need).
+
+#### Movement actions
+
+| action | Description | Required fields |
+|--------|-------------|-----------------|
+| `OutEdges` | move to edges leaving the current node | `label` (omit for all edges) |
+| `InEdges` | move to edges entering the current node | `label` |
+| `BothEdges` | move to both incoming and outgoing edges | `label` |
+| `OutNodes` | move to the destination node of the current edge | `label` |
+| `InNodes` | move to the source node of the current edge | `label` |
+| `BothNodes` | move to both endpoint nodes of the edge | `label` |
+
+#### Filter/transform actions
+
+| action | Description | Required fields |
+|--------|-------------|-----------------|
+| `Filter` | filter by property condition | `filter` or `compound_filter` or `custom_filter` or `any_key_contains` |
+| `HasLabel` | keep only those with the given labels | `labels: [...]` |
+| `Dedup` | remove duplicate RecordIds | none |
+| `Limit` | keep at most N | `count: N` |
+| `Skip` | skip the first N | `skip: N` |
+| `OrderBy` | sort by property | `order_by: {"key": "score", "direction": "Desc"}` |
+| `Repeat` | repeat a step sequence up to N times (BFS) | `repeat_steps: [...]`, `max_depth: N` |
+
+#### Step examples
+
+```json
+{ "action": "OutEdges", "label": "OWNS" }
+{ "action": "OutNodes", "label": "Project" }
+{ "action": "Filter", "filter": { "property": "isArchived", "operator": "Equals", "value": false } }
+{ "action": "HasLabel", "labels": ["Admin"] }
+{ "action": "Dedup" }
+{ "action": "OrderBy", "order_by": { "key": "score", "direction": "Desc" } }
+{ "action": "Skip", "skip": 10 }
+{ "action": "Limit", "count": 5 }
+{ "action": "Filter", "any_key_contains": "Alice" }
+```
+
+#### Repeat example (friends-of-friends, up to 3 hops)
+
+```json
+{
+  "action": "Repeat",
+  "max_depth": 3,
+  "repeat_steps": [
+    { "action": "OutEdges", "label": "FRIENDS" },
+    { "action": "OutNodes", "label": "User" }
+  ]
+}
+```
+
+### 4.4 filter (simple filter)
+
+```json
+"filter": {
+  "property": "property name",
+  "operator": "operator",
+  "value": comparison value
+}
+```
+
+#### Operators
+
+| Operator | Description | value type |
+|----------|-------------|------------|
+| `Equals` | exact match | any |
+| `NotEquals` | not equal | any |
+| `GreaterThan` | greater than | number or string |
+| `LessThan` | less than | number or string |
+| `GreaterThanOrEquals` | greater or equal | number or string |
+| `LessThanOrEquals` | less or equal | number or string |
+| `Contains` | substring match | string |
+| `StartsWith` | prefix match | string |
+| `EndsWith` | suffix match | string |
+| `Matches` | regex match | regex string |
+| `Exists` | field exists and is non-null | (value ignored) |
+| `IsNull` | field missing or null | (value ignored) |
+| `PropertyEquals` | equal to another field | `{"type":"property","key":"other field"}` |
+| `PropertyGreaterThan` | greater than another field | `{"type":"property","key":"other field"}` |
+| `PropertyLessThan` | less than another field | `{"type":"property","key":"other field"}` |
+
+#### any_key_contains (substring match across all string properties)
+
+A special filter usable alongside `filter` / `compound_filter`. Searches all String-typed
+properties and keeps nodes/edges where any of them contains the substring. Case-insensitive.
+Non-string properties (Int/Boolean, etc.) are ignored.
+
+```json
+{ "action": "Filter", "any_key_contains": "alice" }
+```
+
+#### Kinds of filter value
+
+1. **Literal**: `"Alice"`, `42`, `false`, `null`
+2. **Bind variable**: `{ "$bind": "name" }` — resolved from the command's `bindings`
+3. **Property reference**: `{ "type": "property", "key": "other field" }` — another field of the
+   same node/edge
+
+#### Simple filter examples
+
+```json
+{ "property": "name", "operator": "Equals", "value": "Alice" }
+{ "property": "age",  "operator": "GreaterThan", "value": 18 }
+{ "property": "name", "operator": "Matches", "value": "^A.*e$" }
+{ "property": "score","operator": "Exists" }
+{ "property": "deletedAt", "operator": "IsNull" }
+{ "property": "age",  "operator": "PropertyGreaterThan", "value": { "type": "property", "key": "minAge" } }
+{ "property": "score","operator": "GreaterThan", "value": { "$bind": "threshold" } }
+```
+
+### 4.5 compound_filter
+
+```json
+"compound_filter": {
+  "operator": "And",
+  "filters": [
+    { "property": "age", "operator": "GreaterThan", "value": 18 },
+    { "property": "isActive", "operator": "Equals", "value": true }
+  ]
+}
+```
+
+| operator | Description |
+|----------|-------------|
+| `And` | true if all filters are true |
+| `Or` | true if any filter is true |
+| `Not` | true if the filter is false (uses the `"filter": {...}` field) |
+
+#### Nested example (And + Or)
+
+```json
+"compound_filter": {
+  "operator": "And",
+  "filters": [
+    { "property": "isActive", "operator": "Equals", "value": true },
+    {
+      "operator": "Or",
+      "filters": [
+        { "property": "role", "operator": "Equals", "value": "admin" },
+        { "property": "role", "operator": "Equals", "value": "owner" }
+      ]
+    }
+  ]
+}
+```
+
+#### Not example
+
+```json
+"compound_filter": {
+  "operator": "Not",
+  "filter": { "property": "status", "operator": "Equals", "value": "archived" }
+}
+```
+
+### 4.6 custom_filter (batch-style)
+
+The application can evaluate arbitrary logic. A batch style: candidate node properties are
+passed in bulk, and the list of passing RecordIds is returned.
+
+```json
+"custom_filter": { "callback_id": "my_filter_name" }
+```
+
+Override `GraphAccess::apply_custom_filter` to implement it (the default passes everything
+through). `callback_id` selects among multiple filter logics.
+
+### 4.7 collect (collecting results)
+
+#### Get node properties
+
+```json
+"collect": {
+  "type": "Nodes",
+  "properties": ["id", "name", "score"]
+}
+```
+
+If `properties` is empty, all properties are returned.
+
+#### Get a count
+
+```json
+"collect": {
+  "type": "Count"
+}
+```
+
+### 4.8 Full query examples
+
+#### Example 1: non-archived projects owned by Alice
+
+```json
+{
+  "version": 1,
+  "start": {
+    "type": "Node",
+    "label": "User",
+    "key": "id",
+    "value": "alice"
+  },
+  "steps": [
+    { "action": "OutEdges", "label": "OWNS" },
+    {
+      "action": "OutNodes",
+      "label": "Project",
+      "filter": { "property": "isArchived", "operator": "Equals", "value": false }
+    }
+  ],
+  "collect": {
+    "type": "Nodes",
+    "properties": ["id", "title"]
+  }
+}
+```
+
+#### Example 2: dynamic query with bind variables
+
+```json
+{
+  "version": 1,
+  "bindings": {
+    "userId": "alice",
+    "minScore": 80
+  },
+  "start": {
+    "type": "Node",
+    "label": "User",
+    "key": "id",
+    "value": { "$bind": "userId" }
+  },
+  "steps": [
+    { "action": "OutEdges", "label": "AUTHORED" },
+    {
+      "action": "OutNodes",
+      "label": "Document",
+      "filter": {
+        "property": "score",
+        "operator": "GreaterThan",
+        "value": { "$bind": "minScore" }
+      }
+    },
+    { "action": "OrderBy", "order_by": { "key": "score", "direction": "Desc" } },
+    { "action": "Limit", "count": 10 }
+  ],
+  "collect": {
+    "type": "Nodes",
+    "properties": ["id", "title", "score"]
+  }
+}
+```
+
+#### Example 3: count of all Users with isActive=true
+
+```json
+{
+  "version": 1,
+  "start": {
+    "type": "AllNodes",
+    "label": "User",
+    "key": "",
+    "value": null
+  },
+  "steps": [
+    {
+      "action": "Filter",
+      "filter": { "property": "isActive", "operator": "Equals", "value": true }
+    }
+  ],
+  "collect": { "type": "Count" }
+}
+```
+
+#### Example 4: friends-of-friends (up to 2 hops)
+
+```json
+{
+  "version": 1,
+  "start": {
+    "type": "Node",
+    "label": "User",
+    "key": "id",
+    "value": "alice"
+  },
+  "steps": [
+    {
+      "action": "Repeat",
+      "max_depth": 2,
+      "repeat_steps": [
+        { "action": "OutEdges", "label": "FRIENDS" },
+        { "action": "OutNodes", "label": "User" }
+      ]
+    },
+    { "action": "Dedup" }
+  ],
+  "collect": {
+    "type": "Nodes",
+    "properties": ["id", "name"]
+  }
+}
+```
+
+#### Example 5: pagination
+
+```json
+{
+  "version": 1,
+  "start": { "type": "AllNodes", "label": "Product", "key": "", "value": null },
+  "steps": [
+    { "action": "OrderBy", "order_by": { "key": "price", "direction": "Asc" } },
+    { "action": "Skip",  "skip": 20 },
+    { "action": "Limit", "count": 10 }
+  ],
+  "collect": { "type": "Nodes", "properties": ["id", "name", "price"] }
+}
+```
+
+---
+
+## 5. Rust API (chiffondb-core)
+
+### 5.1 Database
+
+#### Create / open
+
+```rust
+// File backend
+let db = Database::create(Path::new("mydb.chiffon"))?;
+let db = Database::open(Path::new("mydb.chiffon"))?;
+
+// In-memory (no file)
+let db = Database::open_in_memory()?;
+```
+
+#### Schema operations
+
+```rust
+// Apply a schema (parse + validate + save in one call)
+db.apply_schema(schema_text)?;
+
+// Get the schema registry
+let registry = db.load_schema_registry()?;
+let type_id = registry.node_type_id("User").unwrap();
+let type_name = registry.node_type_name(type_id).unwrap();
+
+// Get the schema as DSL text
+let text = db.get_schema_text()?;
+```
+
+#### Node operations
+
+```rust
+// Insert by type ID
+let rid = db.insert_node(type_id, props)?;
+
+// Insert by type name (requires a schema)
+let rid = db.insert_node_by_name("User", props)?;
+
+// Insert with multiple labels (by type name)
+let rid = db.insert_node_with_label_names("User", vec!["Admin"], props)?;
+
+// Read properties
+let props = db.get_node_properties(rid)?;
+
+// Update properties (overwrites existing values)
+db.update_node_properties(rid, new_props)?;
+
+// Delete (cascades to associated edges)
+db.delete_node(rid)?;
+
+// List (Some("type") filters by type, None for all). Both scan the topology
+// through the bounded page cache (there is no in-memory index).
+let list = db.list_nodes(Some("User"))?; // Vec<(RecordId, HashMap<String, Value>)>
+
+// Label operations
+let labels = db.get_node_label_names(rid)?; // Vec<String>
+db.add_node_label_by_name(rid, "Admin")?;
+db.remove_node_label_by_name(rid, "Admin")?;
+
+// Get the type name
+let type_name = db.get_node_type_name(rid)?;
+
+// Existence check (&self; no mutable borrow needed)
+let exists: bool = db.node_exists(rid);
+
+// Count (count only, without fetching everything)
+let n: u64 = db.count_nodes(None)?;            // all nodes
+let n: u64 = db.count_nodes(Some("User"))?;    // type filter
+
+// Patch update (overwrite only the given keys; keep the rest)
+db.patch_node_properties(rid, patch_props)?;
+```
+
+#### Edge operations
+
+```rust
+let eid = db.insert_edge(type_id, from_rid, to_rid, props)?;
+let eid = db.insert_edge_by_name("OWNS", from_rid, to_rid, props)?;
+let props = db.get_edge_properties(eid)?;
+db.update_edge_properties(eid, new_props)?;
+db.delete_edge(eid)?;
+let list = db.list_edges(Some("OWNS"))?;
+let labels = db.get_edge_label_names(eid)?;
+db.add_edge_label_by_name(eid, "MANAGES")?;
+db.remove_edge_label_by_name(eid, "MANAGES")?;
+let (from_rid, to_rid) = db.get_edge_endpoints(eid)?;
+let type_name = db.get_edge_type_name(eid)?;
+
+// Existence check
+let exists: bool = db.edge_exists(eid);
+
+// Count
+let n: u64 = db.count_edges(None)?;
+let n: u64 = db.count_edges(Some("OWNS"))?;
+
+// Patch update
+db.patch_edge_properties(eid, patch_props)?;
+```
+
+#### Schema queries
+
+```rust
+// Type-name lists
+let node_types: Vec<String> = db.node_type_names()?;
+let edge_types: Vec<String> = db.edge_type_names()?;
+
+// Property definitions (Ok(None) if the type does not exist)
+let schema: Option<NodeTypeSchema> = db.node_type_schema("User")?;
+let schema: Option<EdgeTypeSchema> = db.edge_type_schema("OWNS")?;
+
+// Structure of NodeTypeSchema / EdgeTypeSchema
+pub struct NodeTypeSchema {
+    pub name: String,
+    pub properties: Vec<PropertyDef>,
+}
+pub struct PropertyDef {
+    pub name: String,
+    pub value_type: String,  // "String", "Int", "Float", "Boolean", "DateTime", ...
+    pub nullable: bool,
+}
+```
+
+#### Running a traversal
+
+```rust
+let view = DatabaseGraphView::load(&mut db)?;
+let cmd: TraversalCommand = serde_json::from_str(json_str)?;
+let result = execute(&view, &cmd)?;
+
+match result {
+    CollectResult::Rows(rows) => {
+        for row in rows {
+            println!("{:?}", row);
+        }
+    }
+    CollectResult::Count(n) => println!("count: {}", n),
+}
+```
+
+#### Persistence / operations
+
+```rust
+// Checkpoint the WAL into the main file and sync
+db.flush()?;
+
+// VACUUM (physically remove deleted slots)
+// In-memory DB
+db.vacuum()?;
+// File backend
+Database::vacuum_file(Path::new("mydb.chiffon"))?;
+
+// Integrity check (any warnings indicate a problem)
+let warnings = db.verify()?;
+if !warnings.is_empty() {
+    for w in &warnings { eprintln!("WARNING: {}", w); }
+}
+```
+
+### 5.2 Transactions
+
+Begin a transaction with `Connection::begin()`. `commit()` to finalize; `rollback()` or drop to
+discard.
+
+```rust
+// Basic pattern
+let mut tx = conn.begin();
+tx.insert_node("Person".to_string(), props_json)?;
+tx.insert_edge("FOLLOWS".to_string(), from, to, "{}".to_string())?;
+tx.commit()?;  // finalize
+
+// Rollback
+let mut tx = conn.begin();
+tx.insert_node(...)?;
+tx.rollback();  // discard (conn returns to its pre-begin state)
+
+// Drop also auto-rolls-back
+{
+    let mut tx = conn.begin();
+    tx.insert_node(...)?;
+    // tx dropped here → auto rollback
+}
+```
+
+**Methods available on Transaction (delegated to the corresponding Connection methods):**
+
+| Method | Description |
+|--------|-------------|
+| `insert_node` / `insert_edge` | insert |
+| `delete_node` / `delete_edge` | delete |
+| `update_node_properties` / `update_edge_properties` | full-replace update |
+| `patch_node_properties` / `patch_edge_properties` | patch update |
+| `get_node_properties` / `get_edge_properties` | read |
+| `list_nodes` / `list_edges` | list |
+| `node_exists` / `edge_exists` | existence check |
+| `count_nodes` / `count_edges` | count |
+| `apply_schema` | apply schema |
+
+**Implementation (WAL-truncate based):**
+- At `begin()`, snapshot the WAL file length, the logical page count, and the in-memory header
+  (`TopologyStore` is file-backed with O(1) metadata only; there is no in-memory index).
+- Writes are write-through to the WAL, so on `rollback()` / drop the WAL is truncated back to
+  the snapshot length and the page cache is cleared, reverting the changes.
+- `commit()` just discards the snapshot; no extra I/O.
+- `Connection` is exclusively held by one `Transaction` via `&mut self`, so concurrent
+  transactions on the same `Connection` are prevented at compile time.
+
+### 5.3 Shortest-path API
+
+ChiffonDB runs BFS from the Rust side over the on-disk adjacency lists.
+
+#### Rust API
+
+```rust
+use crate::pathfinding::{PathOptions, PathDirection, PathResult, ConnectingSubgraph};
+
+// Shortest path (BFS, unweighted)
+let result = db.shortest_path(
+    from_rid,
+    to_rid,
+    PathOptions {
+        max_depth: 10,
+        direction: PathDirection::Both,
+        edge_type_ids: None, // None = all edges. Some(vec![type_id]) to filter
+    },
+)?;
+
+if let Some(path) = result {
+    // path.node_rids: Vec<RecordId> — start → end order
+    // path.edge_rids: Vec<RecordId> — edges along the path
+}
+
+// Connecting subgraph among multiple nodes (for path highlighting)
+let subgraph = db.connecting_subgraph(
+    vec![rid1, rid2, rid3],
+    PathOptions { max_depth: 10, direction: PathDirection::Both, edge_type_ids: None },
+)?;
+// subgraph.node_rids, subgraph.edge_rids
+```
+
+**Note**: `PathOptions::edge_type_ids` takes a `Vec<u16>` of type IDs (not names). Convert names
+to IDs with `SchemaRegistry::edge_type_id()`.
+
+#### PathOptions
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_depth` | 10 | maximum hop count |
+| `direction` | `Both` | `Outgoing` / `Incoming` / `Both` |
+| `edge_type_ids` | `None` (all edges) | filter by target edge type IDs. Convert names with `SchemaRegistry::edge_type_id()` |
+
+### 5.4 RecordId
+
+```rust
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RecordId {
+    pub page_id: PageId,  // u32
+    pub slot_id: SlotId,  // u16
+}
+
+// JSON representation
+// { "page": 1, "slot": 0 }
+```
+
+### 5.5 Error type
+
+```rust
+pub enum GraphError {
+    NodeNotFound(String),
+    EdgeNotFound(String),
+    SchemaError(String),                              // includes schema-change-policy violations
+    StorageCorrupted(u32),                            // page_id
+    UnsupportedVersion { found: u32, supported: u32 },// unsupported format version
+    CapacityExceeded { kind: &'static str, needed: usize, available: usize }, // topology segment full
+    InvalidCommand(String),
+    TypeMismatch { expected: String, actual: String },
+    ValidationError(String),
+    Io(std::io::Error),
+}
+```
+
+Defined with `thiserror`. Propagated with the `?` operator.
+
+### 5.6 Implementing a custom filter
+
+Implement the `GraphAccess` trait and override `apply_custom_filter`.
+
+```rust
+impl GraphAccess for MyGraph {
+    // ... other methods ...
+
+    fn apply_custom_filter(
+        &self,
+        callback_id: &str,
+        candidates: Vec<(NodeId, HashMap<String, Value>)>,
+    ) -> Vec<NodeId> {
+        match callback_id {
+            "high_score" => candidates
+                .into_iter()
+                .filter(|(_, props)| {
+                    props.get("score")
+                        .and_then(|v| v.as_f64())
+                        .is_some_and(|s| s > 80.0)
+                })
+                .map(|(id, _)| id)
+                .collect(),
+            _ => candidates.into_iter().map(|(id, _)| id).collect(),
+        }
+    }
+}
+```
+
+---
+
+## 6. File format
+
+### 6.1 .chiffon file layout
+
+```
+Page 0  : header (magic="CHIFFON\0", version, segment starts, schema_root, schema_version)
+Page 1+ : topology segment (node pages and edge pages interleaved)
+          even relative offset = node page
+          odd relative offset  = edge page
+Page 64+: property segment (slotted-page format)
+```
+
+Defaults:
+- Topology segment start: Page 1
+- Property segment start: Page 64
+
+### 6.2 Header page (Page 0)
+
+| Field | Offset | Size | Contents |
+|-------|--------|------|----------|
+| magic | 0 | 8 bytes | `CHIFFON\0` |
+| version | 8 | 4 bytes | format version (u32 LE). Currently `3`. A mismatch is rejected at `open` with `UnsupportedVersion` (older formats are not silently misread) |
+| page_size | 12 | 4 bytes | page size (fixed 4096) |
+| topology_segment_start | 16 | 4 bytes | starting page of the topology segment (default: 1) |
+| property_segment_start | 20 | 4 bytes | starting page of the property segment (default: 64) |
+| vector_segment_start | 24 | 4 bytes | starting page of the vector segment (0 = unused) |
+| page_directory_root | 28 | 4 bytes | reserved (for a future MVCC page directory; currently always 0 / unused) |
+| schema_root | 32 | 4 bytes | page where schema information is stored |
+| schema_version | 36 | 4 bytes | u32 incremented on each schema change |
+| node_page_count | 40 | 4 bytes | number of node logical pages in use (persisted to restore the actual count on reopen) |
+| edge_page_count | 44 | 4 bytes | number of edge logical pages in use |
+| reserved | 48+ | rest | reserved for future use (zero-filled) |
+
+### 6.3 WAL file
+
+On write, data goes to `mydb.chiffon-wal` and is reflected into the main file on `flush()`.
+After a process crash, recovery runs automatically on the next `open()`.
+
+### 6.4 JSON representation of RecordId
+
+```json
+{ "page": 1, "slot": 0 }
+```
+
+`page` is u32, `slot` is u16.
+
+---
+
+## 7. Implementation guide for LLMs
+
+### 7.1 Schema design principles
+
+- Node/edge type names in PascalCase (e.g. `User`, `Project`, `OWNS`)
+- Field names in camelCase (e.g. `isActive`, `createdAt`)
+- Edge type names conventionally in UPPER_SNAKE_CASE (e.g. `OWNS`, `AUTHORED_BY`)
+- `from`/`to` may only reference node types defined in the schema
+
+### 7.2 Query-generation tips
+
+1. **Always include `version: 1`**
+2. `start.type` is either `"Node"` or `"AllNodes"`
+3. When `start.type = "AllNodes"`, `key` and `value` are ignored but required as JSON (pass an
+   empty string and null)
+4. `collect.type` is either `"Nodes"` or `"Count"`
+5. An empty `collect.properties` array `[]` **returns all properties**
+6. Steps run in order (a pipeline)
+7. The `Filter` action applies a condition to the cursor without moving
+8. Following `OutEdges` immediately with `OutNodes` is the basic pattern
+
+### 7.3 Common implementation patterns
+
+#### Pattern 1: get a specific user's related objects
+
+```json
+{
+  "version": 1,
+  "start": { "type": "Node", "label": "User", "key": "id", "value": "user_id_here" },
+  "steps": [
+    { "action": "OutEdges", "label": "EDGE_TYPE" },
+    { "action": "OutNodes", "label": "TARGET_TYPE" }
+  ],
+  "collect": { "type": "Nodes", "properties": ["id", "needed fields"] }
+}
+```
+
+#### Pattern 2: full scan + filter + pagination
+
+```json
+{
+  "version": 1,
+  "start": { "type": "AllNodes", "label": "NodeType", "key": "", "value": null },
+  "steps": [
+    { "action": "Filter", "filter": { "property": "field", "operator": "Equals", "value": value } },
+    { "action": "OrderBy", "order_by": { "key": "sortKey", "direction": "Asc" } },
+    { "action": "Skip",  "skip": (page * pageSize) },
+    { "action": "Limit", "count": pageSize }
+  ],
+  "collect": { "type": "Nodes", "properties": ["id", "display fields"] }
+}
+```
+
+#### Pattern 3: get only a count (existence check, etc.)
+
+```json
+{
+  "version": 1,
+  "start": { "type": "Node", "label": "User", "key": "id", "value": "u1" },
+  "steps": [
+    { "action": "OutEdges", "label": "EDGE_TYPE" }
+  ],
+  "collect": { "type": "Count" }
+}
+```
+
+#### Pattern 4: AND filter of multiple conditions
+
+```json
+{
+  "action": "Filter",
+  "compound_filter": {
+    "operator": "And",
+    "filters": [
+      { "property": "isActive", "operator": "Equals", "value": true },
+      { "property": "age", "operator": "GreaterThanOrEquals", "value": 18 }
+    ]
+  }
+}
+```
+
+#### Pattern 5: dynamic filter with bind variables (reusable query)
+
+```json
+{
+  "version": 1,
+  "bindings": { "status": "active", "minAge": 18 },
+  "start": { "type": "AllNodes", "label": "User", "key": "", "value": null },
+  "steps": [
+    {
+      "action": "Filter",
+      "compound_filter": {
+        "operator": "And",
+        "filters": [
+          { "property": "status", "operator": "Equals", "value": { "$bind": "status" } },
+          { "property": "age", "operator": "GreaterThanOrEquals", "value": { "$bind": "minAge" } }
+        ]
+      }
+    }
+  ],
+  "collect": { "type": "Nodes", "properties": ["id", "name"] }
+}
+```
+
+### 7.4 Error handling
+
+The CLI `query` command returns JSON even on error:
+```json
+{ "success": false, "error": "Node not found: ..." }
+```
+
+The Rust API returns `Result<CollectResult, GraphError>`. The `Connection` layer (`api`) returns
+`Result<String, String>`, with the error message in `Err(String)`.
+
+### 7.5 Constraints and notes
+
+- **`insert_node(type_id, props)` works even on a schema-less DB** (type ID given directly).
+  Operating by type name requires a schema.
+- **`list_nodes` / `find` / `count_nodes` do a full topology scan** (there is no in-memory
+  index). Resident memory does not grow (it goes through the bounded page cache), but the cost
+  is O(all nodes).
+- **Full scan is possible with an `AllNodes` start + `Filter`** in a traversal.
+- **Specify `Dedup` explicitly.** Always add `Dedup` after `BothEdges` or `Repeat` (the same
+  node can appear multiple times).
+- **Data lives only in the WAL until `flush()`.** Always `flush()` or `close()` before the app
+  exits.
+- **VACUUM rebuilds the file.** `vacuum()` is in-memory only; for a file DB use `vacuum_file(path)`.
+  No other process may have the same DB open while it runs.
+- **An in-memory DB vanishes on process exit.** For tests / transient work.
+- **`list_edges` is also a full scan.** Prefer traversal when there are many edges.
+- **Transactions auto-rollback on drop.** Writes are discarded unless `commit()` is called.
+- **`count_nodes` / `count_edges` are faster than fetching everything.** Use them instead of
+  `list_nodes` for stats display or emptiness checks.
+- **`patch_node_properties` / `patch_edge_properties` are partial updates.**
+  `update_node_properties` replaces all properties, so use patch to change a single field.
+- **Schema queries (`node_type_names`, etc.) involve file reads.** Cache the result if calling
+  repeatedly in a loop.
+
+---
+
+## 8. Import / export
+
+For data exchange with spreadsheets (Excel/Numbers, etc.) and editors. Implemented in the CLI
+layer only; chiffondb-core is untouched.
+
+### 8.1 CSV format
+
+The first column is `:TYPE` (type name). For edges, add `:FROM` / `:TO` columns. Remaining
+columns are properties. One type per file as a rule (use JSON to mix multiple types).
+
+**Node CSV example:**
+```csv
+:TYPE,id,name,isActive,createdAt
+User,u1,Alice,true,2024-01-01T00:00:00Z
+User,u2,Bob,true,2024-01-02T00:00:00Z
+```
+
+**Edge CSV example:**
+```csv
+:TYPE,:FROM,:TO,role,grantedAt
+FOLLOWS,u1,u2,friend,2024-01-03T00:00:00Z
+FOLLOWS,u2,u1,friend,2024-01-04T00:00:00Z
+```
+
+- `:FROM` / `:TO` values are matched against the referenced node's `id` property (changeable
+  with `--id-prop`) to identify the node
+- **Automatic type inference**: `true`/`false` → Boolean, integer literal → Int, decimal literal
+  → Float, ISO 8601 string → DateTime, anything else → String
+- An unknown type name is an error
+- A `:FROM` / `:TO` referencing a node not in the DB is an error
+
+### 8.2 JSON format
+
+An array format that can mix nodes and edges in one file. Property types are passed as JSON types
+directly (no conversion).
+
+**Import JSON:**
+```json
+[
+  { "type": "User", "props": { "id": "u1", "name": "Alice", "isActive": true, "createdAt": 1704067200000 } },
+  { "type": "User", "props": { "id": "u2", "name": "Bob",   "isActive": true } },
+  { "type": "FOLLOWS", "from": "u1", "to": "u2", "props": { "role": "friend" } }
+]
+```
+
+- Edge elements have `"from"` / `"to"` keys (how to distinguish them from nodes)
+- `"from"` / `"to"` values are matched against the node's `id` property (changeable with `--id-prop`)
+- A missing `"type"` key is an error
+
+**Exported JSON:**
+```json
+[
+  { "type": "User", "rid": { "page": 1, "slot": 0 }, "props": { "id": "u1", "name": "Alice", "isActive": true } },
+  { "type": "User", "rid": { "page": 1, "slot": 1 }, "props": { "id": "u2", "name": "Bob",   "isActive": true } },
+  { "type": "FOLLOWS", "rid": { "page": 2, "slot": 0 }, "from": "u1", "to": "u2", "props": { "role": "friend" } }
+]
+```
+
+Export emits nodes first, then edges.
+
+### 8.3 Typical workflows
+
+#### Import from a spreadsheet
+
+```bash
+# 1. Prepare a DB with a schema applied
+chiffon init --db app.chiffon
+chiffon schema apply --db app.chiffon --schema schema.graph
+
+# 2. Import nodes (users.csv authored in a spreadsheet)
+chiffon import --db app.chiffon --format csv users.csv
+
+# 3. Import edges (follows.csv authored in a spreadsheet)
+chiffon import --db app.chiffon --format csv follows.csv
+
+# 4. Check
+chiffon info --db app.chiffon
+```
+
+#### Backup / restore via JSON
+
+```bash
+# Export all data
+chiffon export --db app.chiffon --format json --out backup.json
+
+# Restore into another DB
+chiffon init --db restored.chiffon
+chiffon schema apply --db restored.chiffon --schema schema.graph
+chiffon import --db restored.chiffon --format json backup.json
+```
+
+### 8.4 Constraints and notes
+
+- **Import is append-only.** No dedup against existing nodes (a node with the same `id` property
+  is inserted twice). To avoid duplicates, reset the DB before import or manage it in the app.
+- **CSV `:FROM` / `:TO` resolution depends on import order.** Referenced nodes must already exist
+  in the DB before importing the edge CSV.
+- **CSV is one type per file.** To mix types in one file, use the JSON format.
+- **DateTime in CSV is an ISO 8601 string** (e.g. `2024-01-01T00:00:00Z`). Stored internally as
+  UNIX milliseconds.
+
+---
+
+## 9. Current limitations / unimplemented
+
+| Item | Status |
+|------|--------|
+| Variable-length topology segment | Not supported. The segment is fixed (`[topology_segment_start, property_segment_start)`, default Pages 1–63), so a single DB holds at most ~2000 nodes before `CapacityExceeded`. Variable-length is future work |
+| CoW / MVCC | **Not implemented.** Durability is via the WAL (write-through). `page_directory_root` is reserved for a future MVCC (always 0). Transactions (begin/commit/rollback) are WAL-truncate based, but there is no multi-version concurrency control or non-blocking reads |
+| Concurrent access | Single process, single writer/reader. An exclusive advisory lock + in-process open tracking make a second open of the same file fail |
+| Cost of `find` / `list_nodes` / `count_nodes` | O(all nodes) topology scan (through the bounded page cache) since the in-memory index was removed. A bounded cache layer, etc., is future work if performance becomes an issue |
+| `chiffon vacuum` / `chiffon verify` CLI commands | Not added (`Database::vacuum()` / `vacuum_file()` / `verify()` are implemented) |
+| Actual Vector storage/search (HNSW) | Reserved space only (post-MVP) |
+| Full-text search index | Not implemented (`Contains`, `Matches` are linear scans) |
+| Dedup / upsert on import | Not implemented (append-only) |
+| Multithreading | Not supported (single-threaded design; the caller is responsible for wrapping in `Arc<Mutex<Connection>>`) |
+
+---
+
+## 10. Glossary
+
+| Term | Description |
+|------|-------------|
+| RecordId | logical address of a node/edge composed of page ID + slot ID |
+| type_id | a u16 assigned to a schema type (numbered from 1 in definition order) |
+| topology segment | file region storing node/edge connectivity (Pages 1–63 by default) |
+| property segment | file region storing variable-length data (property values) (Pages 64+ by default) |
+| slotted page | page format with an index at the front and data packed from the end |
+| WAL | Write-Ahead Log. A log file recording changes before they are applied |
+| schema_version | a u32 counter incremented on each schema change (recorded in the header) |
+| primary label | the main type name given when creating a node/edge |
+| additional label | a type name beyond the primary (multiple allowed; serialized into a property page) |
+| bind variable | a value injectable at query time (`{ "$bind": "key" }` form) |
+| custom filter | a batch-style filter whose evaluation logic is provided by the application (a `GraphAccess` impl) |
+| VACUUM | an operation that physically removes deleted slots to compact the file |
+| `:TYPE` | the header name of the type-name column used by CSV import/export |
+| `:FROM` / `:TO` | columns in a CSV edge row holding property values identifying the edge's source/destination nodes |
+| DatabaseGraphView | a view for running traversals. `load()` builds a label map (label→type_id, etc.) by a full node/edge scan (an in-memory HashMap proportional to node count). Properties are lazy-loaded; the topology records themselves go through the bounded page cache |
+| Transaction | a transaction handle obtained from `Connection::begin()`. `commit()` to finalize, `rollback()` or drop to discard |
+| WAL-truncate rollback | the transaction implementation. At begin, snapshot the WAL file length, logical page count, and header; at rollback, truncate the WAL and clear the page cache to revert |

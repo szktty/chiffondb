@@ -1,0 +1,40 @@
+node User {
+    id: String
+    name: String
+    isActive: Boolean
+    createdAt: DateTime
+}
+
+node Project {
+    id: String
+    title: String
+    isArchived: Boolean
+}
+
+node Document {
+    id: String
+    content: String
+    embedding: Vector<384>
+}
+
+edge OWNS<T: User> {
+    from: T
+    to: Project
+    props: {
+        role: String
+        grantedAt: DateTime
+    }
+}
+
+edge AUTHORED {
+    from: User
+    to: Document
+    props: {
+        contributionScore: Float
+    }
+}
+
+edge BELONGS_TO {
+    from: Document
+    to: Project
+}

@@ -1,0 +1,21 @@
+node User {
+    id: String
+    name: String
+    isActive: Boolean
+    createdAt: DateTime
+}
+
+node Project {
+    id: String
+    title: String
+    isArchived: Boolean
+}
+
+edge OWNS {
+    from: User
+    to: Project
+    props: {
+        role: String
+        grantedAt: DateTime
+    }
+}

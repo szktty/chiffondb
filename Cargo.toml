@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "chiffondb",
+    "chiffondb-core",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/szktty/chiffondb"
+authors = ["SUZUKI Tetsuya <tetsuya.suzuki@gmail.com>"]
+keywords = ["graph", "database", "embedded", "graphdb"]
+categories = ["database-implementations"]
