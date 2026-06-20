@@ -1,7 +1,7 @@
 # ChiffonDB Complete Reference
 
-Version: 2026-06-20
-Tests: 270
+Version: 2026-06-21
+Tests: 280
 
 ---
 
@@ -804,30 +804,34 @@ if !warnings.is_empty() {
 
 ### 5.2 Transactions
 
-Begin a transaction with `Connection::begin()`. `commit()` to finalize; `rollback()` or drop to
-discard.
+Two APIs are available. Both share a single internal state machine (`Connection::pending_snapshot`).
+
+#### RAII API (type-safe, Rust-only)
+
+`Connection::begin()` returns `Result<Transaction<'_>, String>`. `commit()` to finalize;
+`rollback()` or drop to discard.
 
 ```rust
 // Basic pattern
-let mut tx = conn.begin();
+let mut tx = conn.begin()?;
 tx.insert_node("Person".to_string(), props_json)?;
 tx.insert_edge("FOLLOWS".to_string(), from, to, "{}".to_string())?;
 tx.commit()?;  // finalize
 
-// Rollback
-let mut tx = conn.begin();
+// Explicit rollback
+let mut tx = conn.begin()?;
 tx.insert_node(...)?;
-tx.rollback();  // discard (conn returns to its pre-begin state)
+tx.rollback()?;  // discard; conn returns to its pre-begin state
 
 // Drop also auto-rolls-back
 {
-    let mut tx = conn.begin();
+    let mut tx = conn.begin()?;
     tx.insert_node(...)?;
     // tx dropped here → auto rollback
 }
 ```
 
-**Methods available on Transaction (delegated to the corresponding Connection methods):**
+**Methods available on `Transaction` (delegated to `Connection`):**
 
 | Method | Description |
 |--------|-------------|
@@ -841,14 +845,30 @@ tx.rollback();  // discard (conn returns to its pre-begin state)
 | `count_nodes` / `count_edges` | count |
 | `apply_schema` | apply schema |
 
-**Implementation (WAL-truncate based):**
-- At `begin()`, snapshot the WAL file length, the logical page count, and the in-memory header
-  (`TopologyStore` is file-backed with O(1) metadata only; there is no in-memory index).
-- Writes are write-through to the WAL, so on `rollback()` / drop the WAL is truncated back to
-  the snapshot length and the page cache is cleared, reverting the changes.
-- `commit()` just discards the snapshot; no extra I/O.
-- `Connection` is exclusively held by one `Transaction` via `&mut self`, so concurrent
-  transactions on the same `Connection` are prevented at compile time.
+#### Flat API (FFI / Dart-facing)
+
+Three methods on `Connection` usable without a `Transaction` guard. These are the methods exposed
+to Dart via flutter_rust_bridge (`Transaction<'a>` cannot be made opaque due to its lifetime).
+
+```rust
+conn.begin_transaction()?;    // Err if already in progress
+conn.commit_transaction()?;   // flush; Err if no tx in progress
+conn.rollback_transaction()?; // restore snapshot; Err if no tx in progress
+```
+
+Both APIs share `Connection::pending_snapshot`. Calling `begin_transaction()` while a `Transaction`
+guard is alive is prevented at compile time (the guard holds `&mut Connection`).
+
+**`close()` behaviour:** if a transaction is pending when `close()` is called, it is automatically
+rolled back before the final flush. Uncommitted writes are never persisted on close.
+
+**Implementation (snapshot-based):**
+- At `begin_transaction()`, a lightweight snapshot of the WAL position, logical page count, and
+  header is stored in `Connection::pending_snapshot`.
+- Writes are write-through to the WAL; on rollback the WAL is truncated and the page cache is
+  cleared, reverting to the snapshot state.
+- `commit_transaction()` discards the snapshot and calls `flush()`; no extra copy I/O.
+- Nested transactions are not supported (`pending_snapshot` is `Option`, not `Vec`).
 
 ### 5.3 Shortest-path API
 
@@ -1283,5 +1303,6 @@ chiffon import --db restored.chiffon --format json backup.json
 | `:TYPE` | the header name of the type-name column used by CSV import/export |
 | `:FROM` / `:TO` | columns in a CSV edge row holding property values identifying the edge's source/destination nodes |
 | DatabaseGraphView | a view for running traversals. `load()` builds a label map (label→type_id, etc.) by a full node/edge scan (an in-memory HashMap proportional to node count). Properties are lazy-loaded; the topology records themselves go through the bounded page cache |
-| Transaction | a transaction handle obtained from `Connection::begin()`. `commit()` to finalize, `rollback()` or drop to discard |
+| Transaction | a RAII transaction guard obtained from `Connection::begin()?`. `commit()` to finalize, `rollback()` or drop to discard. State is held in `Connection::pending_snapshot` |
+| flat transaction API | `begin_transaction` / `commit_transaction` / `rollback_transaction` on `Connection`. FFI-facing; shares the same state machine as the RAII `Transaction` guard |
 | WAL-truncate rollback | the transaction implementation. At begin, snapshot the WAL file length, logical page count, and header; at rollback, truncate the WAL and clear the page cache to revert |
