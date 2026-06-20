@@ -21,6 +21,8 @@ pub struct NodeResult {
 
 pub struct Connection {
     inner: Option<Database>,
+    /// Snapshot held for the current pending transaction. None when idle.
+    pending_snapshot: Option<DbSnapshot>,
 }
 
 impl Connection {
@@ -33,7 +35,10 @@ impl Connection {
     /// Opens an existing database.
     pub fn open(path: String) -> Result<Connection, String> {
         Database::open(std::path::Path::new(&path))
-            .map(|db| Connection { inner: Some(db) })
+            .map(|db| Connection {
+                inner: Some(db),
+                pending_snapshot: None,
+            })
             .map_err(|e| e.to_string())
     }
 
@@ -44,14 +49,20 @@ impl Connection {
     ) -> Result<Connection, String> {
         let opts = crate::storage::file::OpenOptions { max_memory_bytes };
         Database::open_with_options(std::path::Path::new(&path), &opts)
-            .map(|db| Connection { inner: Some(db) })
+            .map(|db| Connection {
+                inner: Some(db),
+                pending_snapshot: None,
+            })
             .map_err(|e| e.to_string())
     }
 
     /// Creates a new database and opens it.
     pub fn create(path: String) -> Result<Connection, String> {
         Database::create(std::path::Path::new(&path))
-            .map(|db| Connection { inner: Some(db) })
+            .map(|db| Connection {
+                inner: Some(db),
+                pending_snapshot: None,
+            })
             .map_err(|e| e.to_string())
     }
 
@@ -62,20 +73,29 @@ impl Connection {
     ) -> Result<Connection, String> {
         let opts = crate::storage::file::OpenOptions { max_memory_bytes };
         Database::create_with_options(std::path::Path::new(&path), &opts)
-            .map(|db| Connection { inner: Some(db) })
+            .map(|db| Connection {
+                inner: Some(db),
+                pending_snapshot: None,
+            })
             .map_err(|e| e.to_string())
     }
 
     /// Opens an in-memory database (no file created).
     pub fn open_in_memory() -> Result<Connection, String> {
         Database::open_in_memory()
-            .map(|db| Connection { inner: Some(db) })
+            .map(|db| Connection {
+                inner: Some(db),
+                pending_snapshot: None,
+            })
             .map_err(|e| e.to_string())
     }
 
     /// Flushes pending writes and releases the database (file lock included).
     /// After this call the connection is closed; any further method call returns an error.
+    /// If a transaction is pending, it is rolled back before the flush.
     pub fn close(&mut self) -> Result<(), String> {
+        // Roll back any pending transaction before flushing; no-op if none is active.
+        let _ = self.rollback_transaction();
         if let Some(mut db) = self.inner.take() {
             db.flush().map_err(|e| e.to_string())?;
             // db is dropped here, releasing DatabaseFile and its file lock.
@@ -538,19 +558,45 @@ impl Connection {
         }
     }
 
-    // ---- Transaction ----
+    // ---- Transaction (flat state machine — consumed by FFI) ----
 
-    /// Begins a transaction. The transaction must be committed with `commit()` or discarded
-    /// with `rollback()`. Dropping a `Transaction` without committing automatically rolls back.
-    pub fn begin(&mut self) -> Transaction<'_> {
-        let snapshot = self
-            .db_mut()
-            .expect("connection already closed")
-            .take_snapshot();
-        Transaction {
-            conn: self,
-            snapshot: Some(snapshot),
+    /// Begins a transaction. Returns an error if one is already in progress.
+    pub fn begin_transaction(&mut self) -> Result<(), String> {
+        if self.pending_snapshot.is_some() {
+            return Err("transaction already in progress".to_string());
         }
+        let snap = self.db_mut()?.take_snapshot();
+        self.pending_snapshot = Some(snap);
+        Ok(())
+    }
+
+    /// Commits the current transaction, flushing all writes to disk.
+    pub fn commit_transaction(&mut self) -> Result<(), String> {
+        if self.pending_snapshot.take().is_none() {
+            return Err("no transaction in progress".to_string());
+        }
+        self.db_mut()?.flush().map_err(|e| e.to_string())
+    }
+
+    /// Rolls back the current transaction, restoring the pre-begin snapshot.
+    pub fn rollback_transaction(&mut self) -> Result<(), String> {
+        match self.pending_snapshot.take() {
+            None => Err("no transaction in progress".to_string()),
+            Some(snap) => {
+                self.db_mut()?.restore_snapshot(snap);
+                Ok(())
+            }
+        }
+    }
+
+    // ---- Transaction (RAII wrapper — type-safe API) ----
+
+    /// Begins a transaction and returns a `Transaction` RAII guard.
+    /// Returns an error if a transaction is already in progress.
+    /// Dropping the guard without committing automatically rolls back.
+    pub fn begin(&mut self) -> Result<Transaction<'_>, String> {
+        self.begin_transaction()?;
+        Ok(Transaction { conn: self })
     }
 }
 
@@ -560,25 +606,23 @@ impl Connection {
 ///
 /// All write operations go through the transaction. Call `commit()` to persist
 /// them, or `rollback()` (or simply drop) to discard them.
+///
+/// This is a thin RAII wrapper over `Connection::begin_transaction` /
+/// `commit_transaction` / `rollback_transaction`. The snapshot is held inside
+/// `Connection::pending_snapshot` — not here — so both APIs share a single state.
 pub struct Transaction<'a> {
     conn: &'a mut Connection,
-    snapshot: Option<DbSnapshot>,
 }
 
 impl<'a> Transaction<'a> {
     /// Commits the transaction. All writes become permanent (flushed to disk).
-    pub fn commit(mut self) -> Result<(), String> {
-        self.snapshot = None;
-        self.conn.db_mut()?.flush().map_err(|e| e.to_string())
+    pub fn commit(self) -> Result<(), String> {
+        self.conn.commit_transaction()
     }
 
     /// Rolls back the transaction, discarding all writes since `begin()`.
-    pub fn rollback(mut self) {
-        if let Some(snap) = self.snapshot.take() {
-            if let Ok(db) = self.conn.db_mut() {
-                db.restore_snapshot(snap);
-            };
-        }
+    pub fn rollback(self) -> Result<(), String> {
+        self.conn.rollback_transaction()
     }
 
     // Delegate all write (and read) methods to the inner Connection.
@@ -680,11 +724,9 @@ impl<'a> Transaction<'a> {
 
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
-        if let Some(snap) = self.snapshot.take() {
-            if let Ok(db) = self.conn.db_mut() {
-                db.restore_snapshot(snap);
-            };
-        }
+        // If already committed, pending_snapshot is None and rollback_transaction
+        // returns an error which we intentionally ignore here.
+        let _ = self.conn.rollback_transaction();
     }
 }
 
@@ -998,7 +1040,7 @@ edge FOLLOWS {
     fn transaction_commit_persists_writes() {
         let mut conn = make_connection();
         {
-            let mut tx = conn.begin();
+            let mut tx = conn.begin().expect("begin");
             tx.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
                 .expect("insert in tx");
             tx.commit().expect("commit");
@@ -1010,10 +1052,10 @@ edge FOLLOWS {
     fn transaction_rollback_discards_writes() {
         let mut conn = make_connection();
         {
-            let mut tx = conn.begin();
+            let mut tx = conn.begin().expect("begin");
             tx.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
                 .expect("insert in tx");
-            tx.rollback();
+            tx.rollback().expect("rollback");
         }
         assert_eq!(conn.count_nodes(None).unwrap(), 0);
     }
@@ -1022,7 +1064,7 @@ edge FOLLOWS {
     fn transaction_drop_rolls_back() {
         let mut conn = make_connection();
         {
-            let mut tx = conn.begin();
+            let mut tx = conn.begin().expect("begin");
             tx.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
                 .expect("insert in tx");
             // tx dropped here without commit → rollback
@@ -1038,7 +1080,7 @@ edge FOLLOWS {
             .expect("insert alice");
 
         {
-            let mut tx = conn.begin();
+            let mut tx = conn.begin().expect("begin");
             tx.delete_node(RecordId {
                 page: alice.page,
                 slot: alice.slot,
@@ -1048,7 +1090,7 @@ edge FOLLOWS {
                 page: alice.page,
                 slot: alice.slot
             }));
-            tx.rollback();
+            tx.rollback().expect("rollback");
         }
         assert!(conn.node_exists(RecordId {
             page: alice.page,
@@ -1060,7 +1102,7 @@ edge FOLLOWS {
     fn transaction_commit_batch_insert() {
         let mut conn = make_connection();
         {
-            let mut tx = conn.begin();
+            let mut tx = conn.begin().expect("begin");
             for i in 0..5 {
                 tx.insert_node("Person".to_string(), format!(r#"{{"id": "u{i}"}}"#))
                     .expect("insert");
@@ -1086,7 +1128,7 @@ edge FOLLOWS {
     fn commit_flushes_to_disk() {
         let (mut conn, path) = make_file_connection();
         {
-            let mut tx = conn.begin();
+            let mut tx = conn.begin().expect("begin");
             tx.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
                 .expect("insert in tx");
             tx.commit().expect("commit");
@@ -1102,10 +1144,10 @@ edge FOLLOWS {
     fn rollback_does_not_persist_to_disk() {
         let (mut conn, path) = make_file_connection();
         {
-            let mut tx = conn.begin();
+            let mut tx = conn.begin().expect("begin");
             tx.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
                 .expect("insert in tx");
-            tx.rollback();
+            tx.rollback().expect("rollback");
         }
         drop(conn);
 
@@ -1153,5 +1195,134 @@ edge FOLLOWS {
             result.is_err(),
             "expected second open to fail, but it succeeded"
         );
+    }
+
+    // ---- close() with pending transaction ----
+
+    #[test]
+    fn close_with_pending_transaction_discards_writes() {
+        let (mut conn, path) = make_file_connection();
+        conn.begin_transaction().expect("begin");
+        conn.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
+            .expect("insert");
+        conn.close().expect("close");
+
+        let mut conn2 = Connection::open(path.to_string_lossy().into_owned()).expect("reopen");
+        assert_eq!(conn2.count_nodes(None).unwrap(), 0);
+    }
+
+    // ---- Plan C regression tests ----
+
+    // 1. commit persists to disk (begin→insert→commit→reopen verifies count)
+    #[test]
+    fn flat_commit_persists_to_disk() {
+        let (mut conn, path) = make_file_connection();
+        conn.begin_transaction().expect("begin_transaction");
+        conn.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
+            .expect("insert");
+        conn.commit_transaction().expect("commit_transaction");
+        drop(conn);
+
+        let mut conn2 = Connection::open(path.to_string_lossy().into_owned()).expect("reopen");
+        assert_eq!(conn2.count_nodes(None).unwrap(), 1);
+    }
+
+    // 2. rollback discards writes (begin→insert→rollback→count returns 0)
+    #[test]
+    fn flat_rollback_discards_writes() {
+        let mut conn = make_connection();
+        conn.begin_transaction().expect("begin_transaction");
+        conn.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
+            .expect("insert");
+        conn.rollback_transaction().expect("rollback_transaction");
+        assert_eq!(conn.count_nodes(None).unwrap(), 0);
+    }
+
+    // 3. double begin_transaction returns an error
+    #[test]
+    fn flat_double_begin_is_error() {
+        let mut conn = make_connection();
+        conn.begin_transaction().expect("first begin_transaction");
+        let result = conn.begin_transaction();
+        assert!(
+            result.is_err(),
+            "expected error on double begin_transaction"
+        );
+    }
+
+    // 4. commit_transaction / rollback_transaction without a transaction return errors
+    #[test]
+    fn flat_commit_without_transaction_is_error() {
+        let mut conn = make_connection();
+        assert!(conn.commit_transaction().is_err());
+    }
+
+    #[test]
+    fn flat_rollback_without_transaction_is_error() {
+        let mut conn = make_connection();
+        assert!(conn.rollback_transaction().is_err());
+    }
+
+    // 5. rollback after commit is an error (pending_snapshot is already None)
+    #[test]
+    fn flat_rollback_after_commit_is_error() {
+        let mut conn = make_connection();
+        conn.begin_transaction().expect("begin_transaction");
+        conn.commit_transaction().expect("commit_transaction");
+        assert!(conn.rollback_transaction().is_err());
+    }
+
+    // 6. Plan-C specific: RAII begin() delegates to the flat state machine.
+    //    Verifies commit, explicit rollback, and drop-based auto-rollback all
+    //    go through the shared pending_snapshot in Connection.
+    #[test]
+    fn raii_and_flat_share_same_state_commit() {
+        let mut conn = make_connection();
+        {
+            let mut tx = conn.begin().expect("begin");
+            tx.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
+                .expect("insert");
+            tx.commit().expect("commit via RAII");
+        }
+        // After RAII commit, no pending transaction remains.
+        assert!(
+            conn.commit_transaction().is_err(),
+            "no tx after RAII commit"
+        );
+        assert_eq!(conn.count_nodes(None).unwrap(), 1);
+    }
+
+    #[test]
+    fn raii_and_flat_share_same_state_rollback() {
+        let mut conn = make_connection();
+        {
+            let mut tx = conn.begin().expect("begin");
+            tx.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
+                .expect("insert");
+            tx.rollback().expect("rollback via RAII");
+        }
+        // After RAII rollback, no pending transaction remains.
+        assert!(
+            conn.rollback_transaction().is_err(),
+            "no tx after RAII rollback"
+        );
+        assert_eq!(conn.count_nodes(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn raii_drop_auto_rollback_via_flat_state() {
+        let mut conn = make_connection();
+        {
+            let mut tx = conn.begin().expect("begin");
+            tx.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
+                .expect("insert");
+            // tx dropped without commit → Drop calls rollback_transaction()
+        }
+        // After drop-based rollback, no pending transaction remains.
+        assert!(
+            conn.rollback_transaction().is_err(),
+            "no tx after drop rollback"
+        );
+        assert_eq!(conn.count_nodes(None).unwrap(), 0);
     }
 }
