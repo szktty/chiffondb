@@ -2,6 +2,7 @@
 members = [
     "chiffondb",
     "chiffondb-core",
+    "chiffondb-ffi",
 ]
 resolver = "2"
 
