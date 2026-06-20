@@ -57,9 +57,12 @@ caught by **backing the request's claims with the real code and live runs**.
 - **Review result**: write it to `docs/review-2026-MM-DDx.md` (target commit, verification
   commands, summary, per-point findings, extra findings, conclusion). **Do not commit it
   (keep it untracked)** — per recent convention. The request file `docs/review-request-*.md`
-  is committed.
+  is also **not committed** (keep it untracked).
 - **Added tests**: may be committed separately from the implementation diff (part of verification).
 - **Progress update**: commit the TODO/priority changes in `docs/plan-*.md`.
+- **Implementation commit**: the implementation session **does not commit its own changes**.
+  The commit is made by the review session after the review passes, as part of closing out the
+  review cycle. This keeps the commit history clean and ensures no unreviewed code lands in git.
 - **Next-phase implementation request**: once the next task and its approach are settled in
   review/discussion, create and **commit** `docs/implement-request-YYYY-MM-DDx.md` so the
   implementation session can read it cold (state the goal, the work, the DoD, the approach, and
