@@ -594,6 +594,7 @@ impl Connection {
     /// Begins a transaction and returns a `Transaction` RAII guard.
     /// Returns an error if a transaction is already in progress.
     /// Dropping the guard without committing automatically rolls back.
+    #[cfg(test)]
     pub(crate) fn begin(&mut self) -> Result<Transaction<'_>, String> {
         self.begin_transaction()?;
         Ok(Transaction { conn: self })
