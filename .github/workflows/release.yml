@@ -1,0 +1,273 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  LIB_NAME: chiffondb_ffi
+
+permissions:
+  contents: write
+
+jobs:
+  # ── macOS (universal dylib + static lib) ──────────────────────────────────
+  macos:
+    name: macOS (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-cargo-
+
+      - name: Build arm64
+        run: cargo build -p chiffondb-ffi --release --target aarch64-apple-darwin
+
+      - name: Build x86_64
+        run: cargo build -p chiffondb-ffi --release --target x86_64-apple-darwin
+
+      - name: Lipo dylib
+        run: |
+          lipo -create \
+            target/aarch64-apple-darwin/release/lib${{ env.LIB_NAME }}.dylib \
+            target/x86_64-apple-darwin/release/lib${{ env.LIB_NAME }}.dylib \
+            -output lib${{ env.LIB_NAME }}.dylib
+
+      - name: Lipo static lib
+        run: |
+          lipo -create \
+            target/aarch64-apple-darwin/release/lib${{ env.LIB_NAME }}.a \
+            target/x86_64-apple-darwin/release/lib${{ env.LIB_NAME }}.a \
+            -output lib${{ env.LIB_NAME }}.a
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          zip dist/lib${{ env.LIB_NAME }}-macos-universal.zip \
+            lib${{ env.LIB_NAME }}.dylib \
+            lib${{ env.LIB_NAME }}.a
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: macos-universal
+          path: dist/
+
+  # ── Linux x86_64 ──────────────────────────────────────────────────────────
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: Build
+        run: cargo build -p chiffondb-ffi --release --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/lib${{ env.LIB_NAME }}.so .
+          zip dist/lib${{ env.LIB_NAME }}-linux-x86_64.zip lib${{ env.LIB_NAME }}.so
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux-x86_64
+          path: dist/
+
+  # ── Windows x86_64 ────────────────────────────────────────────────────────
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      - name: Build
+        run: cargo build -p chiffondb-ffi --release --target x86_64-pc-windows-msvc
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item target\x86_64-pc-windows-msvc\release\${{ env.LIB_NAME }}.dll .
+          Compress-Archive -Path ${{ env.LIB_NAME }}.dll -DestinationPath dist\${{ env.LIB_NAME }}-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows-x86_64
+          path: dist/
+
+  # ── iOS (XCFramework) ─────────────────────────────────────────────────────
+  ios:
+    name: iOS (XCFramework)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ios-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ios-cargo-
+
+      - name: Build device (arm64)
+        run: cargo build -p chiffondb-ffi --release --target aarch64-apple-ios
+
+      - name: Build simulator (arm64)
+        run: cargo build -p chiffondb-ffi --release --target aarch64-apple-ios-sim
+
+      - name: Build simulator (x86_64)
+        run: cargo build -p chiffondb-ffi --release --target x86_64-apple-ios
+
+      - name: Lipo simulator slice
+        run: |
+          lipo -create \
+            target/aarch64-apple-ios-sim/release/lib${{ env.LIB_NAME }}.a \
+            target/x86_64-apple-ios/release/lib${{ env.LIB_NAME }}.a \
+            -output lib${{ env.LIB_NAME }}-sim.a
+
+      - name: Create XCFramework
+        run: |
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/lib${{ env.LIB_NAME }}.a \
+            -library lib${{ env.LIB_NAME }}-sim.a \
+            -output ${{ env.LIB_NAME }}.xcframework
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          zip -r dist/${{ env.LIB_NAME }}-ios.xcframework.zip ${{ env.LIB_NAME }}.xcframework
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ios-xcframework
+          path: dist/
+
+  # ── Android (AAR) ─────────────────────────────────────────────────────────
+  android:
+    name: Android (AAR)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: android-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: android-cargo-
+
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          local-cache: true
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build Android targets
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk \
+            -t arm64-v8a \
+            -t armeabi-v7a \
+            -t x86_64 \
+            -o android/jniLibs \
+            build -p chiffondb-ffi --release
+
+      - name: Package AAR
+        run: |
+          mkdir -p aar/jni
+          cp -r android/jniLibs/* aar/jni/
+          # Minimal AAR structure
+          cat > aar/AndroidManifest.xml <<'EOF'
+          <manifest package="jp.szktty.chiffondb" xmlns:android="http://schemas.android.com/apk/res/android"/>
+          EOF
+          cd aar && zip -r ../lib${{ env.LIB_NAME }}-android.aar .
+          mkdir -p ../dist
+          mv ../lib${{ env.LIB_NAME }}-android.aar ../dist/
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: android-aar
+          path: dist/
+
+  # ── GitHub Release ────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: [macos, linux, windows, ios, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts/
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts/ -type f -name "*.zip" -o -name "*.aar" | xargs -I{} cp {} release/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release/*
+          generate_release_notes: true
