@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "start": {
+    "type": "Node",
+    "label": "Project",
+    "key": "id",
+    "value": "project_alpha"
+  },
+  "steps": [
+    {
+      "action": "InEdges",
+      "label": "OWNS",
+      "filter": null
+    },
+    {
+      "action": "InNodes",
+      "label": "User",
+      "filter": {
+        "property": "isActive",
+        "operator": "Equals",
+        "value": true
+      }
+    }
+  ],
+  "collect": {
+    "type": "Nodes",
+    "properties": ["id", "name"]
+  }
+}
