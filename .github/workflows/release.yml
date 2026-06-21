@@ -213,20 +213,10 @@ jobs:
           key: android-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: android-cargo-
 
-      - name: Set up NDK
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r27c
-          local-cache: true
-
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
 
       - name: Build Android targets
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           cargo ndk \
             -t arm64-v8a \
