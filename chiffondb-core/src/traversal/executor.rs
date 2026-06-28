@@ -7,7 +7,8 @@ use crate::error::GraphError;
 use crate::traversal::command::{
     resolve_binding, AggregateFn, AggregateFunction, CollectResult, CollectSpec, CompoundFilter,
     CustomFilter, EdgeCollectSpec, Filter, FilterExpr, FilterOperator, FilterValue, GroupByKey,
-    OrderBySpec, PathNodeSpec, SortDirection, TraversalAction, TraversalCommand, TraversalStep,
+    OrderBySpec, PathNodeSpec, PropertyPath, SortDirection, TraversalAction, TraversalCommand,
+    TraversalStep,
 };
 
 // ---- In-memory graph model ----
@@ -357,12 +358,12 @@ fn apply_order_by<G: GraphAccess>(
                 let va = graph
                     .node_properties(a)
                     .as_deref()
-                    .and_then(|p| p.get(&spec.key))
+                    .and_then(|p| spec.key.resolve(p))
                     .cloned();
                 let vb = graph
                     .node_properties(b)
                     .as_deref()
-                    .and_then(|p| p.get(&spec.key))
+                    .and_then(|p| spec.key.resolve(p))
                     .cloned();
                 let ord = cmp_option_values(va.as_ref(), vb.as_ref());
                 if asc {
@@ -378,12 +379,12 @@ fn apply_order_by<G: GraphAccess>(
                 let va = graph
                     .edge_properties(a)
                     .as_deref()
-                    .and_then(|p| p.get(&spec.key))
+                    .and_then(|p| spec.key.resolve(p))
                     .cloned();
                 let vb = graph
                     .edge_properties(b)
                     .as_deref()
-                    .and_then(|p| p.get(&spec.key))
+                    .and_then(|p| spec.key.resolve(p))
                     .cloned();
                 let ord = cmp_option_values(va.as_ref(), vb.as_ref());
                 if asc {
@@ -450,20 +451,20 @@ fn apply_filter<G: GraphAccess>(
 
 fn eval_filter_on_props(
     props: Option<&HashMap<String, Value>>,
-    property: &str,
+    property: &PropertyPath,
     op: &FilterOperator,
     expected: &FilterValue,
     bindings: &std::collections::HashMap<String, Value>,
 ) -> bool {
     match op {
         FilterOperator::Exists => {
-            props.is_some_and(|p| p.get(property).is_some_and(|v| !v.is_null()))
+            props.is_some_and(|p| property.resolve(p).is_some_and(|v| !v.is_null()))
         }
         FilterOperator::IsNull => props
-            .and_then(|p| p.get(property))
+            .and_then(|p| property.resolve(p))
             .is_none_or(|v| v.is_null()),
         _ => {
-            let actual = props.and_then(|p| p.get(property));
+            let actual = props.and_then(|p| property.resolve(p));
             let resolved = expected.resolve(props, bindings);
             match (actual, resolved) {
                 (Some(a), Some(e)) => eval_filter(a, op, &e),
@@ -653,10 +654,18 @@ fn apply_any_key_contains<G: GraphAccess>(
     }
 }
 
-/// Performs a case-insensitive substring check when the value is a string.
+/// Performs a case-insensitive substring check, recursing into JSON objects and arrays.
+/// Only string *values* are matched; object keys are not searched. This lets keyword search
+/// reach strings nested inside a `Json`-typed property (e.g. an aggregated `props` map).
 fn value_contains_string(v: &Value, substr_lower: &str) -> bool {
     match v {
         Value::String(s) => s.to_lowercase().contains(substr_lower),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| value_contains_string(item, substr_lower)),
+        Value::Object(map) => map
+            .values()
+            .any(|val| value_contains_string(val, substr_lower)),
         _ => false,
     }
 }
@@ -798,7 +807,7 @@ fn collect_group_by<G: GraphAccess>(
             GroupByKey::Node { property } => graph
                 .node_properties(node_id)
                 .as_deref()
-                .and_then(|p| p.get(property))
+                .and_then(|p| property.resolve(p))
                 .map(value_to_group_key)
                 .unwrap_or_else(|| "null".to_string()),
             GroupByKey::Edge { .. } => "null".to_string(),
@@ -868,21 +877,25 @@ fn compute_aggregates<G: GraphAccess>(
 
     for func in functions {
         let output_key = func.output_key();
+        // Resolves this function's property path on a node, if a property is set.
+        let resolve_on = |n: NodeId| -> Option<Value> {
+            let prop = func.property.as_ref()?;
+            let props = graph.node_properties(n)?;
+            prop.resolve(&props).cloned()
+        };
         let value = match &func.func {
             AggregateFn::Count => Value::Number(node_ids.len().into()),
             AggregateFn::Sum => {
-                let prop = func.property.as_deref().unwrap_or("");
                 let sum: f64 = node_ids
                     .iter()
-                    .filter_map(|&n| graph.node_properties(n)?.get(prop)?.as_f64())
+                    .filter_map(|&n| resolve_on(n)?.as_f64())
                     .sum();
                 json_number(sum)
             }
             AggregateFn::Avg => {
-                let prop = func.property.as_deref().unwrap_or("");
                 let values: Vec<f64> = node_ids
                     .iter()
-                    .filter_map(|&n| graph.node_properties(n)?.get(prop)?.as_f64())
+                    .filter_map(|&n| resolve_on(n)?.as_f64())
                     .collect();
                 if values.is_empty() {
                     Value::Null
@@ -890,22 +903,16 @@ fn compute_aggregates<G: GraphAccess>(
                     json_number(values.iter().sum::<f64>() / values.len() as f64)
                 }
             }
-            AggregateFn::Min => {
-                let prop = func.property.as_deref().unwrap_or("");
-                node_ids
-                    .iter()
-                    .filter_map(|&n| graph.node_properties(n)?.get(prop).cloned())
-                    .min_by(|a, b| cmp_values(a, b).unwrap_or(std::cmp::Ordering::Equal))
-                    .unwrap_or(Value::Null)
-            }
-            AggregateFn::Max => {
-                let prop = func.property.as_deref().unwrap_or("");
-                node_ids
-                    .iter()
-                    .filter_map(|&n| graph.node_properties(n)?.get(prop).cloned())
-                    .max_by(|a, b| cmp_values(a, b).unwrap_or(std::cmp::Ordering::Equal))
-                    .unwrap_or(Value::Null)
-            }
+            AggregateFn::Min => node_ids
+                .iter()
+                .filter_map(|&n| resolve_on(n))
+                .min_by(|a, b| cmp_values(a, b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(Value::Null),
+            AggregateFn::Max => node_ids
+                .iter()
+                .filter_map(|&n| resolve_on(n))
+                .max_by(|a, b| cmp_values(a, b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(Value::Null),
         };
         result.insert(output_key, value);
     }
@@ -2897,5 +2904,192 @@ mod tests {
         let result = rows(execute(&g, &c).unwrap());
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["id"], json!("p1"));
+    }
+
+    #[test]
+    fn value_contains_string_recurses_into_objects_and_arrays() {
+        // Top-level string still matches (backward compatible).
+        assert!(value_contains_string(&json!("Sakamoto Ryoma"), "ryoma"));
+        // String nested in an object value is reached.
+        assert!(value_contains_string(
+            &json!({"name": "Sakamoto Ryoma", "year": 1867}),
+            "ryoma"
+        ));
+        // String nested in an array is reached.
+        assert!(value_contains_string(&json!(["Person", "Hero"]), "hero"));
+        // Deeply nested object/array mix.
+        assert!(value_contains_string(
+            &json!({"props": {"roles": ["samurai", "diplomat"]}}),
+            "diplomat"
+        ));
+        // Object keys are NOT searched (only values).
+        assert!(!value_contains_string(&json!({"diplomat": 1}), "diplomat"));
+        // No match returns false.
+        assert!(!value_contains_string(
+            &json!({"name": "Alice", "tags": ["a", "b"]}),
+            "zzz"
+        ));
+        // Non-string scalars are ignored.
+        assert!(!value_contains_string(&json!(1867), "1867"));
+    }
+
+    #[test]
+    fn any_key_contains_reaches_into_aggregated_json_property() {
+        let mut g = InMemoryGraph::new();
+        // A meta-schema pattern: arbitrary user properties aggregated into a single
+        // Json-typed `props` field. Keyword search must still reach nested strings.
+        g.add_node(
+            "Entity",
+            HashMap::from([(
+                "props".into(),
+                json!({"name": "Sakamoto Ryoma", "year": 1867}),
+            )]),
+        );
+        g.add_node(
+            "Entity",
+            HashMap::from([(
+                "props".into(),
+                json!({"name": "Tokugawa Yoshinobu", "year": 1837}),
+            )]),
+        );
+
+        let c = TraversalCommand {
+            version: 1,
+            bindings: Default::default(),
+            start: StartSpec {
+                kind: "AllNodes".into(),
+                label: "Entity".into(),
+                key: "".into(),
+                value: json!(null),
+            },
+            steps: vec![step_any_key_contains("Ryoma")],
+            collect: CollectSpec::Nodes {
+                properties: vec!["props".into()],
+                with_edges: None,
+            },
+        };
+        let result = rows(execute(&g, &c).unwrap());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["props"]["name"], json!("Sakamoto Ryoma"));
+    }
+
+    fn entity_graph() -> InMemoryGraph {
+        let mut g = InMemoryGraph::new();
+        g.add_node(
+            "Entity",
+            HashMap::from([(
+                "props".into(),
+                json!({"name": "Ryoma", "year": 1867, "status": "active"}),
+            )]),
+        );
+        g.add_node(
+            "Entity",
+            HashMap::from([(
+                "props".into(),
+                json!({"name": "Yoshinobu", "year": 1837, "status": "active"}),
+            )]),
+        );
+        g.add_node(
+            "Entity",
+            HashMap::from([(
+                "props".into(),
+                json!({"name": "Saigo", "year": 1828, "status": "retired"}),
+            )]),
+        );
+        g
+    }
+
+    fn all_entities(steps: Vec<TraversalStep>, props: Vec<&str>) -> TraversalCommand {
+        TraversalCommand {
+            version: 1,
+            bindings: Default::default(),
+            start: StartSpec {
+                kind: "AllNodes".into(),
+                label: "Entity".into(),
+                key: "".into(),
+                value: json!(null),
+            },
+            steps,
+            collect: CollectSpec::Nodes {
+                properties: props.into_iter().map(|s| s.to_string()).collect(),
+                with_edges: None,
+            },
+        }
+    }
+
+    fn nested_path(segments: &[&str]) -> PropertyPath {
+        PropertyPath::Path {
+            path: segments.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn filter_on_nested_json_path_scalar() {
+        let g = entity_graph();
+        let filter = Filter {
+            property: nested_path(&["props", "year"]),
+            operator: FilterOperator::Equals,
+            value: FilterValue::Literal(json!(1867)),
+        };
+        let c = all_entities(
+            vec![step_with_filter(TraversalAction::Filter, "Entity", filter)],
+            vec!["props"],
+        );
+        let result = rows(execute(&g, &c).unwrap());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["props"]["name"], json!("Ryoma"));
+    }
+
+    #[test]
+    fn filter_on_nested_json_path_string() {
+        let g = entity_graph();
+        let filter = Filter {
+            property: nested_path(&["props", "status"]),
+            operator: FilterOperator::Equals,
+            value: FilterValue::Literal(json!("active")),
+        };
+        let c = all_entities(
+            vec![step_with_filter(TraversalAction::Filter, "Entity", filter)],
+            vec!["props"],
+        );
+        let result = rows(execute(&g, &c).unwrap());
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn order_by_nested_json_path() {
+        let g = entity_graph();
+        let mut step = step(TraversalAction::OrderBy, "Entity");
+        step.order_by = Some(OrderBySpec {
+            key: nested_path(&["props", "year"]),
+            direction: SortDirection::Asc,
+        });
+        let c = all_entities(vec![step], vec!["props"]);
+        let result = rows(execute(&g, &c).unwrap());
+        assert_eq!(result.len(), 3);
+        // Ascending by nested year: 1828, 1837, 1867.
+        assert_eq!(result[0]["props"]["year"], json!(1828));
+        assert_eq!(result[1]["props"]["year"], json!(1837));
+        assert_eq!(result[2]["props"]["year"], json!(1867));
+    }
+
+    #[test]
+    fn flat_property_filter_unchanged() {
+        // Backward compatibility: a flat string property still resolves top-level.
+        let mut g = InMemoryGraph::new();
+        g.add_node("Entity", HashMap::from([("year".into(), json!(1867))]));
+        g.add_node("Entity", HashMap::from([("year".into(), json!(1837))]));
+        let filter = Filter {
+            property: PropertyPath::Flat("year".to_string()),
+            operator: FilterOperator::Equals,
+            value: FilterValue::Literal(json!(1867)),
+        };
+        let c = all_entities(
+            vec![step_with_filter(TraversalAction::Filter, "Entity", filter)],
+            vec!["year"],
+        );
+        let result = rows(execute(&g, &c).unwrap());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["year"], json!(1867));
     }
 }

@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::error::GraphError;
 use crate::pathfinding::{ConnectingSubgraph, PathOptions, PathResult, PathfindingEngine};
 use crate::schema::registry::SchemaRegistry;
-use crate::schema::store::load_schema;
+use crate::schema::store::{load_schema, register_dynamic_type, DynamicTypeKind};
 use crate::storage::file::{DatabaseFile, FileSnapshot, OpenOptions};
 use crate::storage::index;
 use crate::storage::page::{EdgeRid, NodeRid, RecordId};
@@ -18,6 +18,14 @@ use crate::traversal::executor::{EdgeId, GraphAccess, NodeId};
 
 pub type NodeList = Vec<(NodeRid, HashMap<String, Value>)>;
 pub type EdgeList = Vec<(EdgeRid, HashMap<String, Value>)>;
+
+/// The result of resolving a label name: its type id and whether the registration was
+/// newly created (`true`) or already existed (`false`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabelAssignment {
+    pub id: u16,
+    pub created: bool,
+}
 
 pub(crate) struct DbSnapshot {
     pub(crate) topo: TopologyStore,
@@ -541,6 +549,25 @@ impl Database {
         self.add_edge_label(rid, type_id)
     }
 
+    /// Adds an additional label to an edge by type name, registering the name dynamically
+    /// if unknown. Lets an app attach user-defined edge kinds on top of a fixed edge type
+    /// (whose from/to constraints stay schema-defined) without growing the schema.
+    pub fn add_edge_label_dynamic(
+        &mut self,
+        rid: EdgeRid,
+        type_name: &str,
+    ) -> Result<LabelAssignment, GraphError> {
+        let a = if let Some(id) = self.load_schema_registry()?.edge_type_id(type_name) {
+            LabelAssignment { id, created: false }
+        } else {
+            let (id, created) =
+                register_dynamic_type(&mut self.file, DynamicTypeKind::Edge, type_name)?;
+            LabelAssignment { id, created }
+        };
+        self.add_edge_label(rid, a.id)?;
+        Ok(a)
+    }
+
     /// Removes a label from an edge by type name.
     pub fn remove_edge_label_by_name(
         &mut self,
@@ -554,16 +581,29 @@ impl Database {
         self.remove_edge_label(rid, type_id)
     }
 
+    /// Writes the additional label list to the property page and updates label_ref.
+    ///
+    /// Normalizes the list to a set before persisting: the primary edge_type_id is excluded
+    /// and duplicates are dropped (first occurrence wins, preserving input order). This is the
+    /// single write-through point for an edge's additional labels, so all callers share the
+    /// invariant that they never repeat or shadow the primary edge type. Mirrors the node-side
+    /// `set_additional_labels`.
     fn set_edge_additional_labels(
         &mut self,
         rid: RecordId,
         labels: &[u16],
     ) -> Result<(), GraphError> {
         let mut edge = self.topo.read_edge(&mut self.file, rid)?;
-        if labels.is_empty() {
+        let mut normalized = Vec::with_capacity(labels.len());
+        for &id in labels {
+            if id != edge.edge_type_id && !normalized.contains(&id) {
+                normalized.push(id);
+            }
+        }
+        if normalized.is_empty() {
             edge.label_ref = None;
         } else {
-            let bytes = encode_label_list(labels)?;
+            let bytes = encode_label_list(&normalized)?;
             let lref = PropertyStore::write_raw(&mut self.file, &bytes)?;
             edge.label_ref = Some(lref);
         }
@@ -750,6 +790,8 @@ impl Database {
     }
 
     /// Inserts a node with multiple labels specified by type names.
+    /// Every label must already exist in the schema; an unknown name is an error.
+    /// For apps that grow labels dynamically, use `insert_node_with_dynamic_labels`.
     pub fn insert_node_with_label_names(
         &mut self,
         primary_type_name: &str,
@@ -771,13 +813,71 @@ impl Database {
         self.insert_node_with_labels(primary_id, additional_ids, properties)
     }
 
+    /// Resolves a node type name to an id, registering it dynamically if unknown.
+    /// Returns the id and whether it was newly created.
+    fn resolve_or_register_node_type(&mut self, name: &str) -> Result<LabelAssignment, GraphError> {
+        if let Some(id) = self.load_schema_registry()?.node_type_id(name) {
+            return Ok(LabelAssignment { id, created: false });
+        }
+        let (id, created) = register_dynamic_type(&mut self.file, DynamicTypeKind::Node, name)?;
+        Ok(LabelAssignment { id, created })
+    }
+
+    /// Inserts a node, registering any unknown label names on the fly. Returns the new node id
+    /// and a map from each label name (primary + additional) to its assignment, so the caller
+    /// can learn which ids were minted without a separate registration call.
+    pub fn insert_node_with_dynamic_labels(
+        &mut self,
+        primary_type_name: &str,
+        additional_label_names: Vec<&str>,
+        properties: HashMap<String, Value>,
+    ) -> Result<(NodeRid, HashMap<String, LabelAssignment>), GraphError> {
+        let mut assignments = HashMap::new();
+
+        let primary = self.resolve_or_register_node_type(primary_type_name)?;
+        assignments.insert(primary_type_name.to_string(), primary);
+
+        let mut additional_ids = Vec::new();
+        for name in additional_label_names {
+            let a = self.resolve_or_register_node_type(name)?;
+            additional_ids.push(a.id);
+            assignments.insert(name.to_string(), a);
+        }
+
+        let rid = self.insert_node_with_labels(primary.id, additional_ids, properties)?;
+        Ok((rid, assignments))
+    }
+
+    /// Adds a label to a node by type name, registering the name dynamically if unknown.
+    /// Returns the label's assignment (id and whether it was newly created).
+    pub fn add_node_label_dynamic(
+        &mut self,
+        rid: NodeRid,
+        type_name: &str,
+    ) -> Result<LabelAssignment, GraphError> {
+        let a = self.resolve_or_register_node_type(type_name)?;
+        self.add_node_label(rid, a.id)?;
+        Ok(a)
+    }
+
     /// Writes the additional label list to the property page and updates label_ref.
+    ///
+    /// Normalizes the list to a set before persisting: the primary type_id is excluded and
+    /// duplicates are dropped (first occurrence wins, preserving input order). This is the
+    /// single write-through point for additional labels, so all callers share the invariant
+    /// that a node's stored additional labels never repeat or shadow its primary type.
     fn set_additional_labels(&mut self, rid: RecordId, labels: &[u16]) -> Result<(), GraphError> {
         let mut node = self.topo.read_node(&mut self.file, rid)?;
-        if labels.is_empty() {
+        let mut normalized = Vec::with_capacity(labels.len());
+        for &id in labels {
+            if id != node.node_type_id && !normalized.contains(&id) {
+                normalized.push(id);
+            }
+        }
+        if normalized.is_empty() {
             node.label_ref = None;
         } else {
-            let bytes = encode_label_list(labels)?;
+            let bytes = encode_label_list(&normalized)?;
             let lref = PropertyStore::write_raw(&mut self.file, &bytes)?;
             node.label_ref = Some(lref);
         }
@@ -2020,6 +2120,149 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_label_insert_registers_unknown_and_returns_assignments() {
+        let (mut db, _) = make_db_with_schema();
+        // "Person" and "VIP" are not in the schema; they must be registered on the fly.
+        let (rid, assignments) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person", "VIP"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+
+        // "User" already exists in the schema.
+        assert!(!assignments["User"].created);
+        // "Person"/"VIP" are newly minted.
+        assert!(assignments["Person"].created);
+        assert!(assignments["VIP"].created);
+        assert_ne!(assignments["Person"].id, assignments["VIP"].id);
+
+        // The dynamically registered labels resolve back to their names.
+        let labels = db.get_node_label_names(rid).unwrap();
+        assert!(labels.contains(&"Person".to_string()));
+        assert!(labels.contains(&"VIP".to_string()));
+
+        // Re-inserting with the same label reuses the id and reports created=false.
+        let (_, assignments2) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person"],
+                HashMap::from([("id".to_string(), json!("u2"))]),
+            )
+            .unwrap();
+        assert!(!assignments2["Person"].created);
+        assert_eq!(assignments2["Person"].id, assignments["Person"].id);
+    }
+
+    #[test]
+    fn dynamic_label_filtering_via_has_label() {
+        let (mut db, _) = make_db_with_schema();
+        db.insert_node_with_dynamic_labels(
+            "User",
+            vec!["Person"],
+            HashMap::from([("id".to_string(), json!("u1"))]),
+        )
+        .unwrap();
+        db.insert_node_with_dynamic_labels(
+            "User",
+            vec![],
+            HashMap::from([("id".to_string(), json!("u2"))]),
+        )
+        .unwrap();
+        db.flush().unwrap();
+
+        // HasLabel filtering reaches dynamically registered labels with no property scan.
+        let view = DatabaseGraphView::load(&mut db).unwrap();
+        let person_nodes = view.all_nodes_of_label("Person");
+        assert_eq!(person_nodes.len(), 1);
+    }
+
+    #[test]
+    fn dynamic_label_id_persists_across_reopen() {
+        let (mut db, path) = make_db_with_schema();
+        let (_, assignments) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+        let person_id = assignments["Person"].id;
+        db.flush().unwrap();
+        drop(db);
+
+        let mut db2 = Database::open(&path).unwrap();
+        // The id is stable: registering the same name again returns the persisted id.
+        let (_, assignments2) = db2
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person"],
+                HashMap::from([("id".to_string(), json!("u2"))]),
+            )
+            .unwrap();
+        assert!(!assignments2["Person"].created);
+        assert_eq!(assignments2["Person"].id, person_id);
+    }
+
+    #[test]
+    fn dynamic_label_survives_later_apply_schema() {
+        // A schema migration must not drop dynamically registered labels.
+        let (mut db, _) = make_db_with_schema();
+        let (_, assignments) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+        let person_id = assignments["Person"].id;
+
+        // Apply a compatible schema migration (add a field).
+        db.apply_schema(
+            "node User { id: String  name: String  email: String } \
+             node Admin { role: String } \
+             node Project { id: String  title: String } \
+             edge OWNS { from: User  to: Project  props: { role: String } }",
+        )
+        .unwrap();
+
+        // The dynamic label and its id are preserved.
+        let (_, assignments2) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person"],
+                HashMap::from([("id".to_string(), json!("u2"))]),
+            )
+            .unwrap();
+        assert!(!assignments2["Person"].created);
+        assert_eq!(assignments2["Person"].id, person_id);
+    }
+
+    #[test]
+    fn additional_labels_normalized_to_a_set() {
+        // Multi-label semantics are set-like: passing the primary again or repeating an
+        // additional label must not pollute the persisted additional-label list.
+        let (mut db, _) = make_db_with_schema();
+        let (rid, assignments) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["User", "X", "X"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+        let x_id = assignments["X"].id;
+
+        // Names: primary "User" appears once, "X" once, no duplicates.
+        let mut names = db.get_node_label_names(rid).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["User".to_string(), "X".to_string()]);
+
+        // Additional ids: deduplicated and the primary id excluded.
+        assert_eq!(db.get_additional_labels(rid).unwrap(), vec![x_id]);
+    }
+
+    #[test]
     fn add_and_remove_node_label() {
         let (mut db, _) = make_db_with_schema();
         let rid = db
@@ -2374,6 +2617,45 @@ mod tests {
         let labels = db.get_edge_label_names(eid).unwrap();
         assert!(labels.contains(&"OWNS".to_string()));
         assert!(labels.contains(&"MANAGES".to_string()));
+    }
+
+    #[test]
+    fn edge_additional_labels_normalized_to_a_set() {
+        // Edge multi-labels are set-like, mirroring the node-side invariant: the primary
+        // edge type must not appear in the additional list, and ids must not repeat.
+        let (mut db, _) = make_db_with_schema2();
+        let u = db
+            .insert_node_by_name("User", HashMap::from([("id".to_string(), json!("u1"))]))
+            .unwrap();
+        let p = db
+            .insert_node_by_name("Project", HashMap::from([("id".to_string(), json!("p1"))]))
+            .unwrap();
+
+        let registry = db.load_schema_registry().unwrap();
+        let owns_id = registry.edge_type_id("OWNS").unwrap();
+        let manages_id = registry.edge_type_id("MANAGES").unwrap();
+
+        // Pass the primary type ("OWNS") and a duplicated additional ("MANAGES") in the set.
+        let eid = db
+            .insert_edge_with_labels(
+                owns_id,
+                u,
+                p,
+                vec![owns_id, manages_id, manages_id],
+                HashMap::from([("role".to_string(), json!("owner"))]),
+            )
+            .unwrap();
+
+        // Additional ids: deduplicated and the primary id excluded.
+        assert_eq!(
+            db.get_edge_additional_labels(eid).unwrap(),
+            vec![manages_id]
+        );
+
+        // Names: primary "OWNS" once, "MANAGES" once, no duplicates.
+        let mut names = db.get_edge_label_names(eid).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["MANAGES".to_string(), "OWNS".to_string()]);
     }
 
     #[test]

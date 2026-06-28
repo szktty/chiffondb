@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -226,7 +226,12 @@ pub fn save_schema(db: &mut DatabaseFile, ast: &SchemaAst) -> Result<(), GraphEr
 
     let mut dto = ast_to_dto(ast);
     assign_type_ids(&mut dto, previous.as_ref());
-    let bytes = serde_json::to_vec(&dto).map_err(|e| GraphError::SchemaError(e.to_string()))?;
+    write_schema_dto(db, &dto)
+}
+
+/// Serializes a DTO to a fresh schema page chain and bumps schema_version.
+fn write_schema_dto(db: &mut DatabaseFile, dto: &SchemaDto) -> Result<(), GraphError> {
+    let bytes = serde_json::to_vec(dto).map_err(|e| GraphError::SchemaError(e.to_string()))?;
 
     let needed = pages_needed(bytes.len()).max(1);
     let mut pages = vec![[0u8; PAGE_SIZE]; needed];
@@ -241,6 +246,42 @@ pub fn save_schema(db: &mut DatabaseFile, ast: &SchemaAst) -> Result<(), GraphEr
     db.header.schema_version += 1;
     db.write_header()?;
     db.flush()
+}
+
+/// The kind of type being registered dynamically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicTypeKind {
+    Node,
+    Edge,
+}
+
+/// Registers a label/type id without applying a full schema, for apps that grow a
+/// schemaless set of labels on top of a fixed meta-schema. Returns `(id, created)`:
+/// the assigned id, and whether it was newly minted (`true`) or already existed (`false`).
+///
+/// The name is added to the persisted type_id assignments only; no AST definition is
+/// created. `save_schema` preserves such definition-less assignments (see `assign_type_ids`),
+/// so a later schema migration will not drop dynamically registered labels.
+pub fn register_dynamic_type(
+    db: &mut DatabaseFile,
+    kind: DynamicTypeKind,
+    name: &str,
+) -> Result<(u16, bool), GraphError> {
+    let mut dto = load_schema_dto(db)?;
+    let (assignments, next_id) = match kind {
+        DynamicTypeKind::Node => (&mut dto.node_type_ids, &mut dto.next_node_id),
+        DynamicTypeKind::Edge => (&mut dto.edge_type_ids, &mut dto.next_edge_id),
+    };
+
+    if let Some((_, id)) = assignments.iter().find(|(n, _)| n == name) {
+        return Ok((*id, false));
+    }
+
+    let id = (*next_id).max(1);
+    *next_id = id + 1;
+    assignments.push((name.to_string(), id));
+    write_schema_dto(db, &dto)?;
+    Ok((id, true))
 }
 
 /// Reads the schema AST from the database file.
@@ -322,6 +363,24 @@ fn assign_type_ids(dto: &mut SchemaDto, previous: Option<&SchemaDto>) {
                     id
                 });
                 edge_ids.push((e.name.clone(), id));
+            }
+        }
+    }
+
+    // Preserve dynamically registered labels: assignments that exist in the previous DTO
+    // but have no AST definition in the new schema. Without this, a later save_schema would
+    // drop labels registered via register_dynamic_type.
+    if let Some(p) = previous {
+        let defined_nodes: HashSet<String> = node_ids.iter().map(|(n, _)| n.clone()).collect();
+        for (name, id) in &p.node_type_ids {
+            if !defined_nodes.contains(name) {
+                node_ids.push((name.clone(), *id));
+            }
+        }
+        let defined_edges: HashSet<String> = edge_ids.iter().map(|(n, _)| n.clone()).collect();
+        for (name, id) in &p.edge_type_ids {
+            if !defined_edges.contains(name) {
+                edge_ids.push((name.clone(), *id));
             }
         }
     }
@@ -423,5 +482,54 @@ mod tests {
 
         let db2 = DatabaseFile::open(&path).unwrap();
         assert_eq!(db2.header.schema_version, 1);
+    }
+
+    #[test]
+    fn register_dynamic_type_mints_and_reuses() {
+        let (mut db, _) = make_db();
+        save_schema(&mut db, &parse("node User { id: String }").unwrap()).unwrap();
+
+        // Unknown name is minted; its id comes after the schema-defined User (id 1).
+        let (id1, created1) =
+            register_dynamic_type(&mut db, DynamicTypeKind::Node, "Person").unwrap();
+        assert!(created1);
+        assert_eq!(id1, 2);
+
+        // Second unknown name gets the next id.
+        let (id2, created2) = register_dynamic_type(&mut db, DynamicTypeKind::Node, "VIP").unwrap();
+        assert!(created2);
+        assert_eq!(id2, 3);
+
+        // Re-registering returns the existing id without minting.
+        let (id3, created3) =
+            register_dynamic_type(&mut db, DynamicTypeKind::Node, "Person").unwrap();
+        assert!(!created3);
+        assert_eq!(id3, id1);
+
+        // An existing schema type name resolves to its existing id, created=false.
+        let (id_user, created_user) =
+            register_dynamic_type(&mut db, DynamicTypeKind::Node, "User").unwrap();
+        assert!(!created_user);
+        assert_eq!(id_user, 1);
+    }
+
+    #[test]
+    fn register_dynamic_type_survives_save_schema() {
+        let (mut db, _) = make_db();
+        save_schema(&mut db, &parse("node User { id: String }").unwrap()).unwrap();
+        let (person_id, _) =
+            register_dynamic_type(&mut db, DynamicTypeKind::Node, "Person").unwrap();
+
+        // A later schema migration must keep the dynamic label and its id.
+        save_schema(
+            &mut db,
+            &parse("node User { id: String  name: String }").unwrap(),
+        )
+        .unwrap();
+
+        let (id_again, created) =
+            register_dynamic_type(&mut db, DynamicTypeKind::Node, "Person").unwrap();
+        assert!(!created);
+        assert_eq!(id_again, person_id);
     }
 }

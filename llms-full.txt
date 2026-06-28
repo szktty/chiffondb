@@ -119,7 +119,7 @@ node Admin extends User {
 
 ### 2.7 Multiple labels
 
-Nodes/edges can carry multiple types (labels).
+Nodes/edges can carry multiple types (labels). The labels must already exist in the schema.
 
 ```
 # Insert a node that is both User and Admin
@@ -129,6 +129,34 @@ insert_node_with_label_names(primary: "User", additional: ["Admin"], props: {...
 add_node_label_by_name(rid, "Admin")
 remove_node_label_by_name(rid, "Admin")
 ```
+
+A node/edge's additional labels are stored as a **set**: the primary type is never duplicated
+into the additional list, and repeated labels are collapsed (first occurrence wins, input order
+preserved). So passing `additional: ["User", "VIP", "VIP"]` to a `User` node stores just `["VIP"]`.
+
+#### Dynamic labels (register on insert)
+
+For schemaless apps that grow labels on top of a fixed meta-schema, labels can be registered
+without running `apply_schema`. An unknown label name is assigned a type id on the fly and
+persisted; a later schema migration preserves it. Dynamic labels share the same id space as
+schema-defined types, so the usual label lookups and `HasLabel` filtering work unchanged.
+
+```
+# Mints type ids for any unknown names ("Person", "VIP") and returns a name -> {id, created} map,
+# so the caller learns which ids were newly created vs. already existing — no separate
+# registration call is needed.
+insert_node_with_dynamic_labels(primary: "Person", additional: ["VIP"], props: {...})
+  -> (node_id, { "Person": {id, created}, "VIP": {id, created} })
+
+# Add a label to an existing node/edge, registering the name if unknown.
+add_node_label_dynamic(rid, "VIP")     -> {id, created}
+add_edge_label_dynamic(eid, "MANAGES") -> {id, created}
+```
+
+Type ids are `u16` (1..=65535; 0 is reserved). Ids are never reused: a removed type's id is not
+handed out again, so already-stored records are never misread as the wrong type. Removing a label
+definition has no referential-integrity check — cleaning up referencing nodes/edges is the
+application's responsibility.
 
 ---
 
@@ -345,7 +373,7 @@ what you need).
 | `Dedup` | remove duplicate RecordIds | none |
 | `Limit` | keep at most N | `count: N` |
 | `Skip` | skip the first N | `skip: N` |
-| `OrderBy` | sort by property | `order_by: {"key": "score", "direction": "Desc"}` |
+| `OrderBy` | sort by property (key accepts a nested path, see §4.4) | `order_by: {"key": "score", "direction": "Desc"}` |
 | `Repeat` | repeat a step sequence up to N times (BFS) | `repeat_steps: [...]`, `max_depth: N` |
 
 #### Step examples
@@ -385,6 +413,23 @@ what you need).
 }
 ```
 
+#### Property paths (flat key or nested path)
+
+`property` (and `OrderBy`'s `key`, and a property-reference `key`) accepts two forms:
+
+- **Flat key**: a plain string, e.g. `"name"` — a top-level property.
+- **Nested path**: `{ "path": ["props", "name"] }` — walks into a nested `Json` value. Resolves
+  to a nested *scalar*; array indexing and JSON containment are out of scope. A path segment that
+  is missing, or whose parent is not an object, resolves to absent (the filter does not match).
+
+This makes filtering/sorting work over user properties aggregated into a single `Json` field.
+Group-by keys and aggregate function properties accept the same two forms.
+
+```json
+{ "property": { "path": ["props", "year"] }, "operator": "Equals", "value": 1867 }
+{ "action": "OrderBy", "order_by": { "key": { "path": ["props", "year"] }, "direction": "Asc" } }
+```
+
 #### Operators
 
 | Operator | Description | value type |
@@ -407,9 +452,11 @@ what you need).
 
 #### any_key_contains (substring match across all string properties)
 
-A special filter usable alongside `filter` / `compound_filter`. Searches all String-typed
-properties and keeps nodes/edges where any of them contains the substring. Case-insensitive.
-Non-string properties (Int/Boolean, etc.) are ignored.
+A special filter usable alongside `filter` / `compound_filter`. Searches all string values and
+keeps nodes/edges where any of them contains the substring. Case-insensitive. It **recurses into
+`Json`-typed objects and arrays**, so a string nested inside an aggregated `Json` property (e.g.
+`props.name`) is matched too. Only string *values* are searched — object keys and non-string
+scalars (Int/Boolean, etc.) are ignored.
 
 ```json
 { "action": "Filter", "any_key_contains": "alice" }
@@ -420,7 +467,8 @@ Non-string properties (Int/Boolean, etc.) are ignored.
 1. **Literal**: `"Alice"`, `42`, `false`, `null`
 2. **Bind variable**: `{ "$bind": "name" }` — resolved from the command's `bindings`
 3. **Property reference**: `{ "type": "property", "key": "other field" }` — another field of the
-   same node/edge
+   same node/edge. `key` accepts the same flat-or-nested-path forms as `property` (see above),
+   e.g. `{ "type": "property", "key": { "path": ["props", "minAge"] } }`.
 
 #### Simple filter examples
 
