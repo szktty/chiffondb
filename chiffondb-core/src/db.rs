@@ -21,7 +21,8 @@ pub type EdgeList = Vec<(EdgeRid, HashMap<String, Value>)>;
 
 /// The result of resolving a label name: its type id and whether the registration was
 /// newly created (`true`) or already existed (`false`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Serialize` so the FFI layer can return it as a JSON object string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct LabelAssignment {
     pub id: u16,
     pub created: bool,

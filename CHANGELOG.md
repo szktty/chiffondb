@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `add_edge_label_dynamic` register unknown label names on the fly (assigning a `u16` type id
   without `apply_schema`) and return a name → `{ id, created }` mapping. Dynamic labels share the
   schema id space and are preserved across later schema migrations.
+- FFI: the dynamic-label API is exposed on `Connection` for the language bindings. Assignments
+  are returned as JSON object strings (`{"id":<u16>,"created":<bool>}`), consistent with the
+  existing label getters; the node insert returns a `DynamicInsertResult { rid, assignments_json }`.
 
 ### Fixed
 

@@ -17,6 +17,13 @@ pub struct NodeResult {
     pub properties: String, // JSON
 }
 
+/// Result of a dynamic-label node insert: the new node's RecordId plus a JSON object
+/// string mapping each label name to `{"id":<u16>,"created":<bool>}`.
+pub struct DynamicInsertResult {
+    pub rid: RecordId,
+    pub assignments_json: String,
+}
+
 // ---- Database handle ----
 
 pub struct Connection {
@@ -332,6 +339,61 @@ impl Connection {
         self.db_mut()?
             .remove_edge_label_by_name(rid, &type_name)
             .map_err(|e| e.to_string())
+    }
+
+    /// Inserts a node, registering any unknown label names on the fly. Returns the new node's
+    /// RecordId and a JSON object string mapping each label name to `{id, created}`.
+    pub fn insert_node_with_dynamic_labels(
+        &mut self,
+        primary_type: String,
+        additional_labels: Vec<String>,
+        props_json: String,
+    ) -> Result<DynamicInsertResult, String> {
+        let props: HashMap<String, Value> =
+            serde_json::from_str(&props_json).map_err(|e| e.to_string())?;
+        let additional_refs: Vec<&str> = additional_labels.iter().map(|s| s.as_str()).collect();
+        let (rid, assignments) = self
+            .db_mut()?
+            .insert_node_with_dynamic_labels(&primary_type, additional_refs, props)
+            .map_err(|e| e.to_string())?;
+        let assignments_json = serde_json::to_string(&assignments).map_err(|e| e.to_string())?;
+        Ok(DynamicInsertResult {
+            rid: RecordId {
+                page: rid.page_id().0,
+                slot: rid.slot_id().0,
+            },
+            assignments_json,
+        })
+    }
+
+    /// Adds a label to a node, registering the name if unknown.
+    /// Returns `{id, created}` as a JSON object string.
+    pub fn add_node_label_dynamic(
+        &mut self,
+        rid: RecordId,
+        type_name: String,
+    ) -> Result<String, String> {
+        let rid = crate::storage::page::NodeRid::new(rid.page, rid.slot);
+        let a = self
+            .db_mut()?
+            .add_node_label_dynamic(rid, &type_name)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&a).map_err(|e| e.to_string())
+    }
+
+    /// Adds a label to an edge, registering the name if unknown.
+    /// Returns `{id, created}` as a JSON object string.
+    pub fn add_edge_label_dynamic(
+        &mut self,
+        rid: RecordId,
+        type_name: String,
+    ) -> Result<String, String> {
+        let rid = crate::storage::page::EdgeRid::new(rid.page, rid.slot);
+        let a = self
+            .db_mut()?
+            .add_edge_label_dynamic(rid, &type_name)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&a).map_err(|e| e.to_string())
     }
 
     /// Finds the shortest path using BFS.
@@ -1325,5 +1387,107 @@ edge FOLLOWS {
             "no tx after drop rollback"
         );
         assert_eq!(conn.count_nodes(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn insert_node_with_dynamic_labels_mints_unknown_and_returns_json() {
+        let mut conn = make_connection();
+        // "VIP" is not in the schema; it must be registered on the fly.
+        let result = conn
+            .insert_node_with_dynamic_labels(
+                "Person".to_string(),
+                vec!["VIP".to_string()],
+                r#"{"id": "u1"}"#.to_string(),
+            )
+            .expect("dynamic insert");
+
+        let assignments: serde_json::Value =
+            serde_json::from_str(&result.assignments_json).expect("parse assignments");
+        // "Person" already exists in the schema; "VIP" is newly minted.
+        assert_eq!(assignments["Person"]["created"], serde_json::json!(false));
+        assert_eq!(assignments["VIP"]["created"], serde_json::json!(true));
+        assert!(assignments["VIP"]["id"].is_u64());
+
+        // The dynamic label resolves back through the standard label getter.
+        let labels_json = conn.get_node_labels(result.rid).expect("get labels");
+        let labels: Vec<String> = serde_json::from_str(&labels_json).expect("parse labels");
+        assert!(labels.contains(&"Person".to_string()));
+        assert!(labels.contains(&"VIP".to_string()));
+    }
+
+    #[test]
+    fn add_node_label_dynamic_via_connection() {
+        let mut conn = make_connection();
+        let node = conn
+            .insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
+            .expect("insert");
+
+        let json = conn
+            .add_node_label_dynamic(
+                RecordId {
+                    page: node.page,
+                    slot: node.slot,
+                },
+                "Admin".to_string(),
+            )
+            .expect("add dynamic label");
+        let a: serde_json::Value = serde_json::from_str(&json).expect("parse assignment");
+        assert_eq!(a["created"], serde_json::json!(true));
+
+        // Adding the same label again reuses the id and reports created=false.
+        let json2 = conn
+            .add_node_label_dynamic(
+                RecordId {
+                    page: node.page,
+                    slot: node.slot,
+                },
+                "Admin".to_string(),
+            )
+            .expect("add dynamic label again");
+        let a2: serde_json::Value = serde_json::from_str(&json2).expect("parse assignment");
+        assert_eq!(a2["created"], serde_json::json!(false));
+        assert_eq!(a2["id"], a["id"]);
+    }
+
+    #[test]
+    fn add_edge_label_dynamic_via_connection() {
+        let mut conn = make_connection();
+        let alice = conn
+            .insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
+            .expect("insert alice");
+        let bob = conn
+            .insert_node("Person".to_string(), r#"{"id": "u2"}"#.to_string())
+            .expect("insert bob");
+        let edge = conn
+            .insert_edge(
+                "FOLLOWS".to_string(),
+                RecordId {
+                    page: alice.page,
+                    slot: alice.slot,
+                },
+                RecordId {
+                    page: bob.page,
+                    slot: bob.slot,
+                },
+                "{}".to_string(),
+            )
+            .expect("insert edge");
+
+        let json = conn
+            .add_edge_label_dynamic(
+                RecordId {
+                    page: edge.page,
+                    slot: edge.slot,
+                },
+                "BLOCKS".to_string(),
+            )
+            .expect("add dynamic edge label");
+        let a: serde_json::Value = serde_json::from_str(&json).expect("parse assignment");
+        assert_eq!(a["created"], serde_json::json!(true));
+
+        let labels_json = conn.get_edge_labels(edge).expect("get edge labels");
+        let labels: Vec<String> = serde_json::from_str(&labels_json).expect("parse labels");
+        assert!(labels.contains(&"FOLLOWS".to_string()));
+        assert!(labels.contains(&"BLOCKS".to_string()));
     }
 }
