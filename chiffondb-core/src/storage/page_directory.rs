@@ -103,6 +103,13 @@ impl PageDirectory {
     ///
     /// Extends the directory-page chain as needed.
     pub fn push(&mut self, file: &mut DatabaseFile, physical: u32) -> Result<usize, GraphError> {
+        // `UNMAPPED` doubles as the "no mapping" sentinel, so a real physical id must never
+        // equal it: storing it would advance `len` yet make the entry resolve to `None`
+        // (mapped-but-invisible). Unreachable today (it would need a ~16 TB file) but guard
+        // it so a future free-list / pid reuse cannot smuggle the sentinel in.
+        if physical == UNMAPPED {
+            return Err(GraphError::StorageCorrupted(physical));
+        }
         let logical = self.len;
         self.set(file, logical, physical)?;
         self.len = logical + 1;
@@ -222,6 +229,7 @@ fn write_entry(page: &mut [u8; PAGE_SIZE], slot: usize, physical: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn file() -> DatabaseFile {
         // Page 0 stands in for the header so appended directory pages start at pid 1,
@@ -293,5 +301,106 @@ mod tests {
         let restored = PageDirectory::with_root(root, len);
         assert_eq!(restored.resolve(&mut f, 0).unwrap(), Some(11));
         assert_eq!(restored.resolve(&mut f, 1).unwrap(), Some(22));
+    }
+
+    // ---- Reviewer-added coverage (review-request-2026-06-30c) ----
+
+    /// Restore-from-root must resolve every entry across a directory-page boundary, not just
+    /// the 2-entry single-page case `with_root_restores_mapping` covers.
+    #[test]
+    fn with_root_restores_across_directory_page_boundary() {
+        let mut f = file();
+        let n = ENTRIES_PER_DIR_PAGE * 2 + 3;
+        let (root, len) = {
+            let mut dir = PageDirectory::new();
+            for i in 0..n {
+                dir.push(&mut f, 5000 + i as u32).unwrap();
+            }
+            (dir.root(), dir.len())
+        };
+        let restored = PageDirectory::with_root(root, len);
+        // Span the first/second/third directory pages and both boundaries.
+        for i in [
+            0,
+            ENTRIES_PER_DIR_PAGE - 1,
+            ENTRIES_PER_DIR_PAGE,
+            ENTRIES_PER_DIR_PAGE * 2 - 1,
+            ENTRIES_PER_DIR_PAGE * 2,
+            n - 1,
+        ] {
+            assert_eq!(restored.resolve(&mut f, i).unwrap(), Some(5000 + i as u32));
+        }
+        assert_eq!(restored.resolve(&mut f, n).unwrap(), None);
+    }
+
+    /// The exact slot boundary: entry at `ENTRIES_PER_DIR_PAGE - 1` is the last slot of the
+    /// first page (offset 4092..4096); `ENTRIES_PER_DIR_PAGE` is the first slot of the second
+    /// page. Both must read/write within their page and resolve distinctly.
+    #[test]
+    fn exact_directory_page_slot_boundary() {
+        let mut f = file();
+        let mut dir = PageDirectory::new();
+        for i in 0..=ENTRIES_PER_DIR_PAGE {
+            dir.push(&mut f, 7000 + i as u32).unwrap();
+        }
+        let last_of_first = ENTRIES_PER_DIR_PAGE - 1;
+        let first_of_second = ENTRIES_PER_DIR_PAGE;
+        assert_eq!(
+            dir.resolve(&mut f, last_of_first).unwrap(),
+            Some(7000 + last_of_first as u32)
+        );
+        assert_eq!(
+            dir.resolve(&mut f, first_of_second).unwrap(),
+            Some(7000 + first_of_second as u32)
+        );
+    }
+
+    /// A `next` link that points off the end of the file must surface as an error, not panic
+    /// or loop. (Corruption injection: the chain-walk reads a non-existent page.)
+    #[test]
+    fn corrupt_offend_next_link_errors_cleanly() {
+        let mut f = file();
+        let mut dir = PageDirectory::new();
+        dir.push(&mut f, 1000).unwrap();
+        let root = dir.root();
+        let mut page = f.read_page(root).unwrap();
+        // Overwrite the next-page link with a pid far past EOF.
+        page[0..4].copy_from_slice(&999_999u32.to_le_bytes());
+        f.write_page(root, &page).unwrap();
+        // Claim a second directory page so resolve must follow the broken link.
+        let corrupt = PageDirectory::with_root(root, ENTRIES_PER_DIR_PAGE + 1);
+        assert!(corrupt.resolve(&mut f, ENTRIES_PER_DIR_PAGE).is_err());
+    }
+
+    /// Pushing the `UNMAPPED` sentinel as a physical id must be rejected, not stored as a
+    /// mapped-but-invisible entry (would advance `len` yet resolve to `None`).
+    #[test]
+    fn push_rejects_unmapped_sentinel() {
+        let mut f = file();
+        let mut dir = PageDirectory::new();
+        assert!(dir.push(&mut f, 0xFFFF_FFFF).is_err());
+        // The failed push must not have advanced the mapped length.
+        assert_eq!(dir.len(), 0);
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(50))]
+        /// Pushing N random physical ids spanning several directory pages: every logical i
+        /// must resolve to exactly what was pushed, and i >= N must resolve to None.
+        #[test]
+        fn push_resolve_roundtrip_multipage(
+            physicals in proptest::collection::vec(0u32..1_000_000, 1..(ENTRIES_PER_DIR_PAGE * 3))
+        ) {
+            let mut f = file();
+            let mut dir = PageDirectory::new();
+            for &p in &physicals {
+                dir.push(&mut f, p).unwrap();
+            }
+            prop_assert_eq!(dir.len(), physicals.len());
+            for (i, &p) in physicals.iter().enumerate() {
+                prop_assert_eq!(dir.resolve(&mut f, i).unwrap(), Some(p));
+            }
+            prop_assert_eq!(dir.resolve(&mut f, physicals.len()).unwrap(), None);
+        }
     }
 }
