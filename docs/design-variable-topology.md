@@ -120,6 +120,17 @@ property は topology のような「容量上限」問題を持たない（appe
 ただし将来 CoW/MVCC では property も論理間接が要るため、その時点で (a) へ移行する余地を残す。
 本ブランチで (a) まで踏み込むかは Phase 3 着手時に最終判断する（§8 未決に追加）。
 
+> **(b) の成立条件 ★レビュー D-1**: (b) が壊れないのは **property ページが物理連続に
+> 割り当てられている**間に限る。blob チェーン読み出し（`storage/value.rs` の `read_raw` /
+> `read`）は次ページを `pid = first_pid + next`（**相対オフセット加算**）で辿っており、
+> first_pid からの物理連続を前提にしている。現状これは `append_page` が常に末尾へ連続追加する
+> ことで成立している。
+> したがって:
+> - 固定境界（`prop_start`）の撤廃自体は (b) を壊さない（連続追加は維持されるため）。
+> - **free-list（§7）で property ページが非連続割り当てになると (b) は即座に破れる**。
+>   free-list を導入する際は、同時に (a) 論理化するか、blob チェーンの next を相対オフセットから
+>   絶対 pid へ変える必要がある。この依存を free-list 着手の前提条件として §7 に記録する。
+
 ## 4. 影響範囲
 
 | 層 | 変更 |
@@ -127,7 +138,7 @@ property は topology のような「容量上限」問題を持たない（appe
 | `storage/file.rs` | ヘッダに directory ルート用フィールド追加 / `VERSION` bump |
 | `storage/topology.rs` | `node_pid`/`edge_pid` を directory 経由の解決に変更、`*_capacity` 撤廃 |
 | 新規 `storage/page_directory.rs` | directory の読み書き・拡張 |
-| `storage/value.rs` | property ページ確保が固定 `prop_start` 前提 → directory 経由へ |
+| `storage/value.rs` | （(b) 物理維持・§3.4 前提）property の空きページ探索が固定 `prop_start..page_count` を走査している箇所を、固定境界に依存しない形へ更新。blob チェーンの相対オフセット参照（`first_pid + next`）は連続割り当て前提なので**当面は維持**（(a) 論理化や free-list 導入時に変更）。 |
 | `db.rs` | セグメント事前確保ロジック（pages 1..prop_start の zero-fill）の撤廃 |
 | `error.rs` | `CapacityExceeded` の扱い（u32 枯渇時のみに縮退） |
 | `commands/info.rs` | `topology_segment_start` から topology ページ数を表示する箇所を更新 |
@@ -165,6 +176,10 @@ ARCHITECTURE.md は `page_directory_root` を **MVCC のトランザクション
 ## 7. 将来拡張（本設計のスコープ外）
 
 - 解放物理ページの free list（directory と相性が良い）。
+  - **前提条件 ★レビュー D-1**: free-list は property ページを**非連続に**割り当てうるため、
+    導入時に §3.4 (b) が破れる。free-list 着手の前に、property RID の (a) 論理化、または
+    blob チェーンの next を相対オフセット（`first_pid + next`）から**絶対 pid**へ変更する
+    ことが必須（さもないと blob 読み出しが壊れる）。
 - CoW / MVCC（directory のルート差し替え）。
 - `node_page_count` / `edge_page_count` の u32 → u64 化（u32 枯渇は現実的に遠いので後回し）。
 
