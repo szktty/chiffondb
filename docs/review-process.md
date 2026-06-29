@@ -47,10 +47,38 @@ caught by **backing the request's claims with the real code and live runs**.
    behavior; if needed, **temporarily reproduce the pre-change state** to determine "was this a
    pre-existing bug / did this change fix it". (Example: temporarily removing the header restore
    in `restore` proved the schema-rollback drift existed before the change.)
-3. **Always remove the probe**. Restore the file unchanged with `git checkout -- <file>` and
-   make `cargo fmt --check` pass. Never dirty production code during review.
+3. **Always remove the probe — by hand, never with a destructive git command.** Delete exactly
+   the lines you added (and revert exactly the lines you temporarily changed), then make
+   `cargo fmt --check` pass. **Do not** use `git checkout -- <file>`, `git stash`, `git reset`,
+   `git restore`, or `git clean` to "clean up": the review may run on a working tree that still
+   holds the implementer's uncommitted code, and those commands would wipe it. See
+   "Protecting the review target" below. Never dirty production code during review.
 4. **Confirm green yourself**: `cargo test --workspace` / `cargo clippy --all-targets -- -D
    warnings` / `cargo fmt --check`. Also verify the request's test-count claims actually hold.
+
+## Protecting the review target (uncommitted code)
+
+The implementation session does not commit its own changes (that happens at `close`), so the
+review often runs against an **uncommitted working tree**. A review session once destroyed that
+work by running a `git checkout -- <file>` / `git stash` to remove a probe, and recovery was only
+possible because another session still held the diff. To prevent a recurrence:
+
+- **Snapshot before reviewing.** As the very first step of `verify`, the review session takes a
+  read-only snapshot of the implementer's diff so it can always be restored:
+  ```bash
+  git add -A && git commit -m "wip: review snapshot 2026-MM-DDx"   # snapshot SHA = the review target
+  ```
+  Review against that SHA. If anything goes wrong, `git reset --hard <snapshot-sha>` restores it
+  exactly. (`git stash` is **not** a substitute: popping a stash puts the code back into the same
+  destructible uncommitted state, and a shared stash stack invites cross-session collisions.)
+  At `close`, the WIP snapshot is folded into the real implementation commit (squash/amend) so it
+  never lands in history as-is.
+- **No destructive git in review.** The review session must never run `git checkout -- <path>`,
+  `git restore`, `git stash`, `git reset --hard`, or `git clean` against anything but its own
+  throwaway probe lines. Probe removal is line-level and manual (step 3 above).
+- **Prefer isolating probes** so there is nothing in production to "restore": put a probe in its
+  own `#[cfg(test)]` module or a scratch file you can delete outright, rather than editing a
+  production function in place.
 
 ## Deliverables
 

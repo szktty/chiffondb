@@ -44,20 +44,27 @@ The first argument word is the subcommand. If none is given, see "When invoked w
 ### `verify` — verification (review session)
 
 Take the review request and back its claims with the real code and live runs.
-Governed by docs/review-process.md §39–53.
+Governed by docs/review-process.md (see "How to review" and "Protecting the review target").
 
 1. Read `docs/review-request-*.md`; note target commit / branch / changed files.
-2. **Read the diff against the real code.** Don't trust the summary; trace into related existing
+2. **Snapshot the review target first.** The implementer's diff is usually uncommitted, so take a
+   read-only snapshot before touching anything: `git add -A && git commit -m "wip: review
+   snapshot 2026-MM-DDx"`. Review against that SHA; if anything goes wrong, `git reset --hard
+   <snapshot-sha>` restores it. (`git stash` is **not** a substitute — see review-process.md.)
+   The snapshot is folded into the implementation commit at `close`.
+3. **Read the diff against the real code.** Don't trust the summary; trace into related existing
    code (trait boundaries, header layout, snapshot/restore paths).
-3. **Prove concerns with throwaway probes.** Insert a temporary test into the crate to observe
+4. **Prove concerns with throwaway probes.** Insert a temporary test into the crate to observe
    behavior; if needed, temporarily reproduce the pre-change state to decide "pre-existing bug
    or fixed by this change".
-4. **Always remove the probe.** Restore production code with `git checkout -- <file>` and make
-   `cargo fmt --check` pass. Never dirty production code during review.
-5. **Permanently add** the kinds of tests the implementer tends to miss (corruption injection,
+5. **Remove the probe by hand — never with a destructive git command.** Delete exactly the lines
+   you added; do **not** run `git checkout -- <file>`, `git stash`, `git reset`, `git restore`,
+   or `git clean` (they would wipe the implementer's uncommitted code). Make `cargo fmt --check`
+   pass. Never dirty production code during review.
+6. **Permanently add** the kinds of tests the implementer tends to miss (corruption injection,
    property tests, invariants, node/edge symmetry). This is filling coverage gaps, not changing
    core logic. Added tests may be committed separately from the implementation diff.
-6. **Confirm green yourself:**
+7. **Confirm green yourself:**
    ```bash
    cargo test --workspace
    cargo clippy --all-targets -- -D warnings
@@ -65,7 +72,7 @@ Governed by docs/review-process.md §39–53.
    PROPTEST_CASES=1000 cargo test --workspace   # CI equivalent
    ```
    Also verify the request's test-count claims actually hold.
-7. If a failing test reveals a core bug, **do not fix it** — record it under Must fix in
+8. If a failing test reveals a core bug, **do not fix it** — record it under Must fix in
    `result` and send it back.
 
 ### `result` — record the review result (review session)
@@ -93,6 +100,8 @@ Run only after the review passes.
 
 1. **Implementation commit**: the implementation session does not commit its own changes, so
    commit the implementation diff here (keeps history clean; no unreviewed code lands in git).
+   If `verify` took a `wip: review snapshot` commit, fold it into the real implementation commit
+   now (`git commit --amend` / squash) so the WIP message never lands in history as-is.
 2. **Progress update**: update TODOs / open items / priorities in `docs/plan-*.md` to match
    reality and **commit** it. Park `Record only / refactor candidate` findings here too.
 3. **Next implement-request**: once the next task and approach are settled in review/discussion,
