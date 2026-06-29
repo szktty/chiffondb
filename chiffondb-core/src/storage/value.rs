@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::error::GraphError;
 use crate::storage::file::DatabaseFile;
 use crate::storage::page::{RecordId, PAGE_SIZE};
-use crate::storage::property::{pages_needed, read_blob_chain, write_blob_chain, SlottedPage};
+use crate::storage::property::{pages_needed, write_blob_chain, SlottedPage};
 
 // ---- Value tag definitions ----
 const TAG_NULL: u8 = 0;
@@ -143,106 +143,17 @@ impl PropertyStore {
         // Serialize the entire HashMap into MessagePack.
         let bytes = rmp_serde::to_vec(props).map_err(|e| GraphError::SchemaError(e.to_string()))?;
 
-        // Check if it fits in a SlottedPage; if not, use a page chain.
-        if bytes.len() + 6 <= PAGE_SIZE {
-            // Try to append to an existing property page.
-            let page_count = db.page_count()?;
-            let prop_start = db.header.property_segment_start;
-
-            for pid in prop_start..page_count {
-                let raw = db.read_page(pid)?;
-                let mut spage = SlottedPage::from_bytes(raw);
-                if !spage.is_valid() {
-                    continue;
-                }
-                if let Ok(slot) = spage.write_property(&bytes) {
-                    db.write_page(pid, spage.as_bytes())?;
-                    return Ok(RecordId::new(pid, slot.0));
-                }
-            }
-
-            // No space found: add a new page.
-            let mut spage = SlottedPage::new();
-            let slot = spage
-                .write_property(&bytes)
-                .map_err(|_| GraphError::StorageCorrupted(0))?;
-            let pid = db.append_page(spage.as_bytes())?;
-            Ok(RecordId::new(pid, slot.0))
-        } else {
-            // Larger than 4 KB: write using a page chain.
-            let needed = pages_needed(bytes.len()).max(1);
-            let mut pages = vec![[0u8; PAGE_SIZE]; needed];
-            write_blob_chain(&mut pages, &bytes)?;
-            let first_pid = db.append_page(&pages[0])?;
-            for page in pages.iter().skip(1) {
-                db.append_page(page)?;
-            }
-            // SlotId=0xFFFF is a sentinel indicating the head of a chain.
-            Ok(RecordId::new(first_pid, 0xFFFF))
-        }
+        write_property_bytes(db, &bytes)
     }
 
     /// Writes raw bytes to a property page and returns the RecordId.
     pub fn write_raw(db: &mut DatabaseFile, bytes: &[u8]) -> Result<RecordId, GraphError> {
-        if bytes.len() + 6 <= PAGE_SIZE {
-            let page_count = db.page_count()?;
-            let prop_start = db.header.property_segment_start;
-
-            for pid in prop_start..page_count {
-                let raw = db.read_page(pid)?;
-                let mut spage = SlottedPage::from_bytes(raw);
-                if !spage.is_valid() {
-                    continue;
-                }
-                if let Ok(slot) = spage.write_property(bytes) {
-                    db.write_page(pid, spage.as_bytes())?;
-                    return Ok(RecordId::new(pid, slot.0));
-                }
-            }
-
-            let mut spage = SlottedPage::new();
-            let slot = spage
-                .write_property(bytes)
-                .map_err(|_| GraphError::StorageCorrupted(0))?;
-            let pid = db.append_page(spage.as_bytes())?;
-            Ok(RecordId::new(pid, slot.0))
-        } else {
-            let needed = pages_needed(bytes.len()).max(1);
-            let mut pages = vec![[0u8; PAGE_SIZE]; needed];
-            write_blob_chain(&mut pages, bytes)?;
-            let first_pid = db.append_page(&pages[0])?;
-            for page in pages.iter().skip(1) {
-                db.append_page(page)?;
-            }
-            Ok(RecordId::new(first_pid, 0xFFFF))
-        }
+        write_property_bytes(db, bytes)
     }
 
     /// Reads raw bytes from the database using a RecordId.
     pub fn read_raw(db: &mut DatabaseFile, rid: RecordId) -> Result<Vec<u8>, GraphError> {
-        if rid.slot_id.0 == 0xFFFF {
-            let page_count = db.page_count()?;
-            let first_pid = rid.page_id.0;
-            let mut pages = Vec::new();
-            let mut pid = first_pid;
-            loop {
-                let page = db.read_page(pid)?;
-                let next = u32::from_le_bytes(page[0..4].try_into().unwrap());
-                pages.push(page);
-                if next == 0xFFFF_FFFF {
-                    break;
-                }
-                pid = first_pid + next;
-                if pages.len() > page_count as usize {
-                    return Err(GraphError::StorageCorrupted(pid));
-                }
-            }
-            read_blob_chain(&pages)
-        } else {
-            let raw = db.read_page(rid.page_id.0)?;
-            let spage = SlottedPage::from_bytes(raw);
-            Ok(spage.read_property(rid.slot_id)?.to_vec())
-        }
+        read_property_bytes(db, rid)
     }
 
     /// Reads a property map from the database using a RecordId.
@@ -250,34 +161,125 @@ impl PropertyStore {
         db: &mut DatabaseFile,
         rid: RecordId,
     ) -> Result<std::collections::HashMap<String, Value>, GraphError> {
-        let bytes = if rid.slot_id.0 == 0xFFFF {
-            // Page chain
-            let page_count = db.page_count()?;
-            let first_pid = rid.page_id.0;
-            let mut pages = Vec::new();
-            let mut pid = first_pid;
-            loop {
-                let page = db.read_page(pid)?;
-                let next = u32::from_le_bytes(page[0..4].try_into().unwrap());
-                pages.push(page);
-                if next == 0xFFFF_FFFF {
-                    break;
-                }
-                pid = first_pid + next;
-                if pages.len() > page_count as usize {
-                    return Err(GraphError::StorageCorrupted(pid));
-                }
-            }
-            read_blob_chain(&pages)?
-        } else {
-            // SlottedPage
-            let raw = db.read_page(rid.page_id.0)?;
-            let spage = SlottedPage::from_bytes(raw);
-            spage.read_property(rid.slot_id)?.to_vec()
-        };
+        let bytes = read_property_bytes(db, rid)?;
 
         rmp_serde::from_slice(&bytes).map_err(|e| GraphError::SchemaError(e.to_string()))
     }
+}
+
+/// Sentinel `slot_id` marking a RID whose `page_id` is the head of a blob page chain.
+const CHAIN_HEAD_SLOT: u16 = 0xFFFF;
+
+/// Writes `bytes` into the property store and returns its RecordId.
+///
+/// The RID's `page_id` is a *logical* property page number (resolved through the property page
+/// directory), not a physical page id. Small values share a slotted page; values larger than a
+/// page are split across a chain whose pages are each mapped into the directory, so the chain is
+/// dense in logical-page space and needs no physical contiguity (design §3.4).
+fn write_property_bytes(db: &mut DatabaseFile, bytes: &[u8]) -> Result<RecordId, GraphError> {
+    if bytes.len() + 6 <= PAGE_SIZE {
+        // Try to reuse a slot in an existing logical property page.
+        let logical_count = db.property_page_count();
+        for logical in 0..logical_count {
+            let raw = db.read_property_page(logical)?;
+            let mut spage = SlottedPage::from_bytes(raw);
+            if !spage.is_valid() {
+                continue;
+            }
+            if let Ok(slot) = spage.write_property(bytes) {
+                db.write_property_page(logical, spage.as_bytes())?;
+                return Ok(RecordId::new(logical as u32, slot.0));
+            }
+        }
+        // No space: map a fresh logical property page.
+        let mut spage = SlottedPage::new();
+        let slot = spage
+            .write_property(bytes)
+            .map_err(|_| GraphError::StorageCorrupted(0))?;
+        let logical = db.alloc_property_page(spage.as_bytes())?;
+        Ok(RecordId::new(logical as u32, slot.0))
+    } else {
+        // Blob chain: each chunk page is mapped into the directory. `write_blob_chain` links
+        // pages by relative index within `pages`; we translate those to the assigned logical
+        // page numbers so the chain can be followed through the directory on read.
+        let needed = pages_needed(bytes.len()).max(1);
+        let mut pages = vec![[0u8; PAGE_SIZE]; needed];
+        write_blob_chain(&mut pages, bytes)?;
+        let mut first_logical = 0usize;
+        let mut logicals = Vec::with_capacity(needed);
+        for (i, page) in pages.iter().enumerate() {
+            let logical = db.alloc_property_page(page)?;
+            if i == 0 {
+                first_logical = logical;
+            }
+            logicals.push(logical);
+        }
+        // Rewrite each page's `next` link from a relative index to the next page's logical
+        // number, so reads resolve the chain through the directory.
+        relink_chain_to_logical(db, &logicals)?;
+        Ok(RecordId::new(first_logical as u32, CHAIN_HEAD_SLOT))
+    }
+}
+
+/// Reads raw property bytes back for `rid` (slotted page or blob chain).
+fn read_property_bytes(db: &mut DatabaseFile, rid: RecordId) -> Result<Vec<u8>, GraphError> {
+    if rid.slot_id.0 == CHAIN_HEAD_SLOT {
+        // Follow the chain by logical page number via the directory.
+        let mut pages = Vec::new();
+        let mut logical = rid.page_id.0 as usize;
+        let limit = db.property_page_count();
+        loop {
+            let page = db.read_property_page(logical)?;
+            let next = u32::from_le_bytes(page[0..4].try_into().unwrap_or([0xFF; 4]));
+            pages.push(page);
+            if next == 0xFFFF_FFFF {
+                break;
+            }
+            logical = next as usize;
+            if pages.len() > limit {
+                return Err(GraphError::StorageCorrupted(logical as u32));
+            }
+        }
+        read_blob_chain_dense(&pages)
+    } else {
+        let raw = db.read_property_page(rid.page_id.0 as usize)?;
+        let spage = SlottedPage::from_bytes(raw);
+        Ok(spage.read_property(rid.slot_id)?.to_vec())
+    }
+}
+
+/// Rewrites the `next` link of each chain page from `write_blob_chain`'s relative index to the
+/// next page's logical page number (`0xFFFF_FFFF` stays as the end sentinel).
+fn relink_chain_to_logical(db: &mut DatabaseFile, logicals: &[usize]) -> Result<(), GraphError> {
+    for (i, &logical) in logicals.iter().enumerate() {
+        let mut page = db.read_property_page(logical)?;
+        let next = if i + 1 < logicals.len() {
+            logicals[i + 1] as u32
+        } else {
+            0xFFFF_FFFF
+        };
+        page[0..4].copy_from_slice(&next.to_le_bytes());
+        db.write_property_page(logical, &page)?;
+    }
+    Ok(())
+}
+
+/// Reassembles blob bytes from chain pages already collected in chain order.
+///
+/// The pages are gathered by following logical `next` links, so they are already in order;
+/// this only concatenates each page's chunk (unlike `read_blob_chain`, which re-follows a
+/// relative-index `next` within the slice).
+fn read_blob_chain_dense(pages: &[[u8; PAGE_SIZE]]) -> Result<Vec<u8>, GraphError> {
+    const CHAIN_HEADER_SIZE: usize = 8;
+    let mut result = Vec::new();
+    for (idx, page) in pages.iter().enumerate() {
+        let chunk_len = u32::from_le_bytes(page[4..8].try_into().unwrap_or([0; 4])) as usize;
+        if CHAIN_HEADER_SIZE + chunk_len > PAGE_SIZE {
+            return Err(GraphError::StorageCorrupted(idx as u32));
+        }
+        result.extend_from_slice(&page[CHAIN_HEADER_SIZE..CHAIN_HEADER_SIZE + chunk_len]);
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -422,5 +424,63 @@ mod tests {
         let mut db2 = DatabaseFile::open(&path).unwrap();
         let loaded = PropertyStore::read(&mut db2, rid).unwrap();
         assert_eq!(props, loaded);
+    }
+
+    /// A blob larger than one page spans a directory-mapped page chain; it must round-trip and
+    /// the RID's `page_id` must be a logical property page number, not a physical pid.
+    #[test]
+    fn large_blob_spans_chain_and_roundtrips() {
+        let (mut db, _path) = make_db();
+        // ~3 pages of data forces a multi-page chain.
+        let big = "x".repeat(PAGE_SIZE * 3);
+        let mut props = HashMap::new();
+        props.insert("blob".to_string(), json!(big));
+        let rid = PropertyStore::write(&mut db, &props).unwrap();
+        assert_eq!(rid.slot_id.0, CHAIN_HEAD_SLOT);
+        // The chain consumed several logical property pages.
+        assert!(db.property_page_count() >= 3);
+        assert_eq!(PropertyStore::read(&mut db, rid).unwrap(), props);
+    }
+
+    /// Property RIDs are logical, so appending unrelated physical pages between property writes
+    /// must not corrupt earlier properties — the directory resolves each logical page wherever
+    /// it physically landed. This is the interleaving the §3.4 logicalization exists to survive.
+    #[test]
+    fn properties_survive_interleaved_physical_appends() {
+        let (mut db, _path) = make_db();
+        let mut first = HashMap::new();
+        first.insert("a".to_string(), json!("first"));
+        let rid1 = PropertyStore::write(&mut db, &first).unwrap();
+
+        // Simulate a topology page being appended to the file tail between property writes.
+        db.append_page(&[7u8; PAGE_SIZE]).unwrap();
+
+        let mut second = HashMap::new();
+        second.insert("b".to_string(), json!("second"));
+        let rid2 = PropertyStore::write(&mut db, &second).unwrap();
+
+        // Another interleaved append, then read both back.
+        db.append_page(&[9u8; PAGE_SIZE]).unwrap();
+
+        assert_eq!(PropertyStore::read(&mut db, rid1).unwrap(), first);
+        assert_eq!(PropertyStore::read(&mut db, rid2).unwrap(), second);
+    }
+
+    /// Large blob + interleaved appends + reopen: the chain must still resolve from the
+    /// persisted property-directory metadata in the header.
+    #[test]
+    fn large_blob_persists_across_reopen_with_interleaving() {
+        let (mut db, path) = make_db();
+        let big = "y".repeat(PAGE_SIZE * 2 + 100);
+        let mut props = HashMap::new();
+        props.insert("blob".to_string(), json!(big));
+        db.append_page(&[1u8; PAGE_SIZE]).unwrap();
+        let rid = PropertyStore::write(&mut db, &props).unwrap();
+        db.append_page(&[2u8; PAGE_SIZE]).unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let mut db2 = DatabaseFile::open(&path).unwrap();
+        assert_eq!(PropertyStore::read(&mut db2, rid).unwrap(), props);
     }
 }

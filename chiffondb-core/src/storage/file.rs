@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use crate::error::GraphError;
 use crate::storage::buffer::PageCache;
 use crate::storage::page::PAGE_SIZE;
+use crate::storage::page_directory::PageDirectory;
 use crate::storage::wal::{wal_path, WalFile};
 
 /// Default in-memory page-cache budget for file-backed databases.
@@ -74,9 +75,10 @@ pub const MAGIC: &[u8; 8] = b"CHIFFON\0";
 /// On-disk format version. v2 added topology page counts at header offsets 40..48
 /// (file-backed topology, Phase 2). v3 accompanies the product rename to ChiffonDB,
 /// which also changed the magic from `TANABATA` to `CHIFFON\0`; old files are rejected.
-/// A mismatch is rejected by `FileHeader::deserialize` to avoid silently misreading
-/// an older layout.
-pub const VERSION: u32 = 3;
+/// v4 (variable-topology) adds the property page-directory root/len at offsets 48..56 and
+/// makes property RIDs logical page numbers. A mismatch is rejected by
+/// `FileHeader::deserialize` to avoid silently misreading an older layout.
+pub const VERSION: u32 = 4;
 pub const TOPOLOGY_SEGMENT_DEFAULT_START: u32 = 1;
 pub const PROPERTY_SEGMENT_DEFAULT_START: u32 = 64;
 pub const VECTOR_SEGMENT_DEFAULT_START: u32 = 0;
@@ -98,7 +100,16 @@ pub struct FileHeader {
     pub node_page_count: u32,
     /// Number of logical edge pages in use within the topology segment.
     pub edge_page_count: u32,
+    /// Root physical page of the property page directory (`0xFFFF_FFFF` = none yet).
+    /// Property RIDs are logical page numbers resolved through this directory, so property
+    /// pages no longer need a fixed contiguous range (design §3.4, variable-topology).
+    pub property_dir_root: u32,
+    /// Number of mapped logical property pages.
+    pub property_dir_len: u32,
 }
+
+/// Header sentinel for "no page-directory root yet" (matches `PageDirectory::root`'s UNMAPPED).
+pub const NO_DIR_ROOT: u32 = 0xFFFF_FFFF;
 
 impl Default for FileHeader {
     fn default() -> Self {
@@ -118,6 +129,8 @@ impl FileHeader {
             schema_version: 0,
             node_page_count: 1,
             edge_page_count: 1,
+            property_dir_root: NO_DIR_ROOT,
+            property_dir_len: 0,
         }
     }
 
@@ -134,6 +147,8 @@ impl FileHeader {
         buf[36..40].copy_from_slice(&self.schema_version.to_le_bytes());
         buf[40..44].copy_from_slice(&self.node_page_count.to_le_bytes());
         buf[44..48].copy_from_slice(&self.edge_page_count.to_le_bytes());
+        buf[48..52].copy_from_slice(&self.property_dir_root.to_le_bytes());
+        buf[52..56].copy_from_slice(&self.property_dir_len.to_le_bytes());
         buf
     }
 
@@ -161,6 +176,8 @@ impl FileHeader {
         // segment always has at least one logical node and edge page).
         let node_page_count = u32::from_le_bytes(buf[40..44].try_into().unwrap()).max(1);
         let edge_page_count = u32::from_le_bytes(buf[44..48].try_into().unwrap()).max(1);
+        let property_dir_root = u32::from_le_bytes(buf[48..52].try_into().unwrap());
+        let property_dir_len = u32::from_le_bytes(buf[52..56].try_into().unwrap());
         Ok(Self {
             version,
             topology_segment_start,
@@ -171,6 +188,8 @@ impl FileHeader {
             schema_version,
             node_page_count,
             edge_page_count,
+            property_dir_root,
+            property_dir_len,
         })
     }
 }
@@ -485,6 +504,71 @@ impl DatabaseFile {
     pub fn write_header(&mut self) -> Result<(), GraphError> {
         let buf = self.header.serialize();
         self.write_page(0, &buf)
+    }
+
+    // ---- Property page directory ----
+    //
+    // Property pages are addressed by logical page number, resolved to a physical page
+    // through a `PageDirectory` whose root/len live in the header. This keeps property RIDs
+    // stable while their physical pages may be interleaved with topology pages on the append
+    // tail (design §3.4: property RID logicalization).
+
+    /// Builds a `PageDirectory` view over the property directory from the header metadata.
+    fn property_dir(&self) -> PageDirectory {
+        if self.header.property_dir_root == NO_DIR_ROOT {
+            PageDirectory::new()
+        } else {
+            PageDirectory::with_root(
+                self.header.property_dir_root,
+                self.header.property_dir_len as usize,
+            )
+        }
+    }
+
+    /// Persists the property directory metadata back into the header (through the WAL, so a
+    /// crash without flush still recovers a consistent mapping).
+    fn store_property_dir(&mut self, dir: &PageDirectory) -> Result<(), GraphError> {
+        self.header.property_dir_root = dir.root();
+        self.header.property_dir_len = dir.len() as u32;
+        self.write_header()
+    }
+
+    /// Number of mapped logical property pages.
+    pub fn property_page_count(&self) -> usize {
+        self.header.property_dir_len as usize
+    }
+
+    /// Resolves a logical property page number to its physical page id.
+    pub fn resolve_property_page(&mut self, logical: usize) -> Result<u32, GraphError> {
+        let dir = self.property_dir();
+        dir.resolve(self, logical)?
+            .ok_or(GraphError::StorageCorrupted(logical as u32))
+    }
+
+    /// Allocates a fresh physical property page initialized with `data`, maps it into the
+    /// property directory, and returns the assigned logical page number.
+    pub fn alloc_property_page(&mut self, data: &[u8; PAGE_SIZE]) -> Result<usize, GraphError> {
+        let physical = self.append_page(data)?;
+        let mut dir = self.property_dir();
+        let logical = dir.push(self, physical)?;
+        self.store_property_dir(&dir)?;
+        Ok(logical)
+    }
+
+    /// Overwrites the physical page backing logical property page `logical`.
+    pub fn write_property_page(
+        &mut self,
+        logical: usize,
+        data: &[u8; PAGE_SIZE],
+    ) -> Result<(), GraphError> {
+        let physical = self.resolve_property_page(logical)?;
+        self.write_page(physical, data)
+    }
+
+    /// Reads the physical page backing logical property page `logical`.
+    pub fn read_property_page(&mut self, logical: usize) -> Result<[u8; PAGE_SIZE], GraphError> {
+        let physical = self.resolve_property_page(logical)?;
+        self.read_page(physical)
     }
 
     /// Returns the WAL file path (file backend only; intended for tests).
