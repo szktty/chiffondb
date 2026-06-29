@@ -2,6 +2,7 @@ pub mod buffer;
 pub mod file;
 pub mod index;
 pub mod page;
+pub mod page_directory;
 pub mod property;
 pub mod record;
 pub mod topology;
