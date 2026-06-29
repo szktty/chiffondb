@@ -97,6 +97,29 @@ logical edge page i ─┘
 - 解放ページの再利用（free list）は**本設計の必須要件ではない**が、directory があると
   自然に載るため将来拡張として節を立てる（§7）。
 
+### 3.4 property RID の意味 ★レビュー C-1
+
+現状、RID の論理／物理が**非対称**になっている（レビュー指摘 C-1）:
+
+- **topology RID は論理**（`alloc_node` が論理番号を格納、`node_pid()` で物理変換）。
+- **property RID は物理**。`PropertyStore::write`（`storage/value.rs`）は
+  `prop_start..page_count` をスキャンし、空きが無ければ `append_page` で得た**物理 pid**を
+  そのまま RID として返し、`node.property_ref` に永続化している。
+
+property セグメントも固定境界を撤廃する（§4）以上、property RID をどう扱うか決める必要がある。
+
+選択肢:
+- (a) **property RID も論理化**: property 用 directory を導入し、topology と対称にする。
+  RID の意味が全体で「論理」に統一され、将来 CoW にも乗る。実装量は増える。
+- (b) **property RID は物理のまま**: property ページは `append_page` で末尾に伸ばし続け、
+  RID は物理 pid を保持。固定境界を撤廃しても物理 pid 参照は壊れない（セグメント分割が
+  無くなるだけ）。実装は最小。
+
+→ **暫定方針: (b) 物理維持**（シンプル優先）。固定境界撤廃の主目的は満たせるうえ、
+property は topology のような「容量上限」問題を持たない（append で伸びる）。
+ただし将来 CoW/MVCC では property も論理間接が要るため、その時点で (a) へ移行する余地を残す。
+本ブランチで (a) まで踏み込むかは Phase 3 着手時に最終判断する（§8 未決に追加）。
+
 ## 4. 影響範囲
 
 | 層 | 変更 |
@@ -107,7 +130,9 @@ logical edge page i ─┘
 | `storage/value.rs` | property ページ確保が固定 `prop_start` 前提 → directory 経由へ |
 | `db.rs` | セグメント事前確保ロジック（pages 1..prop_start の zero-fill）の撤廃 |
 | `error.rs` | `CapacityExceeded` の扱い（u32 枯渇時のみに縮退） |
+| `commands/info.rs` | `topology_segment_start` から topology ページ数を表示する箇所を更新 |
 | ARCHITECTURE.md | セグメント固定境界の記述を更新 |
+| **テスト** | 固定境界を前提にした容量計算（例: `db.rs:2867` 付近の `property_segment_start - topology_segment_start` による `node_capacity` 算出、`index.rs` / `pathfinding` の `make` ヘルパが pages 1..64 を事前確保する箇所）も改修対象（レビュー記録3）。 |
 
 ## 5. 移行（既存ファイルの互換）
 
@@ -131,6 +156,12 @@ ARCHITECTURE.md は `page_directory_root` を **MVCC のトランザクション
 → **決定: (i) 統合**（シンプルな方針を優先）。directory 間接化は CoW の前提そのものなので
 統合が自然。MVCC 実装時にルート差し替えのセマンティクスを確定させる（将来作業）。
 
+> **更新規律の注意（レビュー記録）**: 本ブランチの directory は **in-place 更新**（既存
+> directory ページを書き換え、WAL write-through で永続化）であり、CoW ではない。将来 MVCC で
+> CoW（書き込み時に directory ページを複製して新ルートへ差し替え）へ移行する際は、この
+> in-place 規律を CoW 規律へ置き換える必要がある。統合フィールドの再利用自体は MVCC の選択肢を
+> 閉ざさないが、更新規律の切り替えは MVCC 実装時の必須作業として残る。
+
 ## 7. 将来拡張（本設計のスコープ外）
 
 - 解放物理ページの free list（directory と相性が良い）。
@@ -147,8 +178,12 @@ ARCHITECTURE.md は `page_directory_root` を **MVCC のトランザクション
 
 未決（実装途中で詰める）:
 5. directory のキャッシュ戦略（page-cache に載せるだけでよいか、ホットなルート段を別持ちするか）。
-6. WAL / ロールバックとの整合（directory 拡張も WAL 経由のため write-through で問題ないかの確認）。
+6. WAL / ロールバックとの整合（directory 拡張・インデックス更新も WAL 経由で write-through /
+   rollback されるか。§11.3 の整合保証は「インデックスを全てオンディスクページに置く」ことに
+   依存する＝本項と連動。`storage/file.rs` / `storage/buffer.rs` の write/rollback 経路で確認）。
 7. インデックスのデータ構造詳細（B-tree のノードレイアウト・分割閾値など。§11 で方針のみ確定）。
+8. §3.4 property RID を論理化(a)するか物理維持(b)するか（暫定: b。Phase 3 着手時に最終判断）。
+9. §11 層1ラベルインデックスのキーを primary type のみ(a)／全ラベル(b)にするか（暫定: b 全ラベル）。
 
 ## 9. 段階実装プラン（案）
 
@@ -202,6 +237,21 @@ O(nodes) のため実用不可になる。容量拡大とインデックスは�
 - 構造: `type_id → ノード RecordId 集合`。実装は B-tree もしくは型ごとのページチェーン
   （挿入/削除が O(log n)〜O(1)）。page directory 上に載せ、メモリは page-cache で頭打ち。
 
+#### マルチラベル／動的ラベルの扱い ★レビュー C-3
+
+現状の `rids_of_type`（`index.rs`）は `node.node_type_id`（**primary type のみ**）で
+フィルタしており、追加ラベル（`label_ref` 経由のマルチラベル）や動的ラベルは見ていない。
+一方、ノードは set-normalized マルチラベル・動的ラベルを既に持てる（直近の機能）。
+
+→ **決定が必要**: 層1インデックスのキーを
+- (a) **primary type のみ**にする（現状 `rids_of_type` の semantics を維持。最小）。
+- (b) **全ラベル**（primary + 追加 + 動的）にし、`MATCH (n:Label)` がどのラベルでも当たる
+  ようにする（標準グラフ DB の挙動に近い。1ノードが複数キーに載る）。
+
+→ **暫定方針: (b) 全ラベル**。マルチラベル機能を入れた以上、ラベル検索がそれを無視するのは
+一貫しない。1ノードを所属する各 `type_id` の集合に登録する。既存の `rids_of_type`
+（primary のみ）の呼び出し側があれば semantics 変更の影響を Phase 4 で精査する。
+
 ### 層2: プロパティインデックス — 明示宣言（B-tree）
 
 - `(型, プロパティキー) → ノード` の二次インデックス。`find` / `find_all` を加速する。
@@ -210,6 +260,18 @@ O(nodes) のため実用不可になる。容量拡大とインデックスは�
   （traversal に既存）も加速できる。page directory 上に配置。
 - インデックスキーは **`PropertyPath`**（`traversal/command.rs` に既存）を流用し、
   フラットキーと **JSON ネストキー**の両方をサポート（§11.2）。
+
+#### 検索 API の拡張 ★レビュー C-2
+
+現状の `index::find` / `find_all`（`index.rs`）および `db.rs` の呼び出し
+（`db.rs:1001` ほか）は **`key: &str` の平坦キーのみ**を受け、`PropertyPath` は経由して
+**いない**（レビュー指摘 C-2: 「現状 semantics と整合」という暗黙前提は不正確）。
+したがって本設計は **検索 API を `PropertyPath` 受けに拡張する**ことを含む:
+
+- `find` / `find_all` のキー引数を `&str` → `PropertyPath`（`From<&str>` 既存なので
+  平坦キーは引き続き渡せる）に変更する。
+- インデックスが張られた `(型, PropertyPath)` は B+tree 探索へ、未索引は従来どおり
+  全件スキャンへフォールバックする（プランナの最小形）。
 
 ### 層3: 一意制約（unique constraint）
 
@@ -247,3 +309,9 @@ O(nodes) のため実用不可になる。容量拡大とインデックスは�
 - インデックスはノードの挿入 / 更新 / 削除と**同一トランザクション内**で更新する
   （WAL write-through に載せ、ロールバックで一緒に巻き戻る）。
 - 索引と実体（topology / property）の二重更新の原子性は WAL に委ねる。
+- **前提（レビュー記録 / §8 未決6 と連動）**: この WAL ロールバック保証が成立するのは
+  **インデックス構造を全てオンディスクページに置き**、その更新が `read_page`/`write_page`
+  経由で WAL に載る場合に限る。インメモリのインデックス状態を別に持つと、ロールバック時に
+  オンディスクとメモリが乖離しうる。したがって層1〜3 のインデックスは page directory 上の
+  ページに常駐させ、インメモリの可変状態を持たない設計とする（メモリは page-cache で頭打ち、
+  という engine 全体の不変条件とも一致）。
