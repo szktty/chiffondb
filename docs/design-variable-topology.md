@@ -115,21 +115,33 @@ property セグメントも固定境界を撤廃する（§4）以上、property
   RID は物理 pid を保持。固定境界を撤廃しても物理 pid 参照は壊れない（セグメント分割が
   無くなるだけ）。実装は最小。
 
-→ **暫定方針: (b) 物理維持**（シンプル優先）。固定境界撤廃の主目的は満たせるうえ、
-property は topology のような「容量上限」問題を持たない（append で伸びる）。
-ただし将来 CoW/MVCC では property も論理間接が要るため、その時点で (a) へ移行する余地を残す。
-本ブランチで (a) まで踏み込むかは Phase 3 着手時に最終判断する（§8 未決に追加）。
+→ **決定: (a) property RID も論理化**（Phase 2 で前倒し確定。当初は (b) 暫定だったが、
+Phase 2 実装中に (b) が成立しないと判明したため変更）。
 
-> **(b) の成立条件 ★レビュー D-1**: (b) が壊れないのは **property ページが物理連続に
-> 割り当てられている**間に限る。blob チェーン読み出し（`storage/value.rs` の `read_raw` /
-> `read`）は次ページを `pid = first_pid + next`（**相対オフセット加算**）で辿っており、
-> first_pid からの物理連続を前提にしている。現状これは `append_page` が常に末尾へ連続追加する
-> ことで成立している。
-> したがって:
-> - 固定境界（`prop_start`）の撤廃自体は (b) を壊さない（連続追加は維持されるため）。
-> - **free-list（§7）で property ページが非連続割り当てになると (b) は即座に破れる**。
->   free-list を導入する際は、同時に (a) 論理化するか、blob チェーンの next を相対オフセットから
->   絶対 pid へ変える必要がある。この依存を free-list 着手の前提条件として §7 に記録する。
+> **(b) を破棄した理由 ★Phase 2 実装で判明**: 当初は (b) 物理維持（property は `append_page`
+> で末尾連続）を暫定とし、(a) は Phase 3 で判断する予定だった。しかし Phase 2 で topology を
+> 可変長化すると、topology のレコードページ／directory ページも `append_page`（単一カウンタ）で
+> ファイル末尾に取られる。この結果、property の連続前提が **2 点で実際に破綻する**ことを実コードで
+> 確認した:
+> 1. **property スキャンの誤読**: `PropertyStore::write`（`value.rs`）は `prop_start..page_count`
+>    の全ページを property ページとみなして走査する。間に入った topology / directory ページを
+>    `SlottedPage::is_valid()` が弾けない（先頭2バイトを `slot_count` として読むだけの緩い検査で、
+>    レコードページが偶然通過しうる）→ **topology ページに property を書き込んで破壊しうる**。
+> 2. **blob チェーンの分断**: blob 読み出しは `pid = first_pid + next`（相対オフセット）で辿る
+>    （§3.4 の (b) 成立条件）。チェーンの途中に topology ページが割り込むと参照先がずれ、
+>    **blob 読み出しが壊れる**。
+>
+> したがって「topology を append 末尾に混ぜつつ property を物理連続に保つ」ことは両立しない。
+> (a) 論理化は **property も page directory 経由**にし、物理ページが全種類混在しても論理番号で
+> 完全分離する。これにより `prop_start..page_count` スキャンも blob 相対オフセットも不要になり、
+> 上記2点を**同時に根本解決**する。free-list（§7）や CoW の前提も自然に整う。
+>
+> **実装の含意（Phase 2 スコープ拡大）**:
+> - property 用の独立 `PageDirectory`（node/edge directory と同様）を導入。
+> - property RID の `page_id` を物理 pid → 論理番号に変更（`encode_record_id_6` の意味が変わる）。
+> - blob チェーンの next を **絶対 pid（→ 論理番号）参照**に変更、または各ページ確保時に directory へ
+>   push して論理連続で辿る形に。`value.rs` の `prop_start..page_count` 走査を directory ベースの
+>   空きページ探索へ置き換える。
 
 ## 4. 影響範囲
 
@@ -138,7 +150,8 @@ property は topology のような「容量上限」問題を持たない（appe
 | `storage/file.rs` | ヘッダに directory ルート用フィールド追加 / `VERSION` bump |
 | `storage/topology.rs` | `node_pid`/`edge_pid` を directory 経由の解決に変更、`*_capacity` 撤廃 |
 | 新規 `storage/page_directory.rs` | directory の読み書き・拡張 |
-| `storage/value.rs` | （(b) 物理維持・§3.4 前提）property の空きページ探索が固定 `prop_start..page_count` を走査している箇所を、固定境界に依存しない形へ更新。blob チェーンの相対オフセット参照（`first_pid + next`）は連続割り当て前提なので**当面は維持**（(a) 論理化や free-list 導入時に変更）。 |
+| `storage/value.rs` | （(a) 論理化・§3.4 決定）property も page directory 経由へ。`prop_start..page_count` の固定走査を directory ベースの空きページ探索に置換し、blob チェーンの相対オフセット参照を論理番号参照へ変更。property RID の `page_id` を物理 pid → 論理番号に。 |
+| `storage/record.rs` | property RID（`encode_record_id_6`）の `page_id` が物理→論理に変わる前提を確認（serialize 自体は不変だが意味が変わる）。 |
 | `db.rs` | セグメント事前確保ロジック（pages 1..prop_start の zero-fill）の撤廃 |
 | `error.rs` | `CapacityExceeded` の扱い（u32 枯渇時のみに縮退） |
 | `commands/info.rs` | `topology_segment_start` から topology ページ数を表示する箇所を更新 |
@@ -176,10 +189,10 @@ ARCHITECTURE.md は `page_directory_root` を **MVCC のトランザクション
 ## 7. 将来拡張（本設計のスコープ外）
 
 - 解放物理ページの free list（directory と相性が良い）。
-  - **前提条件 ★レビュー D-1**: free-list は property ページを**非連続に**割り当てうるため、
-    導入時に §3.4 (b) が破れる。free-list 着手の前に、property RID の (a) 論理化、または
-    blob チェーンの next を相対オフセット（`first_pid + next`）から**絶対 pid**へ変更する
-    ことが必須（さもないと blob 読み出しが壊れる）。
+  - **前提条件 ★レビュー D-1 → Phase 2 で解消**: かつて (b) 物理維持だった頃は free-list が
+    property の物理連続を壊すため阻害要因だった。Phase 2 で property RID を (a) 論理化した
+    （§3.4）ことで、property ページは directory 経由で非連続割り当てに耐える。free-list 導入の
+    前提条件はすでに満たされている。
 - CoW / MVCC（directory のルート差し替え）。
 - `node_page_count` / `edge_page_count` の u32 → u64 化（u32 枯渇は現実的に遠いので後回し）。
 
@@ -197,7 +210,8 @@ ARCHITECTURE.md は `page_directory_root` を **MVCC のトランザクション
    rollback されるか。§11.3 の整合保証は「インデックスを全てオンディスクページに置く」ことに
    依存する＝本項と連動。`storage/file.rs` / `storage/buffer.rs` の write/rollback 経路で確認）。
 7. インデックスのデータ構造詳細（B-tree のノードレイアウト・分割閾値など。§11 で方針のみ確定）。
-8. §3.4 property RID を論理化(a)するか物理維持(b)するか（暫定: b。Phase 3 着手時に最終判断）。
+8. ~~§3.4 property RID を論理化(a)するか物理維持(b)するか~~ → **決定: (a) 論理化（§3.4、
+   Phase 2 で前倒し確定。(b) は混在 append で破綻するため）**。
 9. §11 層1ラベルインデックスのキーを primary type のみ(a)／全ラベル(b)にするか（暫定: b 全ラベル）。
 
 ## 9. 段階実装プラン（案）

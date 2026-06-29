@@ -7,6 +7,23 @@ and `docs/plan-variable-topology.md`.
 - Branch: `feature/variable-topology` (continue on it; forked from `e134249`).
 - Source design: design §9 Phase 2.
 
+## ⚠️ Revised 2026-06-30 — scope expanded: property RID logicalization folded in
+
+During Phase 2 implementation it became clear (verified against the real code) that wiring
+topology through the directory **forces** property RIDs to be logicalized too. Once topology
+record/directory pages are appended to the same file tail as property pages, the `(b) keep
+property physical` plan breaks in two concrete ways:
+
+1. `PropertyStore::write` scans `prop_start..page_count` treating every page as a property page;
+   `SlottedPage::is_valid()` is too weak to reject an interleaved topology/directory page, so a
+   property write can land on — and corrupt — a topology page.
+2. Blob chains follow `pid = first_pid + next` (relative offset), so a topology page inserted
+   mid-chain breaks blob reads.
+
+**Decision (design §3.4 updated b→a):** property is now **also routed through a `PageDirectory`**
+in this phase. This supersedes the original "Out of scope: property RID stays physical" line
+below. See the expanded Work item 7 and the updated Out-of-scope section.
+
 ## Goal
 
 Replace the fixed, physically-interleaved topology layout with logical→physical resolution
@@ -48,10 +65,22 @@ topology beyond the old `[topology_segment_start, property_segment_start)` range
 
 - A database can insert well beyond ~2000 nodes (add a test that previously hit
   `CapacityExceeded` and now passes).
-- Reopen restores topology built across multiple directory pages.
+- Reopen restores topology **and properties** built across multiple directory pages.
+- Properties (including >4 KB blob chains) survive interleaved topology/property growth — add a
+  test that writes large blobs while also growing topology, then reads them back intact.
 - `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`
   all green; `PROPTEST_CASES=1000` for any new proptest.
 - No `unwrap()`/`expect()`/`unsafe`; comments English, WHY-only.
+
+7. **Property RID logicalization (folded in — design §3.4 (a)).** Give the property store its own
+   `PageDirectory`. Change property RID `page_id` from a physical pid to a logical page number
+   (`record.rs` `encode_record_id_6` serialization is unchanged; only the meaning shifts).
+   Replace the `prop_start..page_count` free-page scan in `value.rs` (`write` / `write_raw`) with
+   a directory-based search, and resolve property pages through the directory on read. Change the
+   blob-chain `next` link so it no longer assumes physical contiguity (either store the logical
+   page number per chain page and resolve each through the directory, or push each chain page into
+   the directory so the chain is logically dense). Node/edge `property_ref` values stored on disk
+   become logical — confirm read/write paths round-trip.
 
 ## Must address (carried from Phase 1 review — plan E-2)
 
@@ -62,12 +91,12 @@ topology beyond the old `[topology_segment_start, property_segment_start)` range
 
 ## Out of scope (do not do here)
 
-- Property / vector segment boundary removal (Phase 3) — topology only.
+- Vector segment boundary removal — defer to Phase 3 (no vector data is written yet).
 - Any index work (Phases 4–6).
-- Property RID logicalization (design §3.4 (a)) — property RID stays physical; do not touch
-  `value.rs` blob-chain logic.
-- `VERSION` bump / ARCHITECTURE.md (Phase 7) — though if the on-disk header layout changes here,
-  note it for Phase 7.
+- `VERSION` bump / ARCHITECTURE.md (Phase 7) — though the on-disk header layout *does* change
+  here (directory roots/lens for node/edge/property), so note the new layout for Phase 7.
+- Free-list / page reuse, CoW — future work (§7). (Logicalizing property RID removes the former
+  blocker, but do not implement reuse here.)
 
 ## Approach is decided — do not re-deliberate
 

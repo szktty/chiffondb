@@ -11,8 +11,8 @@ Updated by the review session at each `close`.
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 1 | `PageDirectory` data structure + read/write (test-first) | ✅ done (`676dfc7`, `a9283d1`) |
-| 2 | Wire `topology.rs` physical resolution through the directory; drop `*_capacity` | ⏭️ next |
-| 3 | Remove the fixed property / vector segment boundaries | todo |
+| 2 | Wire topology through the directory; drop `*_capacity`; **+ logicalize property RID (folded in, §3.4 a)** | 🚧 in progress |
+| 3 | Remove the fixed vector segment boundary (property folded into Phase 2) | todo |
 | 4 | Tier-1 label index (`list`/`count`/type filter → O(matches)) | todo |
 | 5 | Tier-2 property index (schema DSL `@index` + B+tree) | todo |
 | 6 | Tier-3 unique constraint (unique variant of tier 2) | todo |
@@ -43,7 +43,7 @@ Post-implementation cleanup & squash merge: design §10 (do **not** start until 
 - (6) WAL/rollback consistency for directory growth and index updates (§11.3 premise: indexes
   must live fully on-disk).
 - (7) B+tree node layout / split thresholds (only the approach is fixed in §11).
-- (8) property RID: logicalize (a) vs. keep physical (b) — tentative (b), decide at Phase 3
-  (precondition for free-list, design §3.4 / §7).
+- (8) ~~property RID: logicalize (a) vs. keep physical (b)~~ → **decided (a) logicalize**, folded
+  into Phase 2 (the (b) plan breaks once topology shares the append tail — design §3.4).
 - (9) tier-1 label index key: primary type only (a) vs. all labels (b) — tentative (b),
   decide at Phase 4.
