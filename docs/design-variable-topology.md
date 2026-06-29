@@ -87,8 +87,9 @@ logical edge page i ─┘
 - (A) 名前空間プレフィックスを論理番号の最上位ビットで分ける（node = 0xx…, edge = 1xx…）。
 - (B) node/edge それぞれに独立した directory を持つ。
 
-→ **(B) を推奨**。`node_page_count` / `edge_page_count` が既に独立管理されており、
-スキャン（`live_node_rids` 等）も論理 0..count で回しているため、移行が素直。
+→ **決定: (B) 独立 directory**（シンプルな方針を優先）。`node_page_count` /
+`edge_page_count` が既に独立管理されており、スキャン（`live_node_rids` 等）も
+論理 0..count で回しているため、移行が素直。
 
 ### 3.3 物理ページの確保と再利用
 
@@ -117,7 +118,7 @@ logical edge page i ─┘
   （現状の version 不一致エラーの挙動を踏襲）。アップグレード変換は実装しない。
 - 容量上限の拡大を最優先とし、移行パスの実装コストはかけない。
 
-## 6. `page_directory_root`（MVCC 予約）との関係 ★要決定
+## 6. `page_directory_root`（MVCC 予約）との関係
 
 ARCHITECTURE.md は `page_directory_root` を **MVCC のトランザクション単位 page directory**
 用に予約している。本設計の directory は「論理→物理の恒久マッピング」であり、目的が異なる。
@@ -127,8 +128,8 @@ ARCHITECTURE.md は `page_directory_root` を **MVCC のトランザクション
   （CoW でルートを差し替える土台になる）。フィールドを再利用。
 - (ii) **別フィールドに分離**: 恒久 directory と MVCC スナップショット root を別管理にする。
 
-→ 暫定推奨: **(i)**。directory 間接化は CoW の前提そのものなので統合が自然。
-ただし MVCC 実装時にルート差し替えのセマンティクスを確定させる必要がある。
+→ **決定: (i) 統合**（シンプルな方針を優先）。directory 間接化は CoW の前提そのものなので
+統合が自然。MVCC 実装時にルート差し替えのセマンティクスを確定させる（将来作業）。
 
 ## 7. 将来拡張（本設計のスコープ外）
 
@@ -136,22 +137,36 @@ ARCHITECTURE.md は `page_directory_root` を **MVCC のトランザクション
 - CoW / MVCC（directory のルート差し替え）。
 - `node_page_count` / `edge_page_count` の u32 → u64 化（u32 枯渇は現実的に遠いので後回し）。
 
-## 8. 未決事項
+## 8. 決定事項 / 未決事項
 
-1. §6: MVCC 用 `page_directory_root` と統合するか分離するか。（暫定: 統合）
-2. ~~§5: 旧 v3 ファイルの扱い~~ → **決定済み: 後方互換を取らず拒否（§0, §5）**。
-3. §3.2: node/edge の論理空間分離は (A) ビットプレフィックス / (B) 独立 directory のどちらか。
-   （暫定: B 独立 directory）
-4. directory のキャッシュ戦略（page-cache に載せるだけでよいか、ホットなルート段を別持ちするか）。
-5. WAL / ロールバックとの整合（directory 拡張も WAL 経由のため write-through で問題ないかの確認）。
+決定済み:
+1. ~~§6: MVCC 用 `page_directory_root` と統合か分離か~~ → **決定: 統合（§6）**。
+2. ~~§5: 旧 v3 ファイルの扱い~~ → **決定: 後方互換を取らず拒否（§0, §5）**。
+3. ~~§3.2: node/edge の論理空間分離~~ → **決定: (B) 独立 directory（§3.2）**。
+4. ~~インデックスのスコープ~~ → **決定: 容量拡大とインデックスを同時に設計（§11）**。
+
+未決（実装途中で詰める）:
+5. directory のキャッシュ戦略（page-cache に載せるだけでよいか、ホットなルート段を別持ちするか）。
+6. WAL / ロールバックとの整合（directory 拡張も WAL 経由のため write-through で問題ないかの確認）。
+7. インデックスのデータ構造詳細（B-tree のノードレイアウト・分割閾値など。§11 で方針のみ確定）。
 
 ## 9. 段階実装プラン（案）
 
 - Phase 1: page directory データ構造と読み書き（単体テスト先行。容量境界・チェーン拡張）。
 - Phase 2: `topology.rs` の物理解決を directory 経由に差し替え（既存テスト緑維持）。
 - Phase 3: property / vector セグメントの固定境界撤廃。
-- Phase 4: `VERSION` bump・移行・ARCHITECTURE.md 更新。
+- Phase 4: ラベルインデックス（§11 層1）。`list`/`count`/型フィルタを O(matches) に。
+- Phase 5: プロパティインデックス（§11 層2）。スキーマ DSL 拡張 + B-tree。
+- Phase 6: 一意制約（§11 層3）をプロパティインデックスの一意版として。
+- Phase 7: `VERSION` bump・ARCHITECTURE.md 更新。
 - 各 Phase の停止点で `docs/review-request-*` を作成（CLAUDE.md のレビューワークフロー）。
+
+### コスト見直しの方針
+
+インデックス（特に Phase 5 の B-tree）は実装コストが大きくなりうる。途中で**実装コストが
+過大と判明した場合は立ち止まり、スコープを見直す**（例: B-tree → 等価専用ハッシュへ縮退、
+層2/層3 を別ブランチへ切り出す等）。容量拡大（Phase 1–3）は本ブランチの主目的なので維持し、
+インデックスの段は柔軟に調整する。
 
 ## 10. 実装完了後の作業（クリーンアップ & マージ）
 
@@ -170,3 +185,65 @@ ARCHITECTURE.md は `page_directory_root` を **MVCC のトランザクション
    実装ドキュメントを参照する旨を記す（CHANGELOG 本体には要点のみ）。
 5. **スカッシュマージ**: `feature/variable-topology` を `main` へスカッシュマージする。
    ただし **マージ準備の際は必ず指示を仰ぎ、指示があるまでコミット・マージを行わない**。
+
+## 11. インデックス設計（標準グラフ DB 準拠）
+
+容量を数億ノードへ拡大すると、現状の**全件スキャン**検索（`index.rs` の `find` /
+`find_all` / `rids_of_type`、および `list_nodes` / `count_nodes` の型フィルタ）はすべて
+O(nodes) のため実用不可になる。容量拡大とインデックスは不可分なので同時に設計する。
+
+一般的なプロパティグラフ DB のインデックス階層に倣う。
+
+### 層1: ラベル（型）インデックス — 暗黙・常時
+
+- 「あるラベル（型）を持つノード全集合」への高速アクセス。`list_nodes("User")` /
+  `count_nodes` / `rids_of_type` の起点であり、層2スキャンの起点でもある。
+- ユーザー宣言は不要。**全型に対し常時**保持する。
+- 構造: `type_id → ノード RecordId 集合`。実装は B-tree もしくは型ごとのページチェーン
+  （挿入/削除が O(log n)〜O(1)）。page directory 上に載せ、メモリは page-cache で頭打ち。
+
+### 層2: プロパティインデックス — 明示宣言（B-tree）
+
+- `(型, プロパティキー) → ノード` の二次インデックス。`find` / `find_all` を加速する。
+- **明示宣言**: スキーマ DSL に `@index` 相当のアノテーションを追加（§11.1）。
+- 構造: **オンディスク B+tree**。等価検索に加え、範囲クエリ・`OrderBy`
+  （traversal に既存）も加速できる。page directory 上に配置。
+- インデックスキーは **`PropertyPath`**（`traversal/command.rs` に既存）を流用し、
+  フラットキーと **JSON ネストキー**の両方をサポート（§11.2）。
+
+### 層3: 一意制約（unique constraint）
+
+- `(型, プロパティキー)` の一意性を保証。内部的には層2の**一意版インデックス**。
+- スキーマ DSL の `@unique` 相当で宣言。挿入/更新時に重複を検出し
+  `GraphError`（新変種）を返す。`id` のような一意キーの自然な表現になる。
+
+### 層4: 全文 / ベクトルインデックス — 将来作業（スコープ外）
+
+- 全文検索・近傍探索（vector セグメントは既にヘッダ予約あり）。本ブランチでは扱わない。
+
+### 11.1 スキーマ DSL 拡張
+
+現状の `field_def = ident ~ ":" ~ type_expr`（`schema.pest`）にフィールド単位の
+アノテーションを追加する。記法は実装時に確定（例: `email: String @unique`,
+`name: String @index`）。`ast.rs` の `FieldDef` にインデックス/一意フラグを持たせ、
+`apply_schema` 時にインデックスを構築する。
+
+### 11.2 JSON ネストキーのインデックス
+
+- ChiffonDB には既に `PropertyPath::{Flat, Path}`（`traversal/command.rs`）があり、
+  `resolve()` が `Value::Object` を walk して**ネストしたスカラー値**を取り出す。
+  これをインデックスキーの生成にそのまま流用する。
+  - フラット: `User.email`
+  - JSON ネスト: `User.profile.city`（`Path { path: ["profile", "city"] }`）
+- 制約（現状 `resolve` の仕様を継承）:
+  - **スカラー終端のみ**。中間がオブジェクトでない／最終がオブジェクトの場合は対象外。
+  - **配列インデックスは非対応**（`items[0]` は walk しない）。
+  - 解決値が `None` のノードはインデックスに載らない（**部分インデックス**相当）。
+- これは標準グラフ DB の「ネストプロパティ / JSON パスインデックス」に相当し、
+  スカラー終端のみという制約も標準実装と整合的。
+
+### 11.3 整合性
+
+- インデックスはノードの挿入 / 更新 / 削除と**同一トランザクション内**で更新する
+  （WAL write-through に載せ、ロールバックで一緒に巻き戻る）。
+- 索引と実体（topology / property）の二重更新の原子性は WAL に委ねる。
