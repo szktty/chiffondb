@@ -76,21 +76,19 @@ pub const MAGIC: &[u8; 8] = b"CHIFFON\0";
 /// (file-backed topology, Phase 2). v3 accompanies the product rename to ChiffonDB,
 /// which also changed the magic from `TANABATA` to `CHIFFON\0`; old files are rejected.
 /// v4 (variable-topology) adds the property page-directory root/len at offsets 48..56 and
-/// makes property RIDs logical page numbers. A mismatch is rejected by
+/// makes property RIDs logical page numbers. v5 removes the now-vestigial segment-start fields
+/// and the unused `page_directory_root` at offsets 16..32 (everything resolves through the
+/// node/edge/property page directories), leaving 16..32 reserved. A mismatch is rejected by
 /// `FileHeader::deserialize` to avoid silently misreading an older layout.
-pub const VERSION: u32 = 4;
-pub const TOPOLOGY_SEGMENT_DEFAULT_START: u32 = 1;
-pub const PROPERTY_SEGMENT_DEFAULT_START: u32 = 64;
-pub const VECTOR_SEGMENT_DEFAULT_START: u32 = 0;
+pub const VERSION: u32 = 5;
 
 /// Contents of the header page (Page 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub version: u32,
-    pub topology_segment_start: u32,
-    pub property_segment_start: u32,
-    pub vector_segment_start: u32,
-    pub page_directory_root: u32,
+    // Offsets 16..32 are reserved (formerly topology/property/vector segment starts and the
+    // unused MVCC `page_directory_root`; all removed in v5 — layout now resolves through the
+    // node/edge/property page directories).
     pub schema_root: u32,
     /// Version number incremented on every schema change.
     pub schema_version: u32,
@@ -133,10 +131,6 @@ impl FileHeader {
     pub fn new() -> Self {
         Self {
             version: VERSION,
-            topology_segment_start: TOPOLOGY_SEGMENT_DEFAULT_START,
-            property_segment_start: PROPERTY_SEGMENT_DEFAULT_START,
-            vector_segment_start: VECTOR_SEGMENT_DEFAULT_START,
-            page_directory_root: 0,
             schema_root: 0,
             schema_version: 0,
             // Topology directories start empty; the first node/edge alloc maps logical page 0.
@@ -154,10 +148,7 @@ impl FileHeader {
         buf[0..8].copy_from_slice(MAGIC);
         buf[8..12].copy_from_slice(&self.version.to_le_bytes());
         buf[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-        buf[16..20].copy_from_slice(&self.topology_segment_start.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.property_segment_start.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.vector_segment_start.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.page_directory_root.to_le_bytes());
+        // Offsets 16..32 are reserved (left zeroed).
         buf[32..36].copy_from_slice(&self.schema_root.to_le_bytes());
         buf[36..40].copy_from_slice(&self.schema_version.to_le_bytes());
         buf[40..44].copy_from_slice(&self.node_page_count.to_le_bytes());
@@ -183,10 +174,7 @@ impl FileHeader {
                 supported: VERSION,
             });
         }
-        let topology_segment_start = u32::from_le_bytes(buf[16..20].try_into().unwrap());
-        let property_segment_start = u32::from_le_bytes(buf[20..24].try_into().unwrap());
-        let vector_segment_start = u32::from_le_bytes(buf[24..28].try_into().unwrap());
-        let page_directory_root = u32::from_le_bytes(buf[28..32].try_into().unwrap());
+        // Offsets 16..32 are reserved (ignored on read).
         let schema_root = u32::from_le_bytes(buf[32..36].try_into().unwrap());
         let schema_version = u32::from_le_bytes(buf[36..40].try_into().unwrap());
         // node/edge page counts double as the topology directories' mapped lengths; 0 is valid
@@ -199,10 +187,6 @@ impl FileHeader {
         let edge_dir_root = u32::from_le_bytes(buf[60..64].try_into().unwrap());
         Ok(Self {
             version,
-            topology_segment_start,
-            property_segment_start,
-            vector_segment_start,
-            page_directory_root,
             schema_root,
             schema_version,
             node_page_count,
@@ -831,14 +815,13 @@ mod tests {
 
         let db = DatabaseFile::open(&path).unwrap();
         assert_eq!(db.header.version, VERSION);
-        assert_eq!(
-            db.header.topology_segment_start,
-            TOPOLOGY_SEGMENT_DEFAULT_START
-        );
-        assert_eq!(
-            db.header.property_segment_start,
-            PROPERTY_SEGMENT_DEFAULT_START
-        );
+        // A fresh database has empty page directories (no roots, zero logical pages).
+        assert_eq!(db.header.node_dir_root, NO_DIR_ROOT);
+        assert_eq!(db.header.edge_dir_root, NO_DIR_ROOT);
+        assert_eq!(db.header.property_dir_root, NO_DIR_ROOT);
+        assert_eq!(db.header.node_page_count, 0);
+        assert_eq!(db.header.edge_page_count, 0);
+        assert_eq!(db.header.property_dir_len, 0);
     }
 
     #[test]
@@ -908,8 +891,10 @@ mod tests {
             let mut buf = [0u8; PAGE_SIZE];
             buf[0..8].copy_from_slice(MAGIC);
             buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // legacy v1
-            buf[16..20].copy_from_slice(&TOPOLOGY_SEGMENT_DEFAULT_START.to_le_bytes());
-            buf[20..24].copy_from_slice(&PROPERTY_SEGMENT_DEFAULT_START.to_le_bytes());
+                                                             // Plausible-looking legacy segment-start bytes at the old offsets 16..24; only the
+                                                             // version guard should stand between this file and a misread.
+            buf[16..20].copy_from_slice(&1u32.to_le_bytes());
+            buf[20..24].copy_from_slice(&64u32.to_le_bytes());
             f.write_all(&buf).unwrap();
         }
 
@@ -921,6 +906,59 @@ mod tests {
             Err(e) => panic!("expected UnsupportedVersion for v1, got error {e:?}"),
             Ok(_) => panic!("v1 file was not rejected — silent misread risk"),
         }
+    }
+
+    #[test]
+    fn open_rejects_previous_version_v4() {
+        // v5 removed the segment-start fields at offsets 16..32; a v4 file would be misread under
+        // the v5 layout, so the version guard must reject it (no backward compat, design §0).
+        let dir = TempDir::new().unwrap();
+        let path = make_db_path(&dir);
+        {
+            let mut f = FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let mut buf = [0u8; PAGE_SIZE];
+            buf[0..8].copy_from_slice(MAGIC);
+            buf[8..12].copy_from_slice(&4u32.to_le_bytes()); // previous version v4
+            f.write_all(&buf).unwrap();
+        }
+        match DatabaseFile::open(&path) {
+            Err(GraphError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 4);
+                assert_eq!(supported, VERSION);
+            }
+            Err(e) => panic!("expected UnsupportedVersion for v4, got {e:?}"),
+            Ok(_) => panic!("v4 file was not rejected — silent misread risk"),
+        }
+    }
+
+    /// Reviewer-added (review-2026-06-30g): the v5 layout reserves offsets 16..32 (formerly the
+    /// segment-start fields + `page_directory_root`). `serialize` must leave that range zeroed,
+    /// and `deserialize` must ignore whatever sits there so stray bytes can never leak into a
+    /// real field. This pins the reservation before anything reuses 16..32 in a later phase.
+    #[test]
+    fn header_reserved_range_is_zeroed_and_ignored_on_read() {
+        let header = FileHeader::new();
+        let buf = header.serialize();
+        assert!(
+            buf[16..32].iter().all(|&b| b == 0),
+            "serialize must leave the reserved 16..32 range zeroed"
+        );
+
+        // Inject garbage into the reserved range; the round-tripped header must be unchanged.
+        let mut tampered = header.serialize();
+        for b in &mut tampered[16..32] {
+            *b = 0xAB;
+        }
+        let restored = FileHeader::deserialize(&tampered).unwrap();
+        assert_eq!(
+            header, restored,
+            "deserialize must ignore the reserved range, not leak it into a field"
+        );
     }
 
     #[test]

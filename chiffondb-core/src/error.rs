@@ -10,12 +10,6 @@ pub enum GraphError {
     StorageCorrupted(u32),
     #[error("Unsupported file format version: found {found}, supported {supported}")]
     UnsupportedVersion { found: u32, supported: u32 },
-    #[error("Topology segment capacity exceeded: {kind} needs {needed} pages but only {available} are available")]
-    CapacityExceeded {
-        kind: &'static str,
-        needed: usize,
-        available: usize,
-    },
     #[error("Invalid traversal command: {0}")]
     InvalidCommand(String),
     #[error("Type mismatch: expected {expected}, got {actual}")]
