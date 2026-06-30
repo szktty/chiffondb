@@ -13,11 +13,11 @@ Updated by the review session at each `close`.
 | 1 | `PageDirectory` data structure + read/write (test-first) | ✅ done (`676dfc7`, `a9283d1`) |
 | 2a | **Logicalize property RID** (property `PageDirectory`; blob-chain pages pushed into it) — done first so topology growth can't corrupt physically-contiguous properties | ✅ done (`356ad00`) |
 | 2b | Wire topology through node/edge directories; drop `*_capacity` | ✅ done (`3cb0aa4`) |
-| 3 | Remove the fixed vector segment boundary (property folded into Phase 2) | ⏭️ next |
-| 4 | Tier-1 label index (`list`/`count`/type filter → O(matches)) | todo |
+| 3 | Remove vestigial segment boundaries (segment-start fields + `page_directory_root` + dead `CapacityExceeded`); VERSION 4→5; `info` → directory facts | ✅ done (`a74cc96`) |
+| 4 | Tier-1 label index (`list`/`count`/type filter → O(matches)) | ⏭️ next |
 | 5 | Tier-2 property index (schema DSL `@index` + B+tree) | todo |
 | 6 | Tier-3 unique constraint (unique variant of tier 2) | todo |
-| 7 | ARCHITECTURE.md update (VERSION already bumped 3→4 in Phase 2a) + cleanup (see Phase 7 items below) | todo |
+| 7 | ARCHITECTURE.md update (VERSION now 5; segment cleanup already done in Phase 3) + CHANGELOG + squash (§10) | todo |
 
 > **Ordering note:** 2a precedes 2b deliberately. If topology were wired first, appending
 > topology pages to the file tail would break the still-physical property contiguity (the very
@@ -46,14 +46,23 @@ Post-implementation cleanup & squash merge: design §10 (do **not** start until 
   rejected value. Acceptable (unreachable in practice; useful diagnostic). Consider a dedicated
   variant if the error enum is ever tidied up.
 
-### Phase 7 cleanup (from review 2026-06-30f — Record only)
+### Phase 7 cleanup — status
 
-- **Dead `CapacityExceeded` variant**: `error.rs` still defines `CapacityExceeded`, but Phase 2b
-  removed the only construction sites (no capacity check — the ceiling is now the u32 logical page
-  space). Remove the variant (or repurpose) during Phase 7 cleanup.
-- **Vestigial `*_segment_start` header fields**: `topology_segment_start` / `property_segment_start`
-  no longer bound anything (everything resolves through directories on the append tail). Harmless
-  in v4; remove or redefine during Phase 7 (already noted in the implement-request out-of-scope).
+- **Dead `CapacityExceeded` variant**: ✅ **removed in Phase 3 (`a74cc96`)**. Grep confirmed zero
+  constructors/matches across core/chiffondb/chiffondb-ffi; FFI does not map the enum by
+  discriminant, so removal is safe (review 2026-06-30g).
+- **Vestigial `*_segment_start` header fields**: ✅ **removed in Phase 3 (`a74cc96`)**. Together
+  with the unused `page_directory_root` (MVCC single root, superseded by the per-kind dir roots),
+  offsets 16..32 are now reserved (zeroed). VERSION 4→5; old v4 files rejected (review 2026-06-30g).
+- **(new, Record only — review 2026-06-30g E-3)** Header offsets 16..32 are left *reserved* rather
+  than compacted, to keep surviving offsets stable and the diff a pure deletion. A future header
+  tidy-up could compact them (and reuse the 16 bytes for new fields). Not needed for merge.
+
+> **Note (Phase 3 scope):** the design's "remove the vector segment boundary" turned out to be a
+> no-op for data — there is no vector write path (`VectorStore`/`write_vector`/`alloc_vector` do
+> not exist) and `vector_segment_start` was display-only. So Phase 3 became the vestigial-field
+> cleanup above (which also absorbed the Phase 7 items the 2b review had parked). Vector/full-text
+> indexing is tier 4, out of scope for this branch (design §11).
 
 ### Resolved Needs-a-test
 
