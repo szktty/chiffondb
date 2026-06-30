@@ -94,11 +94,10 @@ pub struct FileHeader {
     pub schema_root: u32,
     /// Version number incremented on every schema change.
     pub schema_version: u32,
-    /// Number of logical node pages in use within the topology segment.
-    /// Persisted so reopen restores the actual used count rather than inferring
-    /// the segment-wide maximum from the pre-allocated layout.
+    /// Number of logical node pages in use. Doubles as the node page directory's mapped length
+    /// (the directory's dense logical space is `0..node_page_count`).
     pub node_page_count: u32,
-    /// Number of logical edge pages in use within the topology segment.
+    /// Number of logical edge pages in use (= the edge page directory's mapped length).
     pub edge_page_count: u32,
     /// Root physical page of the property page directory (`0xFFFF_FFFF` = none yet).
     /// Property RIDs are logical page numbers resolved through this directory, so property
@@ -106,10 +105,23 @@ pub struct FileHeader {
     pub property_dir_root: u32,
     /// Number of mapped logical property pages.
     pub property_dir_len: u32,
+    /// Root physical page of the node page directory (`0xFFFF_FFFF` = none yet). Node logical
+    /// pages resolve through this directory instead of a fixed interleaved segment, lifting the
+    /// old ~2000-node cap (design §3.2, variable-topology). Mapped length = `node_page_count`.
+    pub node_dir_root: u32,
+    /// Root physical page of the edge page directory. Mapped length = `edge_page_count`.
+    pub edge_dir_root: u32,
 }
 
 /// Header sentinel for "no page-directory root yet" (matches `PageDirectory::root`'s UNMAPPED).
 pub const NO_DIR_ROOT: u32 = 0xFFFF_FFFF;
+
+/// Selects which topology page directory (node or edge) a page-directory operation targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopologyKind {
+    Node,
+    Edge,
+}
 
 impl Default for FileHeader {
     fn default() -> Self {
@@ -127,10 +139,13 @@ impl FileHeader {
             page_directory_root: 0,
             schema_root: 0,
             schema_version: 0,
-            node_page_count: 1,
-            edge_page_count: 1,
+            // Topology directories start empty; the first node/edge alloc maps logical page 0.
+            node_page_count: 0,
+            edge_page_count: 0,
             property_dir_root: NO_DIR_ROOT,
             property_dir_len: 0,
+            node_dir_root: NO_DIR_ROOT,
+            edge_dir_root: NO_DIR_ROOT,
         }
     }
 
@@ -149,6 +164,8 @@ impl FileHeader {
         buf[44..48].copy_from_slice(&self.edge_page_count.to_le_bytes());
         buf[48..52].copy_from_slice(&self.property_dir_root.to_le_bytes());
         buf[52..56].copy_from_slice(&self.property_dir_len.to_le_bytes());
+        buf[56..60].copy_from_slice(&self.node_dir_root.to_le_bytes());
+        buf[60..64].copy_from_slice(&self.edge_dir_root.to_le_bytes());
         buf
     }
 
@@ -172,12 +189,14 @@ impl FileHeader {
         let page_directory_root = u32::from_le_bytes(buf[28..32].try_into().unwrap());
         let schema_root = u32::from_le_bytes(buf[32..36].try_into().unwrap());
         let schema_version = u32::from_le_bytes(buf[36..40].try_into().unwrap());
-        // node/edge page counts. `.max(1)` defends against a zeroed value (the topology
-        // segment always has at least one logical node and edge page).
-        let node_page_count = u32::from_le_bytes(buf[40..44].try_into().unwrap()).max(1);
-        let edge_page_count = u32::from_le_bytes(buf[44..48].try_into().unwrap()).max(1);
+        // node/edge page counts double as the topology directories' mapped lengths; 0 is valid
+        // (a fresh database has empty directories until the first node/edge is allocated).
+        let node_page_count = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+        let edge_page_count = u32::from_le_bytes(buf[44..48].try_into().unwrap());
         let property_dir_root = u32::from_le_bytes(buf[48..52].try_into().unwrap());
         let property_dir_len = u32::from_le_bytes(buf[52..56].try_into().unwrap());
+        let node_dir_root = u32::from_le_bytes(buf[56..60].try_into().unwrap());
+        let edge_dir_root = u32::from_le_bytes(buf[60..64].try_into().unwrap());
         Ok(Self {
             version,
             topology_segment_start,
@@ -190,6 +209,8 @@ impl FileHeader {
             edge_page_count,
             property_dir_root,
             property_dir_len,
+            node_dir_root,
+            edge_dir_root,
         })
     }
 }
@@ -568,6 +589,90 @@ impl DatabaseFile {
     /// Reads the physical page backing logical property page `logical`.
     pub fn read_property_page(&mut self, logical: usize) -> Result<[u8; PAGE_SIZE], GraphError> {
         let physical = self.resolve_property_page(logical)?;
+        self.read_page(physical)
+    }
+
+    // ---- Topology page directories (node / edge) ----
+    //
+    // Node and edge logical pages resolve to physical pages through their own `PageDirectory`,
+    // so topology pages need no fixed interleaved segment and can grow on the append tail next
+    // to property pages. This is what lifts the old ~2000-node cap (design §3.2). The directory
+    // root lives in the header; its mapped length reuses the existing `node_page_count` /
+    // `edge_page_count` fields (single source of truth, no double-counting).
+
+    fn topology_dir(&self, kind: TopologyKind) -> PageDirectory {
+        let (root, len) = match kind {
+            TopologyKind::Node => (self.header.node_dir_root, self.header.node_page_count),
+            TopologyKind::Edge => (self.header.edge_dir_root, self.header.edge_page_count),
+        };
+        if root == NO_DIR_ROOT {
+            PageDirectory::new()
+        } else {
+            PageDirectory::with_root(root, len as usize)
+        }
+    }
+
+    fn store_topology_dir(
+        &mut self,
+        kind: TopologyKind,
+        dir: &PageDirectory,
+    ) -> Result<(), GraphError> {
+        match kind {
+            TopologyKind::Node => {
+                self.header.node_dir_root = dir.root();
+                self.header.node_page_count = dir.len() as u32;
+            }
+            TopologyKind::Edge => {
+                self.header.edge_dir_root = dir.root();
+                self.header.edge_page_count = dir.len() as u32;
+            }
+        }
+        self.write_header()
+    }
+
+    /// Resolves a logical topology page number to its physical page id.
+    pub fn resolve_topology_page(
+        &mut self,
+        kind: TopologyKind,
+        logical: usize,
+    ) -> Result<u32, GraphError> {
+        let dir = self.topology_dir(kind);
+        dir.resolve(self, logical)?
+            .ok_or(GraphError::StorageCorrupted(logical as u32))
+    }
+
+    /// Allocates a fresh physical topology page initialized with `data`, maps it into the
+    /// node/edge directory, and returns the assigned logical page number.
+    pub fn alloc_topology_page(
+        &mut self,
+        kind: TopologyKind,
+        data: &[u8; PAGE_SIZE],
+    ) -> Result<usize, GraphError> {
+        let physical = self.append_page(data)?;
+        let mut dir = self.topology_dir(kind);
+        let logical = dir.push(self, physical)?;
+        self.store_topology_dir(kind, &dir)?;
+        Ok(logical)
+    }
+
+    /// Overwrites the physical page backing logical topology page `logical`.
+    pub fn write_topology_page(
+        &mut self,
+        kind: TopologyKind,
+        logical: usize,
+        data: &[u8; PAGE_SIZE],
+    ) -> Result<(), GraphError> {
+        let physical = self.resolve_topology_page(kind, logical)?;
+        self.write_page(physical, data)
+    }
+
+    /// Reads the physical page backing logical topology page `logical`.
+    pub fn read_topology_page(
+        &mut self,
+        kind: TopologyKind,
+        logical: usize,
+    ) -> Result<[u8; PAGE_SIZE], GraphError> {
+        let physical = self.resolve_topology_page(kind, logical)?;
         self.read_page(physical)
     }
 

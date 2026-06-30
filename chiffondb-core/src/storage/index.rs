@@ -92,17 +92,12 @@ pub fn find(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::page::PAGE_SIZE;
     use serde_json::json;
 
-    /// Builds an in-memory DB with a pre-allocated topology segment, like Database::create.
+    /// Builds an in-memory DB. Topology pages map on demand through directories.
     fn make() -> (TopologyStore, DatabaseFile) {
-        let mut file = DatabaseFile::create_in_memory().unwrap();
-        let empty = [0u8; PAGE_SIZE];
-        for _ in 1..64 {
-            file.append_page(&empty).unwrap();
-        }
-        (TopologyStore::new(1, 64), file)
+        let file = DatabaseFile::create_in_memory().unwrap();
+        (TopologyStore::new(), file)
     }
 
     fn insert(

@@ -51,34 +51,21 @@ impl Database {
     /// Creates a new database file with the given options (e.g. memory budget).
     pub fn create_with_options(path: &Path, opts: &OpenOptions) -> Result<Self, GraphError> {
         let mut file = DatabaseFile::create_with_options(path, opts)?;
-        // Pre-allocate the topology segment (pages 1..prop_start-1) with zero pages
-        // so that PropertyStore only writes at prop_start and beyond.
-        let prop_start = file.header.property_segment_start;
-        let current = file.page_count()?;
-        let empty = [0u8; crate::storage::page::PAGE_SIZE];
-        for _ in current..prop_start {
-            file.append_page(&empty)?;
-        }
-        let topo_start = file.header.topology_segment_start;
+        // Topology, property, and directory pages now grow on the append tail and resolve
+        // through page directories (no fixed segment), so there is nothing to pre-allocate.
         file.flush()?;
         Ok(Self {
             file,
-            topo: TopologyStore::new(topo_start, prop_start),
+            topo: TopologyStore::new(),
         })
     }
 
     /// Creates an in-memory database. Operates entirely in memory without any files.
     pub fn open_in_memory() -> Result<Self, GraphError> {
-        let mut file = DatabaseFile::create_in_memory()?;
-        let prop_start = file.header.property_segment_start;
-        let topo_start = file.header.topology_segment_start;
-        let empty = [0u8; crate::storage::page::PAGE_SIZE];
-        for _ in 1..prop_start {
-            file.append_page(&empty)?;
-        }
+        let file = DatabaseFile::create_in_memory()?;
         Ok(Self {
             file,
-            topo: TopologyStore::new(topo_start, prop_start),
+            topo: TopologyStore::new(),
         })
     }
 
@@ -88,21 +75,14 @@ impl Database {
     }
 
     /// Opens an existing database with the given options (e.g. memory budget).
-    /// Restores the topology segment metadata from the header.
+    /// Topology state (directory roots + logical page counts) lives entirely in the header,
+    /// so the stateless `TopologyStore` needs nothing to restore.
     pub fn open_with_options(path: &Path, opts: &OpenOptions) -> Result<Self, GraphError> {
         let file = DatabaseFile::open_with_options(path, opts)?;
-
-        let topo_start = file.header.topology_segment_start;
-        let prop_start = file.header.property_segment_start;
-
-        // Logical page counts come from the header (persisted at flush), not inferred from
-        // the pre-allocated segment width — otherwise reopen would always restore the
-        // segment-wide maximum and make scans walk the whole segment.
-        let node_pages = file.header.node_page_count as usize;
-        let edge_pages = file.header.edge_page_count as usize;
-        let topo = TopologyStore::with_counts(topo_start, prop_start, node_pages, edge_pages);
-
-        Ok(Self { file, topo })
+        Ok(Self {
+            file,
+            topo: TopologyStore::new(),
+        })
     }
 
     /// Returns `(resident_pages, capacity)` of the page cache for the file backend,
@@ -2022,6 +2002,116 @@ mod tests {
     }
 
     #[test]
+    fn rollback_unwinds_node_edge_and_property_growth_together() {
+        // One transaction that grows node, edge, AND property pages (all three directories),
+        // then rolls back. Every directory's root/len lives in the header, which the snapshot
+        // reverts wholesale, so the three must unwind together (Phase 2b DoD).
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.into_temp_path().to_path_buf();
+        std::fs::remove_file(&path).ok();
+        let mut db = Database::create(&path).unwrap();
+
+        let hub = db.insert_node(1, HashMap::new()).unwrap();
+        let spoke = db.insert_node(1, HashMap::new()).unwrap();
+        db.flush().unwrap();
+        let base_nodes = db.count_nodes(None).unwrap();
+        let base_edges = db.count_edges(None).unwrap();
+
+        let snap = db.take_snapshot();
+        // Grow all three page kinds in one transaction.
+        for i in 0..80 {
+            let props = HashMap::from([("v".to_string(), json!(format!("node-{i}")))]);
+            let n = db.insert_node(1, props).unwrap();
+            db.insert_edge(1, hub, n, HashMap::new()).unwrap();
+        }
+        // Also grow edges off the hub to spill onto a 2nd edge page.
+        for _ in 0..80 {
+            db.insert_edge(1, hub, spoke, HashMap::new()).unwrap();
+        }
+        assert!(db.count_nodes(None).unwrap() > base_nodes + 63);
+        assert!(db.count_edges(None).unwrap() > base_edges + 63);
+
+        db.restore_snapshot(snap);
+
+        // All three revert to the pre-transaction state.
+        assert_eq!(db.count_nodes(None).unwrap(), base_nodes);
+        assert_eq!(db.count_edges(None).unwrap(), base_edges);
+        // The pre-transaction graph is intact and further growth still works.
+        let n = db.insert_node(1, HashMap::new()).unwrap();
+        assert!(db.node_exists(n));
+        db.flush().unwrap();
+
+        drop(db);
+        let mut db2 = Database::open(&path).unwrap();
+        assert_eq!(db2.count_nodes(None).unwrap(), base_nodes + 1);
+        assert_eq!(db2.count_edges(None).unwrap(), base_edges);
+    }
+
+    #[test]
+    fn topology_and_properties_interleave_on_the_append_tail() {
+        // Directory pages, topology pages, and property pages all share the single append_page
+        // counter. Growing topology and writing properties in alternation must not collide:
+        // each kind resolves through its own directory regardless of physical interleaving
+        // (Phase 2b DoD / review E-3).
+        let (mut db, _) = make_db();
+        let mut nodes = Vec::new();
+        for i in 0..200 {
+            let props = HashMap::from([("k".to_string(), json!(format!("val-{i}")))]);
+            let n = db.insert_node(1, props).unwrap();
+            if i > 0 {
+                db.insert_edge(1, nodes[i - 1], n, HashMap::new()).unwrap();
+            }
+            nodes.push(n);
+        }
+        // Every node's property reads back correctly despite interleaved topology/property
+        // page allocation.
+        for (i, &n) in nodes.iter().enumerate() {
+            let props = db.get_node_properties(n).unwrap();
+            assert_eq!(props.get("k"), Some(&json!(format!("val-{i}"))));
+        }
+        assert_eq!(db.count_nodes(None).unwrap(), 200);
+        assert_eq!(db.count_edges(None).unwrap(), 199);
+    }
+
+    /// Reviewer-added (review-2026-06-30f): topology must survive a reopen after growing past
+    /// many logical node/edge pages with interleaved property writes. The directory roots and
+    /// reused counts persist in the header, so after reopen every node/edge record and property
+    /// must still resolve through the rebuilt directories — the persistence counterpart to the
+    /// interleave test above (which never closes the file).
+    #[test]
+    fn topology_and_properties_survive_reopen_after_multipage_growth() {
+        let (mut db, path) = make_db();
+        let mut nodes = Vec::new();
+        // >63 nodes forces several logical node pages; edges force several edge pages.
+        for i in 0..300 {
+            let props = HashMap::from([("k".to_string(), json!(format!("v-{i}")))]);
+            let n = db.insert_node(1, props).unwrap();
+            if i > 0 {
+                db.insert_edge(1, nodes[i - 1], n, HashMap::new()).unwrap();
+            }
+            nodes.push(n);
+        }
+        let node_count = db.count_nodes(None).unwrap();
+        let edge_count = db.count_edges(None).unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        // Reopen: the stateless TopologyStore rebuilds directories purely from the header.
+        let mut db2 = Database::open(&path).unwrap();
+        assert_eq!(db2.count_nodes(None).unwrap(), node_count);
+        assert_eq!(db2.count_edges(None).unwrap(), edge_count);
+        // Every property reads back, including ones on high logical pages.
+        for (i, &n) in nodes.iter().enumerate() {
+            let props = db2.get_node_properties(n).unwrap();
+            assert_eq!(props.get("k"), Some(&json!(format!("v-{i}"))));
+        }
+        // Growth still works after reopen (counts/roots were restored, not reset).
+        let extra = db2.insert_node(1, HashMap::new()).unwrap();
+        assert!(db2.node_exists(extra));
+        assert_eq!(db2.count_nodes(None).unwrap(), node_count + 1);
+    }
+
+    #[test]
     fn insert_node_and_read_properties() {
         let (mut db, _) = make_db();
         let props = HashMap::from([
@@ -2860,28 +2950,25 @@ mod tests {
     }
 
     #[test]
-    fn insert_node_returns_error_when_node_capacity_exceeded() {
+    fn insert_grows_past_the_old_fixed_node_cap() {
+        // The old fixed topology segment capped a database at ~2000 nodes. With variable
+        // topology (node pages mapped through a directory), inserting well past that count must
+        // now succeed, and every node must still read back.
         let (mut db, _) = make_db();
-        // The topology segment holds a fixed number of pages. Exceeding it must surface
-        // as a CapacityExceeded error from insert_node (enforced at allocation time).
-        let node_capacity = (db.file.header.property_segment_start
-            - db.file.header.topology_segment_start)
-            .div_ceil(2) as usize;
-        // Keep allocating nodes until we hit capacity.
-        let mut result = Ok(NodeRid::new(0, 0));
-        while db.topo.node_page_count() <= node_capacity {
-            result = db.insert_node(1, HashMap::new());
-            if result.is_err() {
-                break;
-            }
+        // The old cap was 32 node pages * ~63 slots ≈ 2016; exceed it comfortably.
+        let n = 2500;
+        let mut rids = Vec::with_capacity(n);
+        for _ in 0..n {
+            rids.push(
+                db.insert_node(1, HashMap::new())
+                    .expect("insert past the old cap must succeed"),
+            );
         }
-        assert!(
-            matches!(
-                result,
-                Err(GraphError::CapacityExceeded { kind: "node", .. })
-            ),
-            "expected CapacityExceeded, got {result:?}"
-        );
+        assert_eq!(db.count_nodes(None).unwrap(), n as u64);
+        // Spot-check that records spanning many logical node pages are all readable.
+        for rid in [rids[0], rids[n / 2], rids[n - 1]] {
+            assert!(db.topo.node_slot_used(&mut db.file, rid.0));
+        }
     }
 
     #[test]

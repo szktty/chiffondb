@@ -1,103 +1,49 @@
 use crate::error::GraphError;
-use crate::storage::file::DatabaseFile;
-use crate::storage::page::{Page, RecordId, SlotId, PAGE_SIZE};
+use crate::storage::file::{DatabaseFile, TopologyKind};
+use crate::storage::page::{Page, RecordId, SlotId};
 use crate::storage::record::{EdgeRecord, NodeRecord, EDGE_RECORD_SIZE, NODE_RECORD_SIZE};
 
 /// File-backed topology store.
 ///
-/// Node and edge record pages live in the database file's topology segment and are
-/// read/written through `DatabaseFile`, which fronts them with its bounded page cache.
-/// The store itself keeps only O(1) metadata (segment start + logical page counts);
-/// it never holds the record pages resident, so topology memory does not grow with
-/// node/edge count (see `docs/plan-page-cache.md` Phase 2).
+/// Node and edge record pages are read/written through `DatabaseFile`, which fronts them with
+/// its bounded page cache and never holds the record pages resident, so topology memory does
+/// not grow with node/edge count (see `docs/plan-page-cache.md` Phase 2).
 ///
-/// Logical→physical page mapping within the topology segment (node/edge interleaved):
-///   node logical page i → file page `topo_start + i*2`
-///   edge logical page i → file page `topo_start + i*2 + 1`
+/// Node and edge logical pages resolve to physical file pages through per-kind `PageDirectory`
+/// instances held by `DatabaseFile` (roots in the header; mapped lengths are the header's
+/// `node_page_count` / `edge_page_count`). `TopologyStore` therefore keeps no segment metadata of
+/// its own — it is a stateless façade over `DatabaseFile`'s topology page helpers. This removes
+/// the fixed interleaved segment and its ~2000-node cap (design §3.2).
 ///
 /// Slot occupancy is tracked solely by each page's own bitmap (`Page::is_used` /
 /// `alloc_slot` / `free_slot`); there is no separate in-memory occupancy index.
-#[derive(Clone)]
-pub struct TopologyStore {
-    topo_start: u32,
-    /// First file page after the topology segment (= property_segment_start).
-    /// The topology segment is the fixed range `[topo_start, seg_end)`.
-    seg_end: u32,
-    node_page_count: usize,
-    edge_page_count: usize,
-}
+#[derive(Clone, Default)]
+pub struct TopologyStore;
 
 impl TopologyStore {
-    /// Creates a store for a fresh database (one node page and one edge page).
-    /// `topo_start`/`seg_end` bound the fixed topology segment.
-    pub fn new(topo_start: u32, seg_end: u32) -> Self {
-        Self {
-            topo_start,
-            seg_end,
-            node_page_count: 1,
-            edge_page_count: 1,
-        }
-    }
-
-    /// Creates a store for an existing database with known logical page counts.
-    pub fn with_counts(
-        topo_start: u32,
-        seg_end: u32,
-        node_page_count: usize,
-        edge_page_count: usize,
-    ) -> Self {
-        Self {
-            topo_start,
-            seg_end,
-            node_page_count: node_page_count.max(1),
-            edge_page_count: edge_page_count.max(1),
-        }
-    }
-
-    /// Capacity (in logical pages) of each interleaved stream within the segment.
-    fn node_capacity(&self) -> usize {
-        (self.seg_end - self.topo_start).div_ceil(2) as usize
-    }
-
-    fn edge_capacity(&self) -> usize {
-        ((self.seg_end - self.topo_start) / 2) as usize
-    }
-
-    fn node_pid(&self, logical: usize) -> u32 {
-        self.topo_start + (logical as u32) * 2
-    }
-
-    fn edge_pid(&self, logical: usize) -> u32 {
-        self.topo_start + (logical as u32) * 2 + 1
+    /// Creates a topology façade. All state lives in `DatabaseFile`'s header / directories.
+    pub fn new() -> Self {
+        Self
     }
 
     fn load_node_page(&self, file: &mut DatabaseFile, logical: usize) -> Result<Page, GraphError> {
-        let bytes = file.read_page(self.node_pid(logical))?;
+        let bytes = file.read_topology_page(TopologyKind::Node, logical)?;
         Ok(Page::from_bytes(bytes, NODE_RECORD_SIZE))
     }
 
     fn load_edge_page(&self, file: &mut DatabaseFile, logical: usize) -> Result<Page, GraphError> {
-        let bytes = file.read_page(self.edge_pid(logical))?;
+        let bytes = file.read_topology_page(TopologyKind::Edge, logical)?;
         Ok(Page::from_bytes(bytes, EDGE_RECORD_SIZE))
-    }
-
-    /// Ensures file page `pid` exists (appends zeroed pages as needed).
-    fn ensure_page(file: &mut DatabaseFile, pid: u32) -> Result<(), GraphError> {
-        let empty = [0u8; PAGE_SIZE];
-        while file.page_count()? <= pid {
-            file.append_page(&empty)?;
-        }
-        Ok(())
     }
 
     // ---- Counts / page access ----
 
-    pub fn node_page_count(&self) -> usize {
-        self.node_page_count
+    pub fn node_page_count(&self, file: &DatabaseFile) -> usize {
+        file.header.node_page_count as usize
     }
 
-    pub fn edge_page_count(&self) -> usize {
-        self.edge_page_count
+    pub fn edge_page_count(&self, file: &DatabaseFile) -> usize {
+        file.header.edge_page_count as usize
     }
 
     /// Reads node logical page `idx` as a `Page` (for slot-occupancy scans).
@@ -113,7 +59,7 @@ impl TopologyStore {
     /// Returns the RecordIds of all live (used) node slots, scanning each page once.
     pub fn live_node_rids(&self, file: &mut DatabaseFile) -> Result<Vec<RecordId>, GraphError> {
         let mut rids = Vec::new();
-        for logical in 0..self.node_page_count {
+        for logical in 0..self.node_page_count(file) {
             let page = self.load_node_page(file, logical)?;
             for slot_idx in 0..page.slot_count() {
                 let slot = SlotId(slot_idx as u16);
@@ -128,7 +74,7 @@ impl TopologyStore {
     /// Returns the RecordIds of all live (used) edge slots, scanning each page once.
     pub fn live_edge_rids(&self, file: &mut DatabaseFile) -> Result<Vec<RecordId>, GraphError> {
         let mut rids = Vec::new();
-        for logical in 0..self.edge_page_count {
+        for logical in 0..self.edge_page_count(file) {
             let page = self.load_edge_page(file, logical)?;
             for slot_idx in 0..page.slot_count() {
                 let slot = SlotId(slot_idx as u16);
@@ -143,7 +89,7 @@ impl TopologyStore {
     /// Returns whether the given node slot is currently used.
     pub fn node_slot_used(&self, file: &mut DatabaseFile, rid: RecordId) -> bool {
         let logical = rid.page_id.0 as usize;
-        if logical >= self.node_page_count {
+        if logical >= self.node_page_count(file) {
             return false;
         }
         self.load_node_page(file, logical)
@@ -154,7 +100,7 @@ impl TopologyStore {
     /// Returns whether the given edge slot is currently used.
     pub fn edge_slot_used(&self, file: &mut DatabaseFile, rid: RecordId) -> bool {
         let logical = rid.page_id.0 as usize;
-        if logical >= self.edge_page_count {
+        if logical >= self.edge_page_count(file) {
             return false;
         }
         self.load_edge_page(file, logical)
@@ -190,7 +136,7 @@ impl TopologyStore {
         rid: RecordId,
     ) -> Result<NodeRecord, GraphError> {
         let logical = rid.page_id.0 as usize;
-        if logical >= self.node_page_count {
+        if logical >= self.node_page_count(file) {
             return Err(GraphError::StorageCorrupted(rid.page_id.0));
         }
         let page = self.load_node_page(file, logical)?;
@@ -204,12 +150,12 @@ impl TopologyStore {
         node: &NodeRecord,
     ) -> Result<(), GraphError> {
         let logical = node.id.page_id.0 as usize;
-        if logical >= self.node_page_count {
+        if logical >= self.node_page_count(file) {
             return Err(GraphError::StorageCorrupted(node.id.page_id.0));
         }
         let mut page = self.load_node_page(file, logical)?;
         page.write_slot(node.id.slot_id, &node.serialize())?;
-        file.write_page(self.node_pid(logical), page.as_bytes())
+        file.write_topology_page(TopologyKind::Node, logical, page.as_bytes())
     }
 
     // ---- Edge operations ----
@@ -244,7 +190,7 @@ impl TopologyStore {
         rid: RecordId,
     ) -> Result<EdgeRecord, GraphError> {
         let logical = rid.page_id.0 as usize;
-        if logical >= self.edge_page_count {
+        if logical >= self.edge_page_count(file) {
             return Err(GraphError::StorageCorrupted(rid.page_id.0));
         }
         let page = self.load_edge_page(file, logical)?;
@@ -258,12 +204,12 @@ impl TopologyStore {
         edge: &EdgeRecord,
     ) -> Result<(), GraphError> {
         let logical = edge.id.page_id.0 as usize;
-        if logical >= self.edge_page_count {
+        if logical >= self.edge_page_count(file) {
             return Err(GraphError::StorageCorrupted(edge.id.page_id.0));
         }
         let mut page = self.load_edge_page(file, logical)?;
         page.write_slot(edge.id.slot_id, &edge.serialize())?;
-        file.write_page(self.edge_pid(logical), page.as_bytes())
+        file.write_topology_page(TopologyKind::Edge, logical, page.as_bytes())
     }
 
     // ---- Topology operations ----
@@ -316,7 +262,7 @@ impl TopologyStore {
         let logical = edge_rid.page_id.0 as usize;
         let mut page = self.load_edge_page(file, logical)?;
         page.free_slot(edge_rid.slot_id)?;
-        file.write_page(self.edge_pid(logical), page.as_bytes())
+        file.write_topology_page(TopologyKind::Edge, logical, page.as_bytes())
     }
 
     /// Collects the outgoing edges of a node.
@@ -369,69 +315,41 @@ impl TopologyStore {
         let logical = rid.page_id.0 as usize;
         let mut page = self.load_node_page(file, logical)?;
         page.free_slot(rid.slot_id)?;
-        file.write_page(self.node_pid(logical), page.as_bytes())
+        file.write_topology_page(TopologyKind::Node, logical, page.as_bytes())
     }
 
     // ---- Internal helpers ----
 
     /// Finds (or creates) a free node slot, returning its (logical page, slot).
     fn alloc_node_slot(&mut self, file: &mut DatabaseFile) -> Result<(usize, SlotId), GraphError> {
-        for logical in 0..self.node_page_count {
+        for logical in 0..self.node_page_count(file) {
             let mut page = self.load_node_page(file, logical)?;
             if let Some(slot) = page.alloc_slot() {
-                file.write_page(self.node_pid(logical), page.as_bytes())?;
+                file.write_topology_page(TopologyKind::Node, logical, page.as_bytes())?;
                 return Ok((logical, slot));
             }
         }
-        // All pages full: add a new logical node page (if the fixed segment allows it).
-        let logical = self.node_page_count;
-        if logical >= self.node_capacity() {
-            return Err(GraphError::CapacityExceeded {
-                kind: "node",
-                needed: logical + 1,
-                available: self.node_capacity(),
-            });
-        }
-        Self::ensure_page(file, self.node_pid(logical))?;
+        // All pages full: map a fresh logical node page through the directory (append + push +
+        // header persist, all crash-safe via the WAL). No fixed-segment capacity check — the
+        // only ceiling now is the u32 logical page space.
         let mut page = Page::new(NODE_RECORD_SIZE);
-        let slot = page
-            .alloc_slot()
-            .ok_or(GraphError::StorageCorrupted(self.node_pid(logical)))?;
-        file.write_page(self.node_pid(logical), page.as_bytes())?;
-        self.node_page_count += 1;
-        // Persist the grown count through the WAL so it survives a crash without flush
-        // (the new page would otherwise be unreachable after recovery).
-        file.header.node_page_count = self.node_page_count as u32;
-        file.write_header()?;
+        let slot = page.alloc_slot().ok_or(GraphError::StorageCorrupted(0))?;
+        let logical = file.alloc_topology_page(TopologyKind::Node, page.as_bytes())?;
         Ok((logical, slot))
     }
 
     /// Finds (or creates) a free edge slot, returning its (logical page, slot).
     fn alloc_edge_slot(&mut self, file: &mut DatabaseFile) -> Result<(usize, SlotId), GraphError> {
-        for logical in 0..self.edge_page_count {
+        for logical in 0..self.edge_page_count(file) {
             let mut page = self.load_edge_page(file, logical)?;
             if let Some(slot) = page.alloc_slot() {
-                file.write_page(self.edge_pid(logical), page.as_bytes())?;
+                file.write_topology_page(TopologyKind::Edge, logical, page.as_bytes())?;
                 return Ok((logical, slot));
             }
         }
-        let logical = self.edge_page_count;
-        if logical >= self.edge_capacity() {
-            return Err(GraphError::CapacityExceeded {
-                kind: "edge",
-                needed: logical + 1,
-                available: self.edge_capacity(),
-            });
-        }
-        Self::ensure_page(file, self.edge_pid(logical))?;
         let mut page = Page::new(EDGE_RECORD_SIZE);
-        let slot = page
-            .alloc_slot()
-            .ok_or(GraphError::StorageCorrupted(self.edge_pid(logical)))?;
-        file.write_page(self.edge_pid(logical), page.as_bytes())?;
-        self.edge_page_count += 1;
-        file.header.edge_page_count = self.edge_page_count as u32;
-        file.write_header()?;
+        let slot = page.alloc_slot().ok_or(GraphError::StorageCorrupted(0))?;
+        let logical = file.alloc_topology_page(TopologyKind::Edge, page.as_bytes())?;
         Ok((logical, slot))
     }
 
@@ -499,15 +417,10 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     fn make_store() -> (TopologyStore, DatabaseFile) {
-        // In-memory backend: topology segment starts at page 1, pre-allocate pages 1 and 2
-        // (one node page, one edge page) so the initial logical pages exist.
-        let mut file = DatabaseFile::create_in_memory().unwrap();
-        let empty = [0u8; PAGE_SIZE];
-        // Pre-allocate a small topology segment [1, 64) like Database::create does.
-        for _ in 1..64 {
-            file.append_page(&empty).unwrap();
-        }
-        (TopologyStore::new(1, 64), file)
+        // Topology pages are mapped on demand through the node/edge directories, so no
+        // pre-allocation is needed — the first alloc maps logical page 0.
+        let file = DatabaseFile::create_in_memory().unwrap();
+        (TopologyStore::new(), file)
     }
 
     #[test]
