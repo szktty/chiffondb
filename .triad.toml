@@ -1,0 +1,18 @@
+# triad project allowlist (design §4.2). Commands here are auto-approved by the L2 gate;
+# anything not listed and not a built-in safe command escalates to the user. Built-in
+# deny rules (destructive git) and safe rules (read-only git, ls/cat) are fixed and not
+# configured here.
+#
+# ChiffonDB's Rust review toolchain, matching docs/review-process.md's verification step.
+
+[[allow]]
+command = "cargo"
+subcommands = ["test"]
+
+[[allow]]
+command = "cargo"
+subcommands = ["clippy"]
+
+[[allow]]
+command = "cargo"
+subcommands = ["fmt"]
