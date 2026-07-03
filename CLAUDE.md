@@ -34,12 +34,10 @@ variable-length segment is future work).
 - proptest cases: `50` during development, `1000` in CI (`PROPTEST_CASES` env var).
 
 ### Review & progress workflow
-- When an implementation reaches a stopping point, create and commit
-  `docs/review-request-YYYY-MM-DDx.md`.
-- When responding to a review request, follow [docs/review-process.md](docs/review-process.md)
-  (separate the verifier from the fixer; back claims with the real code and throwaway probes;
-  do not edit core logic — send it back to the implementation session). No need to read it
-  when there is no review request.
+- Driven by triad (local tool, `~/work/dev/products/ai/triad`): each session registers as
+  worker or reviewer and follows its instructions — see `.claude/skills/triad/SKILL.md`.
+- The actual review/implement steps (verify/result/fix/request/close) are defined in
+  `.claude/skills/triad-plan/SKILL.md`. Read it only when running one of those steps.
 
 ### Code style
 - `unwrap()` / `expect()` are banned. Propagate errors with the `?` operator.
