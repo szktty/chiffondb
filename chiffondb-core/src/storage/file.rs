@@ -78,17 +78,18 @@ pub const MAGIC: &[u8; 8] = b"CHIFFON\0";
 /// v4 (variable-topology) adds the property page-directory root/len at offsets 48..56 and
 /// makes property RIDs logical page numbers. v5 removes the now-vestigial segment-start fields
 /// and the unused `page_directory_root` at offsets 16..32 (everything resolves through the
-/// node/edge/property page directories), leaving 16..32 reserved. A mismatch is rejected by
+/// node/edge/property page directories), leaving 16..32 reserved. v6 adds the tier-1 label index
+/// root at offset 16..20 (within that reserved range). A mismatch is rejected by
 /// `FileHeader::deserialize` to avoid silently misreading an older layout.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// Contents of the header page (Page 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub version: u32,
-    // Offsets 16..32 are reserved (formerly topology/property/vector segment starts and the
-    // unused MVCC `page_directory_root`; all removed in v5 — layout now resolves through the
-    // node/edge/property page directories).
+    /// Root page of the tier-1 label index (`0xFFFF_FFFF` = none yet). At offset 16..20, within
+    /// the range freed in v5. The rest of 16..32 (20..32) stays reserved.
+    pub label_index_root: u32,
     pub schema_root: u32,
     /// Version number incremented on every schema change.
     pub schema_version: u32,
@@ -131,6 +132,7 @@ impl FileHeader {
     pub fn new() -> Self {
         Self {
             version: VERSION,
+            label_index_root: NO_DIR_ROOT,
             schema_root: 0,
             schema_version: 0,
             // Topology directories start empty; the first node/edge alloc maps logical page 0.
@@ -148,7 +150,8 @@ impl FileHeader {
         buf[0..8].copy_from_slice(MAGIC);
         buf[8..12].copy_from_slice(&self.version.to_le_bytes());
         buf[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-        // Offsets 16..32 are reserved (left zeroed).
+        buf[16..20].copy_from_slice(&self.label_index_root.to_le_bytes());
+        // Offsets 20..32 are reserved (left zeroed).
         buf[32..36].copy_from_slice(&self.schema_root.to_le_bytes());
         buf[36..40].copy_from_slice(&self.schema_version.to_le_bytes());
         buf[40..44].copy_from_slice(&self.node_page_count.to_le_bytes());
@@ -174,7 +177,8 @@ impl FileHeader {
                 supported: VERSION,
             });
         }
-        // Offsets 16..32 are reserved (ignored on read).
+        let label_index_root = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+        // Offsets 20..32 are reserved (ignored on read).
         let schema_root = u32::from_le_bytes(buf[32..36].try_into().unwrap());
         let schema_version = u32::from_le_bytes(buf[36..40].try_into().unwrap());
         // node/edge page counts double as the topology directories' mapped lengths; 0 is valid
@@ -187,6 +191,7 @@ impl FileHeader {
         let edge_dir_root = u32::from_le_bytes(buf[60..64].try_into().unwrap());
         Ok(Self {
             version,
+            label_index_root,
             schema_root,
             schema_version,
             node_page_count,
@@ -909,6 +914,34 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_previous_version_v5() {
+        // v6 added the label-index root at 16..20; a v5 file has garbage/zero there under the v6
+        // layout, so the version guard must reject it (no backward compat, design §0).
+        let dir = TempDir::new().unwrap();
+        let path = make_db_path(&dir);
+        {
+            let mut f = FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let mut buf = [0u8; PAGE_SIZE];
+            buf[0..8].copy_from_slice(MAGIC);
+            buf[8..12].copy_from_slice(&5u32.to_le_bytes()); // previous version v5
+            f.write_all(&buf).unwrap();
+        }
+        match DatabaseFile::open(&path) {
+            Err(GraphError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 5);
+                assert_eq!(supported, VERSION);
+            }
+            Err(e) => panic!("expected UnsupportedVersion for v5, got {e:?}"),
+            Ok(_) => panic!("v5 file was not rejected — silent misread risk"),
+        }
+    }
+
+    #[test]
     fn open_rejects_previous_version_v4() {
         // v5 removed the segment-start fields at offsets 16..32; a v4 file would be misread under
         // the v5 layout, so the version guard must reject it (no backward compat, design §0).
@@ -936,22 +969,21 @@ mod tests {
         }
     }
 
-    /// Reviewer-added (review-2026-06-30g): the v5 layout reserves offsets 16..32 (formerly the
-    /// segment-start fields + `page_directory_root`). `serialize` must leave that range zeroed,
-    /// and `deserialize` must ignore whatever sits there so stray bytes can never leak into a
-    /// real field. This pins the reservation before anything reuses 16..32 in a later phase.
+    /// The v6 layout uses 16..20 for the label-index root and reserves 20..32. `serialize` must
+    /// leave 20..32 zeroed, and `deserialize` must ignore whatever sits there so stray bytes can
+    /// never leak into a real field. (v5 reserved the whole 16..32; v6 reclaimed 16..20.)
     #[test]
     fn header_reserved_range_is_zeroed_and_ignored_on_read() {
         let header = FileHeader::new();
         let buf = header.serialize();
         assert!(
-            buf[16..32].iter().all(|&b| b == 0),
-            "serialize must leave the reserved 16..32 range zeroed"
+            buf[20..32].iter().all(|&b| b == 0),
+            "serialize must leave the reserved 20..32 range zeroed"
         );
 
         // Inject garbage into the reserved range; the round-tripped header must be unchanged.
         let mut tampered = header.serialize();
-        for b in &mut tampered[16..32] {
+        for b in &mut tampered[20..32] {
             *b = 0xAB;
         }
         let restored = FileHeader::deserialize(&tampered).unwrap();

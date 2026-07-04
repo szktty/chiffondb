@@ -11,6 +11,7 @@ use crate::schema::registry::SchemaRegistry;
 use crate::schema::store::{load_schema, register_dynamic_type, DynamicTypeKind};
 use crate::storage::file::{DatabaseFile, FileSnapshot, OpenOptions};
 use crate::storage::index;
+use crate::storage::label_index::LabelIndex;
 use crate::storage::page::{EdgeRid, NodeRid, RecordId};
 use crate::storage::topology::TopologyStore;
 use crate::storage::value::{decode_label_list, encode_label_list, PropertyStore};
@@ -148,6 +149,8 @@ impl Database {
             node.property_ref = Some(pref);
             self.topo.write_node(&mut self.file, &node)?;
         }
+        // Register the node under its primary type in the tier-1 label index.
+        LabelIndex::new(&mut self.file).add(type_id, rid)?;
         Ok(NodeRid(rid))
     }
 
@@ -234,6 +237,14 @@ impl Database {
             .collect();
         for eid in out_edges.into_iter().chain(in_edges) {
             self.topo.delete_edge(&mut self.file, eid)?;
+        }
+        // Remove the node from every label set it was registered under (primary + additional).
+        let type_ids = self.get_node_type_ids(NodeRid(rid))?;
+        {
+            let mut index = LabelIndex::new(&mut self.file);
+            for id in type_ids {
+                index.remove(id, rid)?;
+            }
         }
         self.topo.free_node(&mut self.file, rid)
     }
@@ -855,6 +866,24 @@ impl Database {
                 normalized.push(id);
             }
         }
+
+        // Update the tier-1 label index by the delta between the node's old and new additional
+        // labels (the primary type is never in this set and stays indexed via insert_node).
+        let old = self.get_additional_labels(NodeRid(rid))?;
+        {
+            let mut index = LabelIndex::new(&mut self.file);
+            for &id in &old {
+                if !normalized.contains(&id) {
+                    index.remove(id, rid)?;
+                }
+            }
+            for &id in &normalized {
+                if !old.contains(&id) {
+                    index.add(id, rid)?;
+                }
+            }
+        }
+
         if normalized.is_empty() {
             node.label_ref = None;
         } else {
@@ -2109,6 +2138,249 @@ mod tests {
         let extra = db2.insert_node(1, HashMap::new()).unwrap();
         assert!(db2.node_exists(extra));
         assert_eq!(db2.count_nodes(None).unwrap(), node_count + 1);
+    }
+
+    // ---- Phase 4: tier-1 label index ----
+
+    /// A node with an additional label L must be returned by `list_nodes(L)` and counted by
+    /// `count_nodes(L)` — the (b) all-labels semantics. Primary-type queries still work too.
+    #[test]
+    fn label_index_indexes_all_labels_not_just_primary() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { id: String } node Admin { id: String }")
+            .unwrap();
+        // One plain User, one User that also carries the Admin label.
+        let _plain = db
+            .insert_node_by_name("User", HashMap::from([("id".to_string(), json!("u1"))]))
+            .unwrap();
+        let dual = db
+            .insert_node_with_label_names(
+                "User",
+                vec!["Admin"],
+                HashMap::from([("id".to_string(), json!("u2"))]),
+            )
+            .unwrap();
+
+        // Primary-type query returns both Users.
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 2);
+        // Additional-label query returns only the dual-labelled node (the (b) semantics change).
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 1);
+        let admins: Vec<_> = db
+            .list_nodes(Some("Admin"))
+            .unwrap()
+            .into_iter()
+            .map(|(rid, _)| rid)
+            .collect();
+        assert_eq!(admins, vec![dual]);
+    }
+
+    /// Adding/removing a label moves the node in/out of that label's query result.
+    #[test]
+    fn label_index_tracks_add_and_remove_label() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { id: String } node Admin { id: String }")
+            .unwrap();
+        let n = db
+            .insert_node_by_name("User", HashMap::from([("id".to_string(), json!("u1"))]))
+            .unwrap();
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 0);
+
+        db.add_node_label_by_name(n, "Admin").unwrap();
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 1);
+        // Still a User (primary unchanged).
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+
+        db.remove_node_label_by_name(n, "Admin").unwrap();
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 0);
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+    }
+
+    /// Deleting a node removes it from every label set it was in.
+    #[test]
+    fn label_index_delete_removes_from_all_labels() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { id: String } node Admin { id: String }")
+            .unwrap();
+        let n = db
+            .insert_node_with_label_names(
+                "User",
+                vec!["Admin"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 1);
+
+        db.delete_node(n).unwrap();
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 0);
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 0);
+    }
+
+    /// Dynamic-label insert registers the node under every label, including labels minted on the
+    /// fly. Verified via the returned assignments' type_ids.
+    #[test]
+    fn label_index_dynamic_insert_registers_all_labels() {
+        let (mut db, _) = make_db_with_schema();
+        // "User" is in the schema; "Employee" is minted dynamically.
+        let (rid, assignments) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Employee"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+        let user_id = assignments.get("User").unwrap().id;
+        let employee_id = assignments.get("Employee").unwrap().id;
+        assert!(assignments["Employee"].created);
+        // The node is registered under both its primary (User) and dynamic (Employee) label.
+        assert_eq!(
+            index::rids_of_type(&db.topo, &mut db.file, user_id).unwrap(),
+            vec![rid.0]
+        );
+        assert_eq!(
+            index::rids_of_type(&db.topo, &mut db.file, employee_id).unwrap(),
+            vec![rid.0]
+        );
+    }
+
+    /// The label index must roll back with the data: a transaction that inserts nodes and mutates
+    /// labels, then rolls back, leaves every label query as it was before.
+    #[test]
+    fn label_index_rolls_back_with_the_transaction() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { id: String } node Admin { id: String }")
+            .unwrap();
+        let base = db
+            .insert_node_by_name("User", HashMap::from([("id".to_string(), json!("u1"))]))
+            .unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 0);
+
+        let snap = db.take_snapshot();
+        // Insert more Users and give the baseline node an Admin label — all within the tx.
+        for i in 0..80 {
+            db.insert_node_by_name(
+                "User",
+                HashMap::from([("id".to_string(), json!(format!("u{i}")))]),
+            )
+            .unwrap();
+        }
+        db.add_node_label_by_name(base, "Admin").unwrap();
+        assert!(db.count_nodes(Some("User")).unwrap() > 1);
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 1);
+
+        db.restore_snapshot(snap);
+
+        // Everything reverts, including the label index.
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 0);
+        assert_eq!(
+            db.list_nodes(Some("User"))
+                .unwrap()
+                .into_iter()
+                .map(|(r, _)| r)
+                .collect::<Vec<_>>(),
+            vec![base]
+        );
+    }
+
+    /// Reopen rebuilds the label index from the header root; queries return the same sets.
+    #[test]
+    fn label_index_persists_across_reopen() {
+        let (mut db, path) = make_db();
+        db.apply_schema("node User { id: String } node Admin { id: String }")
+            .unwrap();
+        db.insert_node_by_name("User", HashMap::from([("id".to_string(), json!("u1"))]))
+            .unwrap();
+        db.insert_node_with_label_names(
+            "User",
+            vec!["Admin"],
+            HashMap::from([("id".to_string(), json!("u2"))]),
+        )
+        .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let mut db2 = Database::open(&path).unwrap();
+        assert_eq!(db2.count_nodes(Some("User")).unwrap(), 2);
+        assert_eq!(db2.count_nodes(Some("Admin")).unwrap(), 1);
+    }
+
+    /// Reviewer-added (review-2026-07-04a): a stronger, db-level version of the module proptest.
+    /// After a deterministic-but-varied sequence of insert / add-label / remove-label / delete,
+    /// the label index for every type must equal a brute-force `live_node_rids` filtered by
+    /// `get_node_type_ids` — i.e. `rids_of_type` (which now reads the index) can never drift from
+    /// the ground truth held in the node records themselves.
+    #[test]
+    fn label_index_matches_bruteforce_over_all_types_invariant() {
+        let (mut db, _) = make_db();
+        db.apply_schema(
+            "node User { id: String } node Admin { id: String } node Guest { id: String }",
+        )
+        .unwrap();
+
+        // Mutate labels in a varied pattern: some nodes gain/lose Admin/Guest, some get deleted.
+        let mut live: Vec<NodeRid> = Vec::new();
+        for i in 0..60 {
+            let n = db
+                .insert_node_by_name(
+                    "User",
+                    HashMap::from([("id".to_string(), json!(format!("u{i}")))]),
+                )
+                .unwrap();
+            live.push(n);
+            if i % 3 == 0 {
+                db.add_node_label_by_name(n, "Admin").unwrap();
+            }
+            if i % 5 == 0 {
+                db.add_node_label_by_name(n, "Guest").unwrap();
+            }
+            // Periodically remove a label from the most recent node and delete the oldest one,
+            // exercising the remove-label and delete paths. Index into `live` after the push, and
+            // guard the delete so the two removals never underflow.
+            if i % 7 == 0 {
+                let last = *live.last().unwrap();
+                db.remove_node_label_by_name(last, "Admin").ok();
+            }
+            if i % 11 == 0 && live.len() > 1 {
+                let victim = live.remove(0);
+                db.delete_node(victim).unwrap();
+            }
+        }
+        // Flip one surviving node's Admin off then on to stress the delta path.
+        let survivor = *live.last().unwrap();
+        db.add_node_label_by_name(survivor, "Admin").unwrap();
+        db.remove_node_label_by_name(survivor, "Admin").unwrap();
+
+        // Ground truth: for each type_id, brute-force scan every live node's full label set and
+        // compare with what the index-backed `rids_of_type` returns.
+        let registry = db.load_schema_registry().unwrap();
+        let type_ids = [
+            registry.node_type_id("User").unwrap(),
+            registry.node_type_id("Admin").unwrap(),
+            registry.node_type_id("Guest").unwrap(),
+        ];
+        let all_rids = db.topo.live_node_rids(&mut db.file).unwrap();
+        for type_id in type_ids {
+            let mut expected: Vec<RecordId> = Vec::new();
+            for &rid in &all_rids {
+                if db
+                    .get_node_type_ids(NodeRid(rid))
+                    .unwrap()
+                    .contains(&type_id)
+                {
+                    expected.push(rid);
+                }
+            }
+            let mut got = index::rids_of_type(&db.topo, &mut db.file, type_id).unwrap();
+            got.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+            expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+            assert_eq!(
+                got, expected,
+                "label index drifted from brute-force for type {type_id}"
+            );
+        }
     }
 
     #[test]

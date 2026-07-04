@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::error::GraphError;
 use crate::storage::file::DatabaseFile;
+use crate::storage::label_index::LabelIndex;
 use crate::storage::page::RecordId;
 use crate::storage::topology::TopologyStore;
 use crate::storage::value::PropertyStore;
@@ -24,20 +25,16 @@ fn props_match(props: &HashMap<String, Value>, key: &str, value: &Value) -> bool
     props.get(key).is_some_and(|stored| stored == value)
 }
 
-/// Returns the live node RecordIds whose primary type is `type_id`.
+/// Returns the node RecordIds registered under `type_id` via the tier-1 label index.
+///
+/// Key = all labels (design §11 tier 1): this returns nodes whose primary type *or* any
+/// additional/dynamic label is `type_id`, in O(matches) — not a full topology scan.
 pub fn rids_of_type(
-    topo: &TopologyStore,
+    _topo: &TopologyStore,
     file: &mut DatabaseFile,
     type_id: u16,
 ) -> Result<Vec<RecordId>, GraphError> {
-    let mut out = Vec::new();
-    for rid in topo.live_node_rids(file)? {
-        let node = topo.read_node(file, rid)?;
-        if node.node_type_id == type_id {
-            out.push(rid);
-        }
-    }
-    Ok(out)
+    LabelIndex::new(file).get(type_id)
 }
 
 /// Returns all live nodes of `type_id` whose `key` property equals `value`.
@@ -115,6 +112,8 @@ mod tests {
         let mut node = topo.read_node(file, rid).unwrap();
         node.property_ref = Some(pref);
         topo.write_node(file, &node).unwrap();
+        // rids_of_type now reads the label index, so mirror what Database::insert_node does.
+        LabelIndex::new(file).add(type_id, rid).unwrap();
         rid
     }
 
