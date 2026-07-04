@@ -80,5 +80,8 @@ Post-implementation cleanup & squash merge: design §10 (do **not** start until 
 - (7) B+tree node layout / split thresholds (only the approach is fixed in §11).
 - (8) ~~property RID: logicalize (a) vs. keep physical (b)~~ → **decided (a) logicalize**, folded
   into Phase 2 (the (b) plan breaks once topology shares the append tail — design §3.4).
-- (9) tier-1 label index key: primary type only (a) vs. all labels (b) — tentative (b),
-  decide at Phase 4.
+- (9) ~~tier-1 label index key: primary type only (a) vs. all labels (b)~~ → **decided (b) all
+  labels** (Phase 4, `implement-request-2026-07-04a.md`). A node is indexed under its primary
+  `node_type_id` plus every additional/dynamic label; `MATCH (n:Label)` hits under any label. This
+  changes `list_nodes`/`count_nodes` semantics (today primary-only via `rids_of_type`) — that
+  change is part of Phase 4.
