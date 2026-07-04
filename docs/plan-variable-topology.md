@@ -14,8 +14,8 @@ Updated by the review session at each `close`.
 | 2a | **Logicalize property RID** (property `PageDirectory`; blob-chain pages pushed into it) — done first so topology growth can't corrupt physically-contiguous properties | ✅ done (`356ad00`) |
 | 2b | Wire topology through node/edge directories; drop `*_capacity` | ✅ done (`3cb0aa4`) |
 | 3 | Remove vestigial segment boundaries (segment-start fields + `page_directory_root` + dead `CapacityExceeded`); VERSION 4→5; `info` → directory facts | ✅ done (`a74cc96`) |
-| 4 | Tier-1 label index (`list`/`count`/type filter → O(matches)) | ⏭️ next |
-| 5 | Tier-2 property index (schema DSL `@index` + B+tree) | todo |
+| 4 | Tier-1 label index (`list`/`count`/type filter → O(matches)); key = all labels; per-type page chain; VERSION 5→6 | ✅ done (`0cc7a96`) |
+| 5 | Tier-2 property index (schema DSL `@index` + B+tree) | ⏭️ next |
 | 6 | Tier-3 unique constraint (unique variant of tier 2) | todo |
 | 7 | ARCHITECTURE.md update (VERSION now 5; segment cleanup already done in Phase 3) + CHANGELOG + squash (§10) | todo |
 
@@ -45,6 +45,11 @@ Post-implementation cleanup & squash merge: design §10 (do **not** start until 
   `StorageCorrupted(physical)`, repurposing a variant meant for a "corrupt page id" to carry the
   rejected value. Acceptable (unreachable in practice; useful diagnostic). Consider a dedicated
   variant if the error enum is ever tidied up.
+- **(Phase 4, review 2026-07-04a E-2) `rids_of_type` unused `_topo` param**: routing
+  `rids_of_type` through the label index made the `TopologyStore` argument unnecessary; it was kept
+  as `_topo` to avoid churning callers (`db.rs:350`,`:1300`). Drop it when the index/search
+  signatures are reworked in Phase 5 (tier-2 adds the `PropertyPath`-based `find`/`find_all` — a
+  natural point to tidy the whole `index.rs` signature surface).
 
 ### Phase 7 cleanup — status
 
