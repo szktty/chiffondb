@@ -15,9 +15,9 @@ Updated by the review session at each `close`.
 | 2b | Wire topology through node/edge directories; drop `*_capacity` | ✅ done (`3cb0aa4`) |
 | 3 | Remove vestigial segment boundaries (segment-start fields + `page_directory_root` + dead `CapacityExceeded`); VERSION 4→5; `info` → directory facts | ✅ done (`a74cc96`) |
 | 4 | Tier-1 label index (`list`/`count`/type filter → O(matches)); key = all labels; per-type page chain; VERSION 5→6 | ✅ done (`0cc7a96`) |
-| 5 | Tier-2 property index (schema DSL `@index` + B+tree) | ⏭️ next |
-| 6 | Tier-3 unique constraint (unique variant of tier 2) | todo |
-| 7 | ARCHITECTURE.md update (VERSION now 5; segment cleanup already done in Phase 3) + CHANGELOG + squash (§10) | todo |
+| 5 | Tier-2 property index (schema DSL `@index`; **equality hash bucket**, not a B+tree — §9 cost discipline; `PropertyPath` keys; VERSION 6→7) | ✅ done (`4e48650`) |
+| 6 | Tier-3 unique constraint (`@unique`, built as the unique variant of tier 2) | ⏭️ next |
+| 7 | ARCHITECTURE.md update (VERSION now 7) + CHANGELOG + squash (§10) | todo |
 
 > **Ordering note:** 2a precedes 2b deliberately. If topology were wired first, appending
 > topology pages to the file tail would break the still-physical property contiguity (the very
@@ -47,9 +47,23 @@ Post-implementation cleanup & squash merge: design §10 (do **not** start until 
   variant if the error enum is ever tidied up.
 - **(Phase 4, review 2026-07-04a E-2) `rids_of_type` unused `_topo` param**: routing
   `rids_of_type` through the label index made the `TopologyStore` argument unnecessary; it was kept
-  as `_topo` to avoid churning callers (`db.rs:350`,`:1300`). Drop it when the index/search
-  signatures are reworked in Phase 5 (tier-2 adds the `PropertyPath`-based `find`/`find_all` — a
-  natural point to tidy the whole `index.rs` signature surface).
+  as `_topo` to avoid churning callers. **Phase 5 review confirmed it stays parked**: `index::find`
+  /`find_all` still legitimately use their `topo` param (scan fallback calls `topo.live_node_rids`);
+  only `rids_of_type`'s `_topo` is droppable. Left for a later signature sweep.
+- **(Phase 5, review 2026-07-05a) primary-type-only tier-2 maintenance**: the tier-2 property index
+  maintains only the node's **primary** type's `@index` fields, not `@index` on an additional/
+  dynamic label type (asymmetric with tier-1's all-label key). Review endorsed this: tier-2 indexes
+  a type-specific schema constraint on a single property map, so an "additional-label value" has no
+  distinct meaning. If additional-label property indexes are ever needed, add a
+  `set_additional_labels` hook then.
+- **(Phase 5, review 2026-07-05a E-2) property_index directory-page `count` written but never read**:
+  `bucket_head_ensure` writes a `count` on the bucket-directory page; no reader consumes it
+  (`read_dir_slot` computes the slot offset directly). Harmless dead write; delete or repurpose
+  (e.g. early-exit scan) later.
+- **(Phase 5, review 2026-07-05a E-3) `indexed_paths_for_type` re-parses the whole schema per call**:
+  `find`/`insert`/`delete` reload+linear-search the schema AST each time. Correct but a per-op
+  overhead; move the `indexed` flags into the cached `SchemaRegistry` in a future optimization
+  (alongside any B+tree work).
 
 ### Phase 7 cleanup — status
 
