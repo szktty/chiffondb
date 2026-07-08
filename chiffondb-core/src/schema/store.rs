@@ -65,6 +65,10 @@ struct BoundParamDto {
 struct FieldDefDto {
     name: String,
     type_expr: TypeExprDto,
+    #[serde(default)]
+    indexed: bool,
+    #[serde(default)]
+    unique: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -126,6 +130,8 @@ fn field_to_dto(f: &FieldDef) -> FieldDefDto {
     FieldDefDto {
         name: f.name.clone(),
         type_expr: type_to_dto(&f.type_expr),
+        indexed: f.indexed,
+        unique: f.unique,
     }
 }
 
@@ -182,6 +188,8 @@ fn dto_to_field(f: FieldDefDto) -> FieldDef {
     FieldDef {
         name: f.name,
         type_expr: dto_to_type(f.type_expr),
+        indexed: f.indexed,
+        unique: f.unique,
     }
 }
 

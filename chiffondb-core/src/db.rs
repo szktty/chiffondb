@@ -13,8 +13,10 @@ use crate::storage::file::{DatabaseFile, FileSnapshot, OpenOptions};
 use crate::storage::index;
 use crate::storage::label_index::LabelIndex;
 use crate::storage::page::{EdgeRid, NodeRid, RecordId};
+use crate::storage::property_index::{IndexKey, PropertyIndex};
 use crate::storage::topology::TopologyStore;
-use crate::storage::value::{decode_label_list, encode_label_list, PropertyStore};
+use crate::storage::value::{decode_label_list, encode_label_list, encode_value, PropertyStore};
+use crate::traversal::command::PropertyPath;
 use crate::traversal::executor::{EdgeId, GraphAccess, NodeId};
 
 pub type NodeList = Vec<(NodeRid, HashMap<String, Value>)>;
@@ -151,6 +153,8 @@ impl Database {
         }
         // Register the node under its primary type in the tier-1 label index.
         LabelIndex::new(&mut self.file).add(type_id, rid)?;
+        // Maintain tier-2 property indexes declared on this (primary) type.
+        self.maintain_property_index(type_id, rid, &properties, IndexOp::Add)?;
         Ok(NodeRid(rid))
     }
 
@@ -206,6 +210,11 @@ impl Database {
             Err(GraphError::SchemaError(_)) => {}
             Err(e) => return Err(e),
         }
+        // Read the node's *old* properties before overwriting, so the tier-2 index can drop the
+        // stale value entries and add the new ones.
+        let type_id = node.node_type_id;
+        let old_props = self.get_node_properties_raw(rid)?;
+
         let new_pref = if properties.is_empty() {
             None
         } else {
@@ -213,6 +222,10 @@ impl Database {
         };
         node.property_ref = new_pref;
         self.topo.write_node(&mut self.file, &node)?;
+
+        // Keep the property index consistent: remove old value entries, add new ones.
+        self.maintain_property_index(type_id, rid, &old_props, IndexOp::Remove)?;
+        self.maintain_property_index(type_id, rid, &properties, IndexOp::Add)?;
         Ok(())
     }
 
@@ -238,6 +251,10 @@ impl Database {
         for eid in out_edges.into_iter().chain(in_edges) {
             self.topo.delete_edge(&mut self.file, eid)?;
         }
+        // Remove the node's tier-2 property index entries (primary type's indexed fields).
+        let primary_type = self.topo.read_node(&mut self.file, rid)?.node_type_id;
+        let props = self.get_node_properties_raw(rid)?;
+        self.maintain_property_index(primary_type, rid, &props, IndexOp::Remove)?;
         // Remove the node from every label set it was registered under (primary + additional).
         let type_ids = self.get_node_type_ids(NodeRid(rid))?;
         {
@@ -417,6 +434,117 @@ impl Database {
     pub fn load_schema_registry(&mut self) -> Result<SchemaRegistry, GraphError> {
         let (nodes, edges) = crate::schema::store::load_type_assignments(&mut self.file)?;
         Ok(SchemaRegistry::from_assignments(&nodes, &edges))
+    }
+
+    /// Returns the `@index`-annotated field names of the node type `type_id`, as `PropertyPath`s
+    /// (flat, one per indexed field). Empty when there is no schema or no indexed field — the
+    /// tier-2 index is declared, so unannotated types simply have nothing to maintain.
+    fn indexed_paths_for_type(&mut self, type_id: u16) -> Vec<PropertyPath> {
+        let ast = match load_schema(&mut self.file) {
+            Ok(ast) => ast,
+            Err(_) => return Vec::new(),
+        };
+        let type_name = match self.load_schema_registry() {
+            Ok(reg) => match reg.node_type_name(type_id) {
+                Some(name) => name.to_string(),
+                None => return Vec::new(),
+            },
+            Err(_) => return Vec::new(),
+        };
+        ast.definitions
+            .iter()
+            .find_map(|d| match d {
+                crate::schema::ast::Definition::Node(n) if n.name == type_name => Some(n),
+                _ => None,
+            })
+            .map(|n| {
+                n.fields
+                    .iter()
+                    .filter(|f| f.indexed)
+                    .map(|f| PropertyPath::Flat(f.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Applies `op` (add/remove) to the tier-2 property index for every indexed path of `type_id`
+    /// that resolves to a scalar in `props`. Non-scalar / missing values are skipped (partial
+    /// index). Shared by insert / update / delete so no write path bypasses the index.
+    fn maintain_property_index(
+        &mut self,
+        type_id: u16,
+        rid: RecordId,
+        props: &HashMap<String, Value>,
+        op: IndexOp,
+    ) -> Result<(), GraphError> {
+        let paths = self.indexed_paths_for_type(type_id);
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut index = PropertyIndex::new(&mut self.file);
+        for path in paths {
+            let value = match path.resolve(props) {
+                Some(v) if is_indexable_value(v) => v,
+                _ => continue, // missing or non-scalar → excluded (partial index)
+            };
+            let value_bytes = encode_value(value)?;
+            let key = IndexKey::new(type_id, &path.display_name(), &value_bytes);
+            match op {
+                IndexOp::Add => index.add(key, rid)?,
+                IndexOp::Remove => index.remove(key, rid)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether type `type_id` has a tier-2 index on `path`.
+    fn is_path_indexed(&mut self, type_id: u16, path: &PropertyPath) -> bool {
+        self.indexed_paths_for_type(type_id)
+            .iter()
+            .any(|p| p == path)
+    }
+
+    /// Finds all nodes of `type_id` whose `path` equals `value`, using the tier-2 index when the
+    /// path is indexed (confirming candidates against real values) and falling back to a scan
+    /// otherwise. This is the minimal planner (design §11.2 / implement-request Phase 5).
+    pub fn find_all_nodes(
+        &mut self,
+        type_id: u16,
+        path: &PropertyPath,
+        value: &Value,
+    ) -> Result<Vec<RecordId>, GraphError> {
+        if !self.is_path_indexed(type_id, path) {
+            return index::find_all(&self.topo, &mut self.file, type_id, path, value);
+        }
+        let value_bytes = encode_value(value)?;
+        let key = IndexKey::new(type_id, &path.display_name(), &value_bytes);
+        let candidates = PropertyIndex::new(&mut self.file).candidates(key)?;
+        let mut out = Vec::new();
+        for rid in candidates {
+            // Confirm each candidate: hash collisions can surface a few non-matching rids.
+            let props = self.get_node_properties_raw(rid)?;
+            if path.resolve(&props).is_some_and(|v| v == value) {
+                out.push(rid);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Finds the first node of `type_id` whose `path` equals `value` (index-routed like
+    /// `find_all_nodes`).
+    pub fn find_node(
+        &mut self,
+        type_id: u16,
+        path: &PropertyPath,
+        value: &Value,
+    ) -> Result<Option<RecordId>, GraphError> {
+        if !self.is_path_indexed(type_id, path) {
+            return index::find(&self.topo, &mut self.file, type_id, path, value);
+        }
+        Ok(self
+            .find_all_nodes(type_id, path, value)?
+            .into_iter()
+            .next())
     }
 
     /// Returns the schema stored in the database as DSL source text.
@@ -1007,7 +1135,10 @@ impl<'a> DatabaseGraphView<'a> {
             .or_else(|| label.parse::<u16>().ok())?;
         let mut db = self.db.borrow_mut();
         let db = &mut **db;
-        let rid = index::find(&db.topo, &mut db.file, type_id, key, value).ok()??;
+        // Route through the planner: an indexed (type, key) uses the tier-2 index, else a scan.
+        // `key` is a flat property name; `PropertyPath::from` keeps the &str call site working.
+        let path = PropertyPath::from(key);
+        let rid = db.find_node(type_id, &path, value).ok()??;
         Some(rid_to_id(rid))
     }
 
@@ -1054,6 +1185,19 @@ impl<'a> DatabaseGraphView<'a> {
 
 fn rid_to_id(rid: RecordId) -> u64 {
     ((rid.page_id.0 as u64) << 16) | rid.slot_id.0 as u64
+}
+
+/// Whether to add or remove an index entry when maintaining the tier-2 property index.
+#[derive(Clone, Copy)]
+enum IndexOp {
+    Add,
+    Remove,
+}
+
+/// A value is indexable only if it is a scalar (the partial-index semantics of `PropertyPath`):
+/// arrays and objects have no equality key here and are excluded. `Null` is also excluded.
+fn is_indexable_value(v: &Value) -> bool {
+    matches!(v, Value::Bool(_) | Value::Number(_) | Value::String(_))
 }
 
 fn id_to_rid(id: u64) -> RecordId {
@@ -1753,7 +1897,7 @@ mod tests {
                 &db.topo,
                 &mut db.file,
                 1,
-                "id",
+                &PropertyPath::from("id"),
                 &json!(format!("u{i}")),
             )
             .unwrap();
@@ -1761,7 +1905,14 @@ mod tests {
         }
         // A missing value yields None.
         assert_eq!(
-            crate::storage::index::find(&db.topo, &mut db.file, 1, "id", &json!("absent")).unwrap(),
+            crate::storage::index::find(
+                &db.topo,
+                &mut db.file,
+                1,
+                &PropertyPath::from("id"),
+                &json!("absent")
+            )
+            .unwrap(),
             None
         );
         // list/count by type are scan-backed and correct under the tiny cache.
@@ -2383,6 +2534,399 @@ mod tests {
         }
     }
 
+    // ---- Phase 5: tier-2 property index ----
+
+    /// Builds a DB whose `User` type has an `@index` on `email`, plus a plain `name` field.
+    fn make_db_with_indexed_schema() -> (Database, u16) {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { email: String @index  name: String }")
+            .unwrap();
+        let type_id = db
+            .load_schema_registry()
+            .unwrap()
+            .node_type_id("User")
+            .unwrap();
+        (db, type_id)
+    }
+
+    /// `find_all_nodes` / `find_node` on an `@index` field return the same results a full scan
+    /// would, over a dataset large enough that a scan would be wasteful.
+    #[test]
+    fn property_index_find_agrees_with_scan() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        let mut target = Vec::new();
+        for i in 0..300 {
+            let email = if i % 50 == 0 { "dup@x" } else { "u" };
+            let props = HashMap::from([
+                ("email".to_string(), json!(format!("{email}{i}"))),
+                ("name".to_string(), json!("n")),
+            ]);
+            // Make a few nodes share an exact email to test multi-result find.
+            let props = if i % 50 == 0 {
+                HashMap::from([
+                    ("email".to_string(), json!("dup@x")),
+                    ("name".to_string(), json!("n")),
+                ])
+            } else {
+                props
+            };
+            let rid = db.insert_node_by_name("User", props).unwrap();
+            if i % 50 == 0 {
+                target.push(rid.0);
+            }
+        }
+        // Indexed lookup of the shared value returns exactly the nodes that have it.
+        let path = PropertyPath::from("email");
+        let mut got = db.find_all_nodes(type_id, &path, &json!("dup@x")).unwrap();
+        let mut scan =
+            index::find_all(&db.topo, &mut db.file, type_id, &path, &json!("dup@x")).unwrap();
+        got.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        scan.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(got, scan);
+        assert_eq!(got.len(), 6); // i = 0,50,100,150,200,250
+                                  // A unique value returns a single node; an absent value returns none.
+        assert!(db
+            .find_node(type_id, &path, &json!("u1"))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .find_node(type_id, &path, &json!("nope"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// The planner accepts nested `PropertyPath::Path` keys; non-scalar / None resolve to no
+    /// match (partial-index semantics). Here the path is unindexed, exercising the nested scan
+    /// fallback (nested `@index` declaration is out of scope; the API handles nested keys).
+    #[test]
+    fn property_index_nested_path_via_scan() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node Person { profile: Json }").unwrap();
+        let type_id = db
+            .load_schema_registry()
+            .unwrap()
+            .node_type_id("Person")
+            .unwrap();
+        db.insert_node_by_name(
+            "Person",
+            HashMap::from([("profile".to_string(), json!({"city": "Tokyo"}))]),
+        )
+        .unwrap();
+        db.insert_node_by_name(
+            "Person",
+            HashMap::from([("profile".to_string(), json!({"city": "Osaka"}))]),
+        )
+        .unwrap();
+        // Array-valued / missing terminal → excluded.
+        db.insert_node_by_name(
+            "Person",
+            HashMap::from([("profile".to_string(), json!({"city": ["A", "B"]}))]),
+        )
+        .unwrap();
+
+        let path = PropertyPath::Path {
+            path: vec!["profile".to_string(), "city".to_string()],
+        };
+        // Nested scalar lookup resolves the path and matches only the exact scalar.
+        let tokyo = db.find_all_nodes(type_id, &path, &json!("Tokyo")).unwrap();
+        assert_eq!(tokyo.len(), 1);
+        let osaka = db.find_all_nodes(type_id, &path, &json!("Osaka")).unwrap();
+        assert_eq!(osaka.len(), 1);
+        // A scalar query never matches the node whose `city` resolved to an array.
+        let miss = db.find_all_nodes(type_id, &path, &json!("A")).unwrap();
+        assert!(miss.is_empty());
+    }
+
+    /// Updating an indexed property moves the node from the old value to the new one.
+    #[test]
+    fn property_index_tracks_updates() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        let n = db
+            .insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("email".to_string(), json!("old@x")),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+        let path = PropertyPath::from("email");
+        assert_eq!(
+            db.find_node(type_id, &path, &json!("old@x")).unwrap(),
+            Some(n.0)
+        );
+
+        db.update_node_properties(
+            n,
+            HashMap::from([
+                ("email".to_string(), json!("new@x")),
+                ("name".to_string(), json!("n")),
+            ]),
+        )
+        .unwrap();
+        assert!(db
+            .find_node(type_id, &path, &json!("old@x"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.find_node(type_id, &path, &json!("new@x")).unwrap(),
+            Some(n.0)
+        );
+    }
+
+    /// Deleting a node removes it from the property index.
+    #[test]
+    fn property_index_delete_removes_entry() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        let n = db
+            .insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("email".to_string(), json!("a@x")),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+        let path = PropertyPath::from("email");
+        assert!(db
+            .find_node(type_id, &path, &json!("a@x"))
+            .unwrap()
+            .is_some());
+        db.delete_node(n).unwrap();
+        assert!(db
+            .find_node(type_id, &path, &json!("a@x"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// The property index rolls back with the transaction: inserts/updates within a tx vanish on
+    /// `restore_snapshot`, and the header root reverts.
+    #[test]
+    fn property_index_rolls_back_with_the_transaction() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        let base = db
+            .insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("email".to_string(), json!("base@x")),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+        db.flush().unwrap();
+        let path = PropertyPath::from("email");
+
+        let snap = db.take_snapshot();
+        for i in 0..50 {
+            db.insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("email".to_string(), json!(format!("e{i}@x"))),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+        }
+        db.update_node_properties(
+            base,
+            HashMap::from([
+                ("email".to_string(), json!("changed@x")),
+                ("name".to_string(), json!("n")),
+            ]),
+        )
+        .unwrap();
+        assert!(db
+            .find_node(type_id, &path, &json!("e0@x"))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .find_node(type_id, &path, &json!("changed@x"))
+            .unwrap()
+            .is_some());
+
+        db.restore_snapshot(snap);
+
+        // Everything reverts: the tx inserts are gone and base keeps its original email.
+        assert!(db
+            .find_node(type_id, &path, &json!("e0@x"))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .find_node(type_id, &path, &json!("changed@x"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.find_node(type_id, &path, &json!("base@x")).unwrap(),
+            Some(base.0)
+        );
+    }
+
+    /// Reopen restores the index and the schema's `indexed` flags; queries still hit the index.
+    #[test]
+    fn property_index_persists_across_reopen() {
+        let (mut db, path_db) = make_db();
+        db.apply_schema("node User { email: String @index  name: String }")
+            .unwrap();
+        let n = db
+            .insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("email".to_string(), json!("keep@x")),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let mut db2 = Database::open(&path_db).unwrap();
+        let type_id = db2
+            .load_schema_registry()
+            .unwrap()
+            .node_type_id("User")
+            .unwrap();
+        let path = PropertyPath::from("email");
+        assert_eq!(
+            db2.find_node(type_id, &path, &json!("keep@x")).unwrap(),
+            Some(n.0)
+        );
+        // The `indexed` flag survives: the schema text round-trips with @index.
+        assert!(db2.get_schema_text().unwrap().contains("@index"));
+    }
+
+    /// `find_node_by` on an *unindexed* field still works via the scan fallback.
+    #[test]
+    fn property_index_unindexed_falls_back_to_scan() {
+        let (mut db, _type_id) = make_db_with_indexed_schema();
+        db.insert_node_by_name(
+            "User",
+            HashMap::from([
+                ("email".to_string(), json!("e@x")),
+                ("name".to_string(), json!("Alice")),
+            ]),
+        )
+        .unwrap();
+        // `name` is not indexed; the planner must fall back to a scan and still find it.
+        let view = DatabaseGraphView::load(&mut db).unwrap();
+        assert!(view.find_node_by("User", "name", &json!("Alice")).is_some());
+    }
+
+    /// Reviewer-added (review-2026-07-05a): `is_indexable_value`'s partial-index exclusion must
+    /// hold even when a non-scalar reaches the indexed field's *value* through the low-level
+    /// `insert_node` API, which bypasses `validate_properties`'s schema type check. An array
+    /// value must be silently excluded from the index (not indexed, not a crash), and the node
+    /// must still be reachable via the scan path since `find_all_nodes` falls back whenever the
+    /// index has no entry.
+    #[test]
+    fn property_index_excludes_non_scalar_value_reaching_indexed_field_via_low_level_api() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        // Bypass validate_properties (which insert_node_by_name would run) by calling the
+        // low-level insert_node directly with an array value in the indexed `email` field.
+        let n = db
+            .insert_node(
+                type_id,
+                HashMap::from([
+                    ("email".to_string(), json!(["not", "a", "scalar"])),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+
+        let path = PropertyPath::from("email");
+        // The array value must not appear in the index for any array-shaped query...
+        let hits = db
+            .find_all_nodes(type_id, &path, &json!(["not", "a", "scalar"]))
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "a non-scalar value must never be added to the tier-2 index"
+        );
+        // ...and the node's email must not spuriously match any scalar value either.
+        assert!(db
+            .find_node(type_id, &path, &json!("not"))
+            .unwrap()
+            .is_none());
+        // The node itself is still reachable via the ordinary property read (index exclusion
+        // does not corrupt the node's actual stored properties).
+        assert_eq!(
+            db.get_node_properties(n).unwrap().get("email"),
+            Some(&json!(["not", "a", "scalar"]))
+        );
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(50))]
+        /// For a random sequence of insert / update-property / delete over an `@index` field, the
+        /// index-backed `find_all_nodes` must agree with a brute-force `resolve`-filter over every
+        /// live node — for every value queried.
+        #[test]
+        fn property_index_matches_bruteforce_invariant(
+            ops in proptest::collection::vec(
+                // (op: 0=insert,1=update,2=delete, node slot 0..8, value 0..4)
+                (0u8..3, 0usize..8, 0u8..4),
+                1..120,
+            )
+        ) {
+            let (mut db, type_id) = make_db_with_indexed_schema();
+            let path = PropertyPath::from("email");
+            // Track live nodes by a stable test index → NodeRid.
+            let mut nodes: std::collections::HashMap<usize, NodeRid> = std::collections::HashMap::new();
+            let val = |v: u8| json!(format!("v{v}"));
+
+            for (op, slot, v) in ops {
+                match op {
+                    0 => {
+                        // Insert (replace any existing node at this slot to keep it simple).
+                        if let Some(old) = nodes.remove(&slot) {
+                            db.delete_node(old).unwrap();
+                        }
+                        let n = db.insert_node_by_name(
+                            "User",
+                            HashMap::from([
+                                ("email".to_string(), val(v)),
+                                ("name".to_string(), json!("n")),
+                            ]),
+                        ).unwrap();
+                        nodes.insert(slot, n);
+                    }
+                    1 => {
+                        if let Some(&n) = nodes.get(&slot) {
+                            db.update_node_properties(
+                                n,
+                                HashMap::from([
+                                    ("email".to_string(), val(v)),
+                                    ("name".to_string(), json!("n")),
+                                ]),
+                            ).unwrap();
+                        }
+                    }
+                    _ => {
+                        if let Some(n) = nodes.remove(&slot) {
+                            db.delete_node(n).unwrap();
+                        }
+                    }
+                }
+            }
+
+            // For each possible value, index result == brute-force scan result.
+            let all_rids = db.topo.live_node_rids(&mut db.file).unwrap();
+            for v in 0u8..4 {
+                let value = val(v);
+                let mut expected = Vec::new();
+                for &rid in &all_rids {
+                    let props = db.get_node_properties_raw(rid).unwrap();
+                    if path.resolve(&props).is_some_and(|x| *x == value) {
+                        expected.push(rid);
+                    }
+                }
+                let mut got = db.find_all_nodes(type_id, &path, &value).unwrap();
+                got.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+                expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+                prop_assert_eq!(got, expected, "property index drifted for value {}", v);
+            }
+        }
+    }
+
     #[test]
     fn insert_node_and_read_properties() {
         let (mut db, _) = make_db();
@@ -2853,8 +3397,14 @@ mod tests {
         let registry = db.load_schema_registry().unwrap();
         let type_id = registry.node_type_id("User").unwrap();
         assert_eq!(
-            crate::storage::index::find(&db.topo, &mut db.file, type_id, "id", &json!("u1"))
-                .unwrap(),
+            crate::storage::index::find(
+                &db.topo,
+                &mut db.file,
+                type_id,
+                &PropertyPath::from("id"),
+                &json!("u1")
+            )
+            .unwrap(),
             Some(rid.0)
         );
     }
@@ -2875,8 +3425,14 @@ mod tests {
         let type_id = registry.node_type_id("User").unwrap();
         db.delete_node(rid).unwrap();
         assert_eq!(
-            crate::storage::index::find(&db.topo, &mut db.file, type_id, "id", &json!("u1"))
-                .unwrap(),
+            crate::storage::index::find(
+                &db.topo,
+                &mut db.file,
+                type_id,
+                &PropertyPath::from("id"),
+                &json!("u1")
+            )
+            .unwrap(),
             None
         );
     }
@@ -2904,13 +3460,25 @@ mod tests {
         let registry = db.load_schema_registry().unwrap();
         let type_id = registry.node_type_id("User").unwrap();
         assert_eq!(
-            crate::storage::index::find(&db.topo, &mut db.file, type_id, "name", &json!("Alice"))
-                .unwrap(),
+            crate::storage::index::find(
+                &db.topo,
+                &mut db.file,
+                type_id,
+                &PropertyPath::from("name"),
+                &json!("Alice")
+            )
+            .unwrap(),
             None
         );
         assert_eq!(
-            crate::storage::index::find(&db.topo, &mut db.file, type_id, "name", &json!("Alicia"))
-                .unwrap(),
+            crate::storage::index::find(
+                &db.topo,
+                &mut db.file,
+                type_id,
+                &PropertyPath::from("name"),
+                &json!("Alicia")
+            )
+            .unwrap(),
             Some(rid.0)
         );
     }
@@ -2934,8 +3502,14 @@ mod tests {
         let registry = db2.load_schema_registry().unwrap();
         let type_id = registry.node_type_id("User").unwrap();
         assert_eq!(
-            crate::storage::index::find(&db2.topo, &mut db2.file, type_id, "id", &json!("u1"))
-                .unwrap(),
+            crate::storage::index::find(
+                &db2.topo,
+                &mut db2.file,
+                type_id,
+                &PropertyPath::from("id"),
+                &json!("u1")
+            )
+            .unwrap(),
             Some(rid.0)
         );
     }
@@ -3092,7 +3666,7 @@ mod tests {
                     &db.topo,
                     &mut db.file,
                     type_id,
-                    "id",
+                    &PropertyPath::from("id"),
                     &json!(name.clone()),
                 )
                 .unwrap();

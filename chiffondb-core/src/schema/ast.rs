@@ -36,6 +36,11 @@ pub struct BoundParam {
 pub struct FieldDef {
     pub name: String,
     pub type_expr: TypeExpr,
+    /// `@index`: a tier-2 property index is maintained for this field (Phase 5).
+    pub indexed: bool,
+    /// `@unique`: reserved for the tier-3 unique constraint (Phase 6); parsed but not yet
+    /// enforced.
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

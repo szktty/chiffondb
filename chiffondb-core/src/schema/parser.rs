@@ -133,7 +133,31 @@ fn parse_field_def(pair: Pair<Rule>) -> Result<FieldDef, GraphError> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
     let type_expr = parse_type_expr(inner.next().unwrap())?;
-    Ok(FieldDef { name, type_expr })
+    // Remaining pairs are annotations (`@index`, `@unique`). Each `annotation` rule wraps an
+    // `ident` naming the annotation.
+    let mut indexed = false;
+    let mut unique = false;
+    for ann in inner {
+        if ann.as_rule() != Rule::annotation {
+            continue;
+        }
+        let ident = ann.into_inner().next().unwrap().as_str();
+        match ident {
+            "index" => indexed = true,
+            "unique" => unique = true,
+            other => {
+                return Err(GraphError::SchemaError(format!(
+                    "unknown field annotation '@{other}' on '{name}'"
+                )))
+            }
+        }
+    }
+    Ok(FieldDef {
+        name,
+        type_expr,
+        indexed,
+        unique,
+    })
 }
 
 fn parse_type_expr(pair: Pair<Rule>) -> Result<TypeExpr, GraphError> {
@@ -206,6 +230,30 @@ mod tests {
         assert_eq!(node.fields.len(), 3);
         assert_eq!(node.fields[0].name, "id");
         assert_eq!(node.fields[0].type_expr, TypeExpr::String);
+    }
+
+    #[test]
+    fn parse_field_annotations() {
+        let src = r#"
+            node User {
+                email: String @index
+                handle: String @unique
+                name: String
+            }
+        "#;
+        let ast = parse(src).unwrap();
+        let Definition::Node(node) = &ast.definitions[0] else {
+            panic!()
+        };
+        assert!(node.fields[0].indexed && !node.fields[0].unique);
+        assert!(node.fields[1].unique && !node.fields[1].indexed);
+        assert!(!node.fields[2].indexed && !node.fields[2].unique);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_annotation() {
+        let src = "node User { id: String @bogus }";
+        assert!(parse(src).is_err());
     }
 
     #[test]

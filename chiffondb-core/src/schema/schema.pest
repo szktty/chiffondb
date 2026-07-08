@@ -25,7 +25,10 @@ edge_to   = { "to"   ~ ":" ~ type_expr }
 props_block = { "props" ~ ":" ~ "{" ~ field_def* ~ "}" }
 
 // --- Field definition ---
-field_def = { ident ~ ":" ~ type_expr }
+// A field may carry trailing annotations, e.g. `name: String @index`. `@unique` is reserved
+// for Phase 6 (tier-3) and parsed here so the grammar is stable, though enforcement is later.
+field_def  = { ident ~ ":" ~ type_expr ~ annotation* }
+annotation = { "@" ~ ident }
 
 // --- Type expressions ---
 type_expr = {

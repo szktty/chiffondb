@@ -14,15 +14,14 @@ use crate::storage::label_index::LabelIndex;
 use crate::storage::page::RecordId;
 use crate::storage::topology::TopologyStore;
 use crate::storage::value::PropertyStore;
+use crate::traversal::command::PropertyPath;
 
-/// Returns true if a node's stored property `key` equals `value`.
+/// Returns true if the node's property at `path` equals `value`.
 ///
-/// Property values are scalars (schema field types: String/Int/Float/Bool/…), for which
-/// `Value`'s structural equality coincides with the JSON-string equality the former
-/// in-memory index keyed on — so query semantics are unchanged while avoiding a
-/// per-node string allocation.
-fn props_match(props: &HashMap<String, Value>, key: &str, value: &Value) -> bool {
-    props.get(key).is_some_and(|stored| stored == value)
+/// `path` is a `PropertyPath` (flat or nested scalar), so both `email` and `profile.city`
+/// resolve. Equality is `serde_json::Value`'s structural equality.
+fn props_match(props: &HashMap<String, Value>, path: &PropertyPath, value: &Value) -> bool {
+    path.resolve(props).is_some_and(|stored| stored == value)
 }
 
 /// Returns the node RecordIds registered under `type_id` via the tier-1 label index.
@@ -42,7 +41,7 @@ pub fn find_all(
     topo: &TopologyStore,
     file: &mut DatabaseFile,
     type_id: u16,
-    key: &str,
+    path: &PropertyPath,
     value: &Value,
 ) -> Result<Vec<RecordId>, GraphError> {
     let mut out = Vec::new();
@@ -55,19 +54,19 @@ pub fn find_all(
             None => continue,
             Some(pref) => PropertyStore::read(file, pref)?,
         };
-        if props_match(&props, key, value) {
+        if props_match(&props, path, value) {
             out.push(rid);
         }
     }
     Ok(out)
 }
 
-/// Returns the first live node of `type_id` whose `key` property equals `value`.
+/// Returns the first live node of `type_id` whose `path` property equals `value`.
 pub fn find(
     topo: &TopologyStore,
     file: &mut DatabaseFile,
     type_id: u16,
-    key: &str,
+    path: &PropertyPath,
     value: &Value,
 ) -> Result<Option<RecordId>, GraphError> {
     for rid in topo.live_node_rids(file)? {
@@ -79,7 +78,7 @@ pub fn find(
             None => continue,
             Some(pref) => PropertyStore::read(file, pref)?,
         };
-        if props_match(&props, key, value) {
+        if props_match(&props, path, value) {
             return Ok(Some(rid));
         }
     }
@@ -128,16 +127,29 @@ mod tests {
         );
 
         assert_eq!(
-            find(&topo, &mut f, 1, "id", &json!("u1")).unwrap(),
+            find(&topo, &mut f, 1, &PropertyPath::from("id"), &json!("u1")).unwrap(),
             Some(r1)
         );
         assert_eq!(
-            find(&topo, &mut f, 1, "name", &json!("Alice")).unwrap(),
+            find(
+                &topo,
+                &mut f,
+                1,
+                &PropertyPath::from("name"),
+                &json!("Alice")
+            )
+            .unwrap(),
             Some(r1)
         );
-        assert_eq!(find(&topo, &mut f, 1, "id", &json!("nope")).unwrap(), None);
+        assert_eq!(
+            find(&topo, &mut f, 1, &PropertyPath::from("id"), &json!("nope")).unwrap(),
+            None
+        );
         // Different type_id must not match.
-        assert_eq!(find(&topo, &mut f, 2, "id", &json!("u1")).unwrap(), None);
+        assert_eq!(
+            find(&topo, &mut f, 2, &PropertyPath::from("id"), &json!("u1")).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -147,7 +159,14 @@ mod tests {
         let r2 = insert(&mut topo, &mut f, 1, &[("role", json!("admin"))]);
         let _other = insert(&mut topo, &mut f, 1, &[("role", json!("user"))]);
 
-        let all = find_all(&topo, &mut f, 1, "role", &json!("admin")).unwrap();
+        let all = find_all(
+            &topo,
+            &mut f,
+            1,
+            &PropertyPath::from("role"),
+            &json!("admin"),
+        )
+        .unwrap();
         assert_eq!(all.len(), 2);
         assert!(all.contains(&r1));
         assert!(all.contains(&r2));
@@ -172,6 +191,9 @@ mod tests {
         let (mut topo, mut f) = make();
         let r1 = insert(&mut topo, &mut f, 1, &[("id", json!("u1"))]);
         topo.free_node(&mut f, r1).unwrap();
-        assert_eq!(find(&topo, &mut f, 1, "id", &json!("u1")).unwrap(), None);
+        assert_eq!(
+            find(&topo, &mut f, 1, &PropertyPath::from("id"), &json!("u1")).unwrap(),
+            None
+        );
     }
 }
