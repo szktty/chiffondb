@@ -38,6 +38,7 @@ variable-length segment is future work).
   worker or reviewer and follows its instructions — see `.claude/skills/triad/SKILL.md`.
 - The actual review/implement steps (verify/result/fix/request/close) are defined in
   `.claude/skills/triad-plan/SKILL.md`. Read it only when running one of those steps.
+- Record in-progress work from AI sessions in `../chiffondb-private/docs/working.md`.
 
 ### Code style
 - `unwrap()` / `expect()` are banned. Propagate errors with the `?` operator.
