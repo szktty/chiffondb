@@ -284,6 +284,14 @@ impl Database {
     ) -> Result<EdgeRid, GraphError> {
         let from = from.0;
         let to = to.0;
+        // Validate endpoints before writing: an unchecked freed/invalid NodeRid would later have
+        // its adjacency list rewritten, silently corrupting an unrelated live node.
+        if !self.node_exists_raw(from) {
+            return Err(GraphError::NodeNotFound(format!("edge from {from:?}")));
+        }
+        if !self.node_exists_raw(to) {
+            return Err(GraphError::NodeNotFound(format!("edge to {to:?}")));
+        }
         let prop_ref = if properties.is_empty() {
             None
         } else {

@@ -27,8 +27,6 @@
 //! All pages go through `read_page`/`write_page` → WAL, so the index has no in-memory state and
 //! rolls back with the data (design §11.3).
 
-use std::hash::{Hash, Hasher};
-
 use crate::error::GraphError;
 use crate::storage::file::DatabaseFile;
 use crate::storage::page::{RecordId, PAGE_SIZE};
@@ -66,11 +64,13 @@ impl IndexKey {
 
     fn bucket(&self) -> usize {
         // Combine the three components so different (type, path, value) spread across buckets.
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.type_id.hash(&mut h);
-        self.path_hash.hash(&mut h);
-        self.value_hash.hash(&mut h);
-        (h.finish() as usize) % BUCKET_COUNT
+        // Uses FNV-1a (see `fnv1a`) — a fixed algorithm, unlike `DefaultHasher` whose output may
+        // change across Rust releases and would silently break a persisted index (M-3).
+        let mut buf = [0u8; 18];
+        buf[0..2].copy_from_slice(&self.type_id.to_le_bytes());
+        buf[2..10].copy_from_slice(&self.path_hash.to_le_bytes());
+        buf[10..18].copy_from_slice(&self.value_hash.to_le_bytes());
+        (fnv1a(&buf) as usize) % BUCKET_COUNT
     }
 
     fn matches(&self, type_id: u16, path_hash: u64, value_hash: u64) -> bool {
@@ -78,10 +78,22 @@ impl IndexKey {
     }
 }
 
+/// 64-bit FNV-1a hash. A fixed, specified algorithm so hashes persisted in the on-disk index stay
+/// valid across Rust toolchain updates (unlike `std`'s `DefaultHasher`, which is explicitly not
+/// guaranteed stable between releases — M-3).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    h.finish()
+    fnv1a(bytes)
 }
 
 /// A persisted equality property index. Holds no state beyond the root pid it reads from / writes
@@ -98,6 +110,8 @@ impl<'a> PropertyIndex<'a> {
     /// Adds `(key → rid)` (idempotent for an identical entry).
     pub fn add(&mut self, key: IndexKey, rid: RecordId) -> Result<(), GraphError> {
         let head = self.bucket_head_ensure(key.bucket())?;
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
         let mut pid = head;
         let mut first_free: Option<u32> = None;
         loop {
@@ -115,6 +129,10 @@ impl<'a> PropertyIndex<'a> {
             let next = read_next(&page);
             if next == NO_ROOT {
                 break;
+            }
+            steps += 1;
+            if steps > limit {
+                return Err(GraphError::StorageCorrupted(pid));
             }
             pid = next;
         }
@@ -144,6 +162,8 @@ impl<'a> PropertyIndex<'a> {
             Some(pid) => pid,
             None => return Ok(()),
         };
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
         let mut pid = head;
         loop {
             let mut page = self.file.read_page(pid)?;
@@ -162,6 +182,10 @@ impl<'a> PropertyIndex<'a> {
             if next == NO_ROOT {
                 return Ok(());
             }
+            steps += 1;
+            if steps > limit {
+                return Err(GraphError::StorageCorrupted(pid));
+            }
             pid = next;
         }
     }
@@ -174,6 +198,8 @@ impl<'a> PropertyIndex<'a> {
             Some(pid) => pid,
             None => return Ok(out),
         };
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
         loop {
             let page = self.file.read_page(pid)?;
             let count = read_count(&page);
@@ -186,6 +212,10 @@ impl<'a> PropertyIndex<'a> {
             let next = read_next(&page);
             if next == NO_ROOT {
                 break;
+            }
+            steps += 1;
+            if steps > limit {
+                return Err(GraphError::StorageCorrupted(pid));
             }
             pid = next;
         }
@@ -275,6 +305,8 @@ impl<'a> PropertyIndex<'a> {
     }
 
     fn link_tail(&mut self, head: u32, new_pid: u32) -> Result<(), GraphError> {
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
         let mut pid = head;
         loop {
             let mut page = self.file.read_page(pid)?;
@@ -283,6 +315,10 @@ impl<'a> PropertyIndex<'a> {
                 write_next(&mut page, new_pid);
                 self.file.write_page(pid, &page)?;
                 return Ok(());
+            }
+            steps += 1;
+            if steps > limit {
+                return Err(GraphError::StorageCorrupted(pid));
             }
             pid = next;
         }

@@ -48,7 +48,9 @@ static OPEN_FILES: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
 fn register_path(path: &Path) -> Result<(), GraphError> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut guard = OPEN_FILES.lock().unwrap();
+    // Recover from a poisoned mutex rather than panicking (project rule: no unwrap): the guarded
+    // HashSet stays consistent regardless of the panic that poisoned it.
+    let mut guard = OPEN_FILES.lock().unwrap_or_else(|e| e.into_inner());
     let set = guard.get_or_insert_with(HashSet::new);
     if !set.insert(canonical) {
         return Err(GraphError::Io(std::io::Error::new(
@@ -80,9 +82,11 @@ pub const MAGIC: &[u8; 8] = b"CHIFFON\0";
 /// and the unused `page_directory_root` at offsets 16..32 (everything resolves through the
 /// node/edge/property page directories), leaving 16..32 reserved. v6 adds the tier-1 label index
 /// root at offset 16..20 (within that reserved range). v7 adds the tier-2 property index root at
-/// offset 20..24. A mismatch is rejected by `FileHeader::deserialize` to avoid silently
-/// misreading an older layout.
-pub const VERSION: u32 = 7;
+/// offset 20..24. v8 changes the tier-2 index hash from `DefaultHasher` (not stable across Rust
+/// releases) to a fixed FNV-1a, invalidating persisted index entries — old v7 files are rejected.
+/// A mismatch is rejected by `FileHeader::deserialize` to avoid silently misreading an older
+/// layout.
+pub const VERSION: u32 = 8;
 
 /// Contents of the header page (Page 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -953,6 +957,34 @@ mod tests {
             }
             Err(e) => panic!("expected UnsupportedVersion for v6, got {e:?}"),
             Ok(_) => panic!("v6 file was not rejected — silent misread risk"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_previous_version_v7() {
+        // v8 changed the tier-2 index hash (DefaultHasher → FNV-1a), invalidating a v7 file's
+        // persisted index; the version guard must reject it (no backward compat, design §0).
+        let dir = TempDir::new().unwrap();
+        let path = make_db_path(&dir);
+        {
+            let mut f = FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let mut buf = [0u8; PAGE_SIZE];
+            buf[0..8].copy_from_slice(MAGIC);
+            buf[8..12].copy_from_slice(&7u32.to_le_bytes()); // previous version v7
+            f.write_all(&buf).unwrap();
+        }
+        match DatabaseFile::open(&path) {
+            Err(GraphError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 7);
+                assert_eq!(supported, VERSION);
+            }
+            Err(e) => panic!("expected UnsupportedVersion for v7, got {e:?}"),
+            Ok(_) => panic!("v7 file was not rejected — silent misread risk"),
         }
     }
 

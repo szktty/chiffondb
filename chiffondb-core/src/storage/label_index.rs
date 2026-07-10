@@ -66,6 +66,8 @@ impl<'a> LabelIndex<'a> {
         };
 
         // Walk the chain: dedup, remember the first page with free space.
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
         let mut pid = head;
         let mut first_free: Option<u32> = None;
         loop {
@@ -82,6 +84,10 @@ impl<'a> LabelIndex<'a> {
             let next = read_next(&page);
             if next == NO_ROOT {
                 break;
+            }
+            steps += 1;
+            if steps > limit {
+                return Err(GraphError::StorageCorrupted(pid));
             }
             pid = next;
         }
@@ -112,6 +118,8 @@ impl<'a> LabelIndex<'a> {
             Some(pid) => pid,
             None => return Ok(()),
         };
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
         loop {
             let mut page = self.file.read_page(pid)?;
             let count = read_count(&page);
@@ -129,6 +137,10 @@ impl<'a> LabelIndex<'a> {
             if next == NO_ROOT {
                 return Ok(());
             }
+            steps += 1;
+            if steps > limit {
+                return Err(GraphError::StorageCorrupted(pid));
+            }
             pid = next;
         }
     }
@@ -140,6 +152,8 @@ impl<'a> LabelIndex<'a> {
             Some(pid) => pid,
             None => return Ok(out),
         };
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
         loop {
             let page = self.file.read_page(pid)?;
             let count = read_count(&page);
@@ -149,6 +163,10 @@ impl<'a> LabelIndex<'a> {
             let next = read_next(&page);
             if next == NO_ROOT {
                 break;
+            }
+            steps += 1;
+            if steps > limit {
+                return Err(GraphError::StorageCorrupted(pid));
             }
             pid = next;
         }
@@ -162,12 +180,18 @@ impl<'a> LabelIndex<'a> {
             Some(pid) => pid,
             None => return Ok(0),
         };
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
         loop {
             let page = self.file.read_page(pid)?;
             total += read_count(&page) as u64;
             let next = read_next(&page);
             if next == NO_ROOT {
                 break;
+            }
+            steps += 1;
+            if steps > limit {
+                return Err(GraphError::StorageCorrupted(pid));
             }
             pid = next;
         }
@@ -182,6 +206,8 @@ impl<'a> LabelIndex<'a> {
         if pid == NO_ROOT {
             return Ok(None);
         }
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
         loop {
             let page = self.file.read_page(pid)?;
             let count = read_count(&page);
@@ -194,6 +220,10 @@ impl<'a> LabelIndex<'a> {
             let next = read_next(&page);
             if next == NO_ROOT {
                 return Ok(None);
+            }
+            steps += 1;
+            if steps > limit {
+                return Err(GraphError::StorageCorrupted(pid));
             }
             pid = next;
         }
@@ -210,6 +240,8 @@ impl<'a> LabelIndex<'a> {
         let root = self.file.header.label_index_root;
 
         // Walk root pages: update an existing slot for type_id, else find room for a new slot.
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
         let mut pid = root;
         loop {
             let mut page = self.file.read_page(pid)?;
@@ -240,6 +272,10 @@ impl<'a> LabelIndex<'a> {
                 self.file.write_page(pid, &page)?;
                 return Ok(());
             }
+            steps += 1;
+            if steps > limit {
+                return Err(GraphError::StorageCorrupted(pid));
+            }
             pid = next;
         }
     }
@@ -252,6 +288,8 @@ impl<'a> LabelIndex<'a> {
     }
 
     fn link_tail(&mut self, head: u32, new_pid: u32) -> Result<(), GraphError> {
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
         let mut pid = head;
         loop {
             let mut page = self.file.read_page(pid)?;
@@ -260,6 +298,10 @@ impl<'a> LabelIndex<'a> {
                 write_next(&mut page, new_pid);
                 self.file.write_page(pid, &page)?;
                 return Ok(());
+            }
+            steps += 1;
+            if steps > limit {
+                return Err(GraphError::StorageCorrupted(pid));
             }
             pid = next;
         }

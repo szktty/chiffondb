@@ -286,7 +286,11 @@ pub fn register_dynamic_type(
     }
 
     let id = (*next_id).max(1);
-    *next_id = id + 1;
+    // u16 id space: fail rather than wrap (wrapping to 0 → max(1) would re-issue id 1 and
+    // confuse it with an existing type).
+    *next_id = id
+        .checked_add(1)
+        .ok_or_else(|| GraphError::SchemaError("type id space exhausted (u16)".to_string()))?;
     assignments.push((name.to_string(), id));
     write_schema_dto(db, &dto)?;
     Ok((id, true))
