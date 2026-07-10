@@ -16,10 +16,13 @@ Dart bindings and the GUI browser live in separate repositories — this repo is
 
 ## Status
 
-The whole engine's resident memory is bounded by the page-cache budget (all on-disk pages go
-through a fixed-size LRU cache; there is no in-memory index that grows with the data). Known
-limit: the topology segment is fixed-size, so a database holds at most ~2000 nodes (a
-variable-length segment is future work).
+The whole engine's resident memory is bounded by the page-cache budget (all on-disk pages,
+including the indexes, go through a fixed-size LRU cache; no in-memory index grows with the data —
+except `live_node_rids`, which materializes RecordIds during a full scan). Node/edge/property
+pages grow on the file's append tail via per-kind page directories, so the old ~2000-node cap is
+gone (ceiling is now the u32 logical page space). On-disk `VERSION` is 8. See `ARCHITECTURE.md` for
+the format, the label/property/unique indexes, and the known limitations (insertion is O(n²) at
+scale; crash atomicity is not guaranteed per API call).
 
 ## Development rules
 

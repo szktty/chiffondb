@@ -11,29 +11,63 @@ Offset 8192  : Page 2
 ...
 ```
 
-Internally the file is logically divided into three segments. The starting page number of each segment is recorded in the header page.
+Pages are **not** partitioned into fixed physical segments. Node, edge, and property record pages
+(and their directory/index pages) are all appended to the end of the file and located through
+**page directories** — one per kind, whose root is stored in the header. A logical page number is
+resolved to a physical page id through its directory, so every kind can grow independently on the
+shared append tail without a fixed capacity. (This replaced the original fixed `[topology][property]`
+segment layout, which capped a database at ~2000 nodes; see the version history below.)
 
-| Segment | Contents | Record format |
-|---------|----------|---------------|
-| Topology | Connectivity of nodes and edges | Fixed-size slots |
-| Property | Variable-length data (strings, blobs, etc.) | Slotted page |
-| Vector | Embedding vectors (implemented after MVP) | Fixed-size blocks |
+| Kind | Contents | Record format | Located via |
+|------|----------|---------------|-------------|
+| Node | Node records + adjacency-list heads | Fixed 64-byte slots | node page directory |
+| Edge | Edge records + adjacency-list links | Fixed 64-byte slots | edge page directory |
+| Property | Variable-length values (strings, JSON, blobs, labels) | Slotted page / page chain | property page directory |
+| Label index | `type_id → {node RecordId}` (tier 1) | Per-type page chain | `label_index_root` |
+| Property index | `(type, property) value → {node RecordId}` (tier 2/3) | Hash-bucket page chains | `property_index_root` |
+| Schema | Schema DSL + type-id assignments | Page chain | `schema_root` |
+
+Embedding vectors (a "vector" kind) are reserved for future work; there is no vector write path yet.
 
 ---
 
 ## Header page (Page 0)
 
-| Field | Size | Contents |
-|-------|------|----------|
-| magic | 8 bytes | `CHIFFON\0` |
-| version | 4 bytes | Format version (u32) |
-| page_size | 4 bytes | Page size (fixed at 4096) |
-| topology_segment_start | 4 bytes | Starting page number of the topology segment |
-| property_segment_start | 4 bytes | Starting page number of the property segment |
-| vector_segment_start | 4 bytes | Starting page number of the vector segment (0 = unused) |
-| page_directory_root | 4 bytes | Page number of the latest page directory (for MVCC) |
-| schema_root | 4 bytes | Page number where schema information is stored |
-| reserved | remainder | Reserved for future use (zero-filled) |
+The on-disk `version` is `8`. `FileHeader::deserialize` rejects any other version rather than
+misreading an older layout (there is no backward compatibility — see the version history).
+
+| Offset | Field | Size | Contents |
+|--------|-------|------|----------|
+| 0 | magic | 8 | `CHIFFON\0` |
+| 8 | version | 4 | Format version (u32), currently 8 |
+| 12 | page_size | 4 | Page size (fixed at 4096) |
+| 16 | label_index_root | 4 | Root page of the tier-1 label index (`0xFFFFFFFF` = none) |
+| 20 | property_index_root | 4 | Root page of the tier-2/3 property index (`0xFFFFFFFF` = none) |
+| 24 | *(reserved)* | 8 | Zero-filled |
+| 32 | schema_root | 4 | First page of the schema page chain (0 = none) |
+| 36 | schema_version | 4 | Bumped on each schema change |
+| 40 | node_page_count | 4 | Logical node pages in use (= node directory's mapped length) |
+| 44 | edge_page_count | 4 | Logical edge pages in use (= edge directory's mapped length) |
+| 48 | property_dir_root | 4 | Root of the property page directory (`0xFFFFFFFF` = none) |
+| 52 | property_dir_len | 4 | Mapped length of the property page directory |
+| 56 | node_dir_root | 4 | Root of the node page directory (`0xFFFFFFFF` = none) |
+| 60 | edge_dir_root | 4 | Root of the edge page directory (`0xFFFFFFFF` = none) |
+| 64.. | *(reserved)* | remainder | Zero-filled |
+
+The header is the single in-memory source of truth for all directory/index roots and page counts.
+It is updated **through the WAL** like any other page, and reverts in full on rollback (so the
+whole header is treated as transaction state and moves in lockstep with the data).
+
+### On-disk format version history
+
+| Version | Change |
+|---------|--------|
+| 3 | Product rename to ChiffonDB (magic `TANABATA` → `CHIFFON\0`). |
+| 4 | Variable-length topology: property page directory; property RIDs become logical page numbers. |
+| 5 | Removed the vestigial segment-start fields and the unused MVCC `page_directory_root`. |
+| 6 | Tier-1 label index (root at offset 16). |
+| 7 | Tier-2 property index (root at offset 20). |
+| 8 | Tier-2 index hash changed from `DefaultHasher` (not stable across Rust releases) to a fixed FNV-1a, invalidating persisted index entries. |
 
 ---
 
@@ -110,7 +144,9 @@ Node.first_in_edge  ──► Edge ──► Edge.next_in_edge  ──► Edge �
 
 - When adding an edge, it is **inserted at the head** of the list (O(1))
 - When deleting an edge, the previous and next links are rewired to bypass it
-- Traversal just follows the pointer chain, requiring no index (index-free adjacency traversal)
+- **Adjacency traversal** just follows the pointer chain, requiring no index (index-free). This is
+  separate from the label/property indexes below, which accelerate *lookups by type or property
+  value*, not neighbor traversal.
 
 Source: `chiffondb-core/src/storage/topology.rs`
 
@@ -151,31 +187,97 @@ The slot of the property page pointed to by `label_ref` stores an array of addit
 
 ---
 
+## Indexes
+
+Both index tiers are persisted on disk (pages resolved through the same bounded page cache) and
+carry **no in-memory state**, so their mutations ride the WAL and roll back together with the data.
+Every chain walk is bounded by the file's page count, so a corrupt `next` link errors as
+`StorageCorrupted` rather than looping.
+
+### Tier 1: label (type) index — always on
+
+Maps `type_id → {node RecordId}` so `list_nodes(type)` / `count_nodes(type)` are O(matches)
+instead of a full scan. A node is registered under **every** label it carries (primary
+`node_type_id` plus each additional/dynamic label), so `MATCH (n:Label)` hits under any of a node's
+labels. Structure: a per-type `RecordId` page chain, with a small `type_id → chain head` root map.
+Root at header offset 16. Source: `chiffondb-core/src/storage/label_index.rs`.
+
+### Tier 2: property index — declared with `@index`
+
+Accelerates equality `find` / `find_all` on a `(type, property)` pair declared `@index` in the
+schema. The key is a `PropertyPath` (a flat field name or a nested-scalar path such as
+`profile.city`); only scalar values are indexed (arrays / objects / absent values are excluded —
+a **partial index**). It is an **equality hash-bucket** structure, not a B+tree: an entry stores a
+fixed 24 bytes `[type_id][path_hash][value_hash][rid]`, hashed into 256 buckets. Because the value
+is stored as a hash, a lookup returns **candidates** that the query layer confirms against each
+node's real value (so hash collisions never produce wrong results). Range / ordered queries are not
+accelerated. Hashing uses a fixed **FNV-1a** (not `std`'s release-unstable `DefaultHasher`) so
+persisted entries survive toolchain updates. Root at header offset 20. Source:
+`chiffondb-core/src/storage/property_index.rs`.
+
+### Tier 3: unique constraint — declared with `@unique`
+
+A `@unique` field is maintained in the tier-2 index (so it is also queryable) and additionally
+**enforced**: `insert` / `update` check the index before writing and return `UniqueViolation` if a
+*different* node already holds the value (updating a node to its own value is allowed). The check
+runs pre-write, so a rejected operation leaves the database unchanged. Non-scalar / absent values
+are unconstrained (partial semantics). Enforcement is on the node's **primary** type's `@unique`
+fields.
+
+Tier-4 (full-text / vector) is future work.
+
+---
+
 ## Durability and concurrency (current model)
 
 Durability is provided by the WAL, not by copy-on-write. Every page write is appended to
 the WAL file (write-through); on `flush()` the WAL is checkpointed into the main file. A
-crash before checkpoint is recovered by replaying the WAL on next open. See the "Bounded
-page cache" section below for the read/write/rollback paths.
+crash before checkpoint is recovered by replaying the WAL on next open — `open` checkpoints the
+WAL **before** reading the header, so a header updated only in the WAL (a crash/drop before flush)
+is applied rather than lost. See the "Bounded page cache" section below for the read/write/rollback
+paths.
 
 Concurrency is single-writer, single-reader per database file, enforced by an exclusive
 advisory lock plus an in-process open-file registry (`storage::file`): a second attempt to
 open the same file fails. There is no shared multi-reader access.
 
-> **Not yet implemented (planned).** True copy-on-write and MVCC — a per-transaction page
-> directory (logical→physical page mapping), snapshot isolation with non-blocking readers
-> (SWMR), and incremental backups derived from appended pages — are design goals, not the
-> current behavior. The `page_directory_root` header field is reserved (always 0) for this
-> future work.
-```
+> **Crash atomicity is not guaranteed at the API-call level.** The WAL is write-through and has
+> **no commit boundary**: it records page writes, not transaction boundaries. In-process rollback
+> (`take_snapshot` / `restore_snapshot`, which truncates the WAL to the snapshot length) is exact,
+> but a crash *mid-operation* — e.g. partway through a single `insert_node` that writes several
+> pages — replays whatever reached the WAL, so a partially-applied operation can survive recovery.
+> Treat durability as "flushed state, plus a best-effort tail", not as all-or-nothing per call.
+> A WAL commit marker (replay only up to the last committed record) is future work.
+
+> **Not yet implemented (planned).** True copy-on-write and MVCC — snapshot isolation with
+> non-blocking readers (SWMR) and incremental backups derived from appended pages — are design
+> goals, not the current behavior. The per-kind page directories introduced for variable-length
+> topology are the substrate a future CoW would swap roots on.
 
 ## Bounded page cache
 
 The file backend routes its page I/O through a single bounded LRU page cache (`storage::buffer::PageCache`), modeled on SQLite's pcache. Its capacity is `OpenOptions::max_memory_bytes / PAGE_SIZE` (default 4 MiB ≈ 1024 pages).
 
-> **Scope.** All on-disk data flows through `read_page`/`write_page`: property (blob) pages and topology (node/edge record) pages alike. `TopologyStore` holds only O(1) metadata (segment start + logical page counts) and faults record pages via `DatabaseFile`, and there is no in-memory property index — lookups (`find` / `find_by_type`) scan the topology through the same bounded cache. As a result the whole engine's resident memory is bounded by the cache budget regardless of database size.
+> **Scope.** All on-disk data flows through `read_page`/`write_page`: node/edge record pages,
+> property (blob) pages, and the directory/index pages alike. `TopologyStore` holds only O(1)
+> metadata and faults record pages via `DatabaseFile`; the indexes are on-disk with no resident
+> per-node state. As a result the whole engine's resident memory is bounded by the cache budget
+> regardless of database size — with one caveat below.
 >
-> **Known limit.** The topology segment is a fixed range `[topology_segment_start, property_segment_start)` (pages 1–63 by default), so a database holds at most ~2000 nodes before allocation returns `CapacityExceeded`. A variable-length topology segment is future work.
+> **Node capacity.** There is no longer a fixed ~2000-node cap: node/edge/property pages grow on
+> the append tail, resolved through per-kind page directories. The ceiling is now the u32 logical
+> page space (billions of nodes), bounded in practice by disk.
+>
+> **Known limitations (not addressed on this branch).**
+> - **Insertion is O(n²) at scale.** `alloc_node_slot` / `alloc_edge_slot` and the property
+>   free-slot search scan all existing pages linearly on every insert. This is the main bottleneck
+>   against the "hundreds of millions of nodes" goal; a free-list or a "first page with space" hint
+>   would make it O(1). Small datasets do not show it.
+> - **Space is not reclaimed in place.** `update` / `delete` / label changes do not free the old
+>   property slot, blob chain, or schema chain — space is reclaimed only by a full rebuild (vacuum).
+> - **`live_node_rids` materializes every RecordId into a `Vec`**, which is O(nodes) memory at call
+>   time (not bounded by the cache budget). Full scans that use it are the exception to the
+>   resident-memory bound above.
 
 - **Read path**: cache → WAL file → main `.chiffon` file. The first hit is returned and then inserted into the cache (evicting the LRU page if full).
 - **Write path**: every write is appended to the WAL file immediately (write-through) and the page is cached. Because the durable copy already lives in the WAL, a cached page can be evicted at any time without data loss; the WAL keeps only a small `page_id → byte-offset` index in memory rather than the page bytes.
