@@ -304,7 +304,10 @@ fn load_schema_dto(db: &mut DatabaseFile) -> Result<SchemaDto, GraphError> {
         return Err(GraphError::SchemaError("no schema stored".to_string()));
     }
 
-    // Read the entire page chain
+    // Read the entire page chain. Bound the walk by the total page count so a corrupt/hostile
+    // `next` (e.g. a cycle, or `next=0` re-reading the same page) cannot loop forever or grow
+    // `pages` without limit.
+    let page_count = db.page_count()?;
     let mut pages: Vec<[u8; PAGE_SIZE]> = Vec::new();
     let mut page_id = first_page_id;
     loop {
@@ -314,8 +317,13 @@ fn load_schema_dto(db: &mut DatabaseFile) -> Result<SchemaDto, GraphError> {
         if next == 0xFFFF_FFFF {
             break;
         }
-        // next is a relative index within the chain; convert to an absolute page ID
-        page_id = first_page_id + next;
+        if pages.len() as u32 > page_count {
+            return Err(GraphError::StorageCorrupted(page_id));
+        }
+        // next is a relative index within the chain; convert to an absolute page ID.
+        page_id = first_page_id
+            .checked_add(next)
+            .ok_or(GraphError::StorageCorrupted(page_id))?;
     }
 
     let bytes = read_blob_chain(&pages)?;

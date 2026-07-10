@@ -95,10 +95,15 @@ pub fn decode_value(bytes: &[u8]) -> Result<Value, GraphError> {
             Ok(Value::Number(n))
         }
         TAG_STRING => {
+            // `len` comes from on-disk bytes; reject a length that runs past the payload rather
+            // than panicking on the slice.
             if payload.len() < 4 {
                 return Err(GraphError::StorageCorrupted(0));
             }
             let len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+            if 4 + len > payload.len() {
+                return Err(GraphError::StorageCorrupted(0));
+            }
             let s = std::str::from_utf8(&payload[4..4 + len])
                 .map_err(|_| GraphError::StorageCorrupted(0))?;
             Ok(Value::String(s.to_string()))
@@ -108,6 +113,9 @@ pub fn decode_value(bytes: &[u8]) -> Result<Value, GraphError> {
                 return Err(GraphError::StorageCorrupted(0));
             }
             let len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+            if 4 + len > payload.len() {
+                return Err(GraphError::StorageCorrupted(0));
+            }
             let v: Value = rmp_serde::from_slice(&payload[4..4 + len])
                 .map_err(|e| GraphError::SchemaError(e.to_string()))?;
             Ok(v)

@@ -300,7 +300,10 @@ fn write_next(page: &mut [u8; PAGE_SIZE], pid: u32) {
 }
 
 fn read_count(page: &[u8; PAGE_SIZE]) -> usize {
-    u32::from_le_bytes(page[4..8].try_into().unwrap_or([0; 4])) as usize
+    let raw = u32::from_le_bytes(page[4..8].try_into().unwrap_or([0; 4])) as usize;
+    // Clamp against the max entries a bucket-chain page holds, so a corrupt count can never drive
+    // `read_entry` past the page. (Directory pages don't use read_count for iteration.)
+    raw.min(ENTRIES_PER_PAGE)
 }
 
 fn write_count(page: &mut [u8; PAGE_SIZE], count: usize) {

@@ -277,7 +277,10 @@ fn write_next(page: &mut [u8; PAGE_SIZE], pid: u32) {
 }
 
 fn read_count(page: &[u8; PAGE_SIZE]) -> usize {
-    u32::from_le_bytes(page[4..8].try_into().unwrap_or([0; 4])) as usize
+    let raw = u32::from_le_bytes(page[4..8].try_into().unwrap_or([0; 4])) as usize;
+    // Clamp against the max entries/slots a page can hold so a corrupt count can never drive a
+    // read past the page (entry and root-slot are both 6 bytes → same bound).
+    raw.min(ENTRIES_PER_PAGE.max(ROOT_SLOTS_PER_PAGE))
 }
 
 fn write_count(page: &mut [u8; PAGE_SIZE], count: usize) {

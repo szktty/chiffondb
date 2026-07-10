@@ -448,16 +448,23 @@ impl DatabaseFile {
         let lock = acquire_lock(path)?;
 
         let mut file = FsOpenOptions::new().read(true).write(true).open(path)?;
-        let mut buf = [0u8; PAGE_SIZE];
-        file.read_exact(&mut buf)?;
-        let header = FileHeader::deserialize(&buf)?;
 
         let wp = wal_path(path);
         let mut wal = WalFile::open(&wp)?;
 
+        // Checkpoint the WAL into the main file *before* reading the header. The header (page 0)
+        // is updated through the WAL like any other page, so an uncheckpointed WAL may hold a
+        // newer header than the main file. Reading page 0 first would load a stale header and
+        // then the next write_header() would clobber the WAL's newer header, orphaning every
+        // change made since the last flush (ARCHITECTURE.md's crash-recovery guarantee).
         if !wal.is_empty() {
             wal.checkpoint(&mut file)?;
         }
+
+        file.seek(SeekFrom::Start(0))?;
+        let mut buf = [0u8; PAGE_SIZE];
+        file.read_exact(&mut buf)?;
+        let header = FileHeader::deserialize(&buf)?;
 
         let file_len = file.seek(SeekFrom::End(0))?;
         let logical_page_count = (file_len / PAGE_SIZE as u64) as u32;

@@ -102,6 +102,11 @@ impl SlottedPage {
                 .try_into()
                 .unwrap(),
         ) as usize;
+        // The offset/length come from on-disk bytes (a corrupt or hostile page can put anything
+        // here), so bound-check before slicing rather than panicking on out-of-range data.
+        if offset.checked_add(length).is_none_or(|end| end > PAGE_SIZE) {
+            return Err(GraphError::StorageCorrupted(0));
+        }
         Ok(&self.data[offset..offset + length])
     }
 
