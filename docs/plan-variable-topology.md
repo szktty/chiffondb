@@ -16,8 +16,8 @@ Updated by the review session at each `close`.
 | 3 | Remove vestigial segment boundaries (segment-start fields + `page_directory_root` + dead `CapacityExceeded`); VERSION 4→5; `info` → directory facts | ✅ done (`a74cc96`) |
 | 4 | Tier-1 label index (`list`/`count`/type filter → O(matches)); key = all labels; per-type page chain; VERSION 5→6 | ✅ done (`0cc7a96`) |
 | 5 | Tier-2 property index (schema DSL `@index`; **equality hash bucket**, not a B+tree — §9 cost discipline; `PropertyPath` keys; VERSION 6→7) | ✅ done (`4e48650`) |
-| 6 | Tier-3 unique constraint (`@unique`, built as the unique variant of tier 2) | ⏭️ next |
-| 7 | ARCHITECTURE.md update (VERSION now 7) + CHANGELOG + squash (§10) | todo |
+| 6 | Tier-3 unique constraint (`@unique`, built as the unique variant of tier 2; enforcement only, no new on-disk structure, VERSION stays 7) | ✅ done (`cfba8de`) |
+| 7 | ARCHITECTURE.md update (VERSION now 7) + CHANGELOG + squash (§10) | ⏭️ next — **last phase; this is the final feature phase, Phase 7 is docs-and-merge only** |
 
 > **Ordering note:** 2a precedes 2b deliberately. If topology were wired first, appending
 > topology pages to the file tail would break the still-physical property contiguity (the very
@@ -104,3 +104,23 @@ Post-implementation cleanup & squash merge: design §10 (do **not** start until 
   `node_type_id` plus every additional/dynamic label; `MATCH (n:Label)` hits under any label. This
   changes `list_nodes`/`count_nodes` semantics (today primary-only via `rids_of_type`) — that
   change is part of Phase 4.
+
+### Phase 6 (`@unique`) — review 2026-07-09a confirmations
+
+- Enforcement is **pre-write**, not rollback-based: `check_unique` runs before `insert_node`
+  writes anything and before `update_node_properties` overwrites `property_ref`. A probe confirmed
+  a rejected insert/update appends zero pages, adds zero label/property-index entries, and leaves
+  the target node's properties byte-for-byte unchanged.
+- **Self-exclusion is correctly scoped**: probed with a 3-node scenario (a@x, b@x, c@x) — updating
+  b to a's or c's value is rejected, updating b to its own current value succeeds. `exclude` never
+  leaks to a node other than the one being updated.
+- **All insert entry points funnel through `insert_node`**: `insert_node_with_label_names` →
+  `insert_node_with_labels` → `insert_node`; `insert_node_with_dynamic_labels` → same. No bypass.
+- Reuses tier-2's `find_all_nodes` (candidate + confirm) for the uniqueness check, so hash
+  collisions never affect correctness.
+- Reviewer-added test `unique_absent_value_is_unconstrained_via_high_level_api`: the existing
+  implementer test used the low-level `insert_node` to reach an absent-`@unique`-value state,
+  flagged as a possible fairness concern in the review request. A probe showed the **high-level**
+  `insert_node_by_name` (schema-validated) also allows omitting a declared field, so the same
+  partial-index state is reachable through the realistic API — the low-level test was not testing
+  an unfair/unreachable case. Both tests now exist.
