@@ -16,12 +16,24 @@ Dart bindings and the GUI browser live in separate repositories — this repo is
 
 ## Status
 
-The whole engine's resident memory is bounded by the page-cache budget (all on-disk pages go
-through a fixed-size LRU cache; there is no in-memory index that grows with the data). Known
-limit: the topology segment is fixed-size, so a database holds at most ~2000 nodes (a
-variable-length segment is future work).
+The whole engine's resident memory is bounded by the page-cache budget (all on-disk pages,
+including the indexes, go through a fixed-size LRU cache; no in-memory index grows with the data —
+except `live_node_rids`, which materializes RecordIds during a full scan). Node/edge/property
+pages grow on the file's append tail via per-kind page directories, so the old ~2000-node cap is
+gone (ceiling is now the u32 logical page space). On-disk `VERSION` is 8. See `ARCHITECTURE.md` for
+the format, the label/property/unique indexes, and the known limitations (insertion is O(n²) at
+scale; crash atomicity is not guaranteed per API call).
 
 ## Development rules
+
+### Branching (git flow)
+- **`develop` is the integration branch.** Cut feature branches from `develop` and merge them
+  back into `develop` (squash). Day-to-day work targets `develop`, never `main`.
+- **`main` is the released, stable line.** It is updated *only at release time* by merging
+  `develop` → `main` (and tagging). Do **not** merge feature branches into `main` directly.
+- So: `feature/* → develop` (squash) for normal work; `develop → main` only on release.
+- Merges are gated on explicit user instruction (see `CLAUDE.md` note on confirming
+  hard-to-reverse actions); don't merge without being asked.
 
 ### Tests
 - **Always write tests; choose *when* by the nature of the code** (TDD is a tool, not a rule):
@@ -34,12 +46,11 @@ variable-length segment is future work).
 - proptest cases: `50` during development, `1000` in CI (`PROPTEST_CASES` env var).
 
 ### Review & progress workflow
-- When an implementation reaches a stopping point, create and commit
-  `docs/review-request-YYYY-MM-DDx.md`.
-- When responding to a review request, follow [docs/review-process.md](docs/review-process.md)
-  (separate the verifier from the fixer; back claims with the real code and throwaway probes;
-  do not edit core logic — send it back to the implementation session). No need to read it
-  when there is no review request.
+- Driven by triad (local tool, `~/work/dev/products/ai/triad`): each session registers as
+  worker or reviewer and follows its instructions — see `.claude/skills/triad/SKILL.md`.
+- The actual review/implement steps (verify/result/fix/request/close) are defined in
+  `.claude/skills/triad-plan/SKILL.md`. Read it only when running one of those steps.
+- Record in-progress work from AI sessions in `../chiffondb-private/docs/working.md`.
 
 ### Code style
 - `unwrap()` / `expect()` are banned. Propagate errors with the `?` operator.

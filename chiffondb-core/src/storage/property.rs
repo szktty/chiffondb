@@ -102,6 +102,11 @@ impl SlottedPage {
                 .try_into()
                 .unwrap(),
         ) as usize;
+        // The offset/length come from on-disk bytes (a corrupt or hostile page can put anything
+        // here), so bound-check before slicing rather than panicking on out-of-range data.
+        if offset.checked_add(length).is_none_or(|end| end > PAGE_SIZE) {
+            return Err(GraphError::StorageCorrupted(0));
+        }
         Ok(&self.data[offset..offset + length])
     }
 
@@ -171,6 +176,8 @@ pub fn write_blob_chain(pages: &mut [[u8; PAGE_SIZE]], data: &[u8]) -> Result<()
 pub fn read_blob_chain(pages: &[[u8; PAGE_SIZE]]) -> Result<Vec<u8>, GraphError> {
     let mut result = Vec::new();
     let mut page_idx = 0usize;
+    // Bound the walk by the page count so a corrupt `next` (cycle / repeat) cannot loop forever.
+    let mut steps = 0usize;
     loop {
         let page = pages
             .get(page_idx)
@@ -183,6 +190,10 @@ pub fn read_blob_chain(pages: &[[u8; PAGE_SIZE]]) -> Result<Vec<u8>, GraphError>
         result.extend_from_slice(&page[CHAIN_HEADER_SIZE..CHAIN_HEADER_SIZE + chunk_len]);
         if next == NO_NEXT_PAGE {
             break;
+        }
+        steps += 1;
+        if steps > pages.len() {
+            return Err(GraphError::StorageCorrupted(page_idx as u32));
         }
         page_idx = next as usize;
     }

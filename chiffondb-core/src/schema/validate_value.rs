@@ -101,19 +101,16 @@ mod tests {
     use serde_json::json;
 
     fn fields() -> Vec<FieldDef> {
+        let field = |name: &str, type_expr: TypeExpr| FieldDef {
+            name: name.to_string(),
+            type_expr,
+            indexed: false,
+            unique: false,
+        };
         vec![
-            FieldDef {
-                name: "id".to_string(),
-                type_expr: TypeExpr::String,
-            },
-            FieldDef {
-                name: "age".to_string(),
-                type_expr: TypeExpr::Int,
-            },
-            FieldDef {
-                name: "active".to_string(),
-                type_expr: TypeExpr::Boolean,
-            },
+            field("id", TypeExpr::String),
+            field("age", TypeExpr::Int),
+            field("active", TypeExpr::Boolean),
         ]
     }
 

@@ -72,7 +72,20 @@ fn unparse_fields(fields: &[FieldDef], indent: usize) -> String {
     let pad = "  ".repeat(indent);
     fields
         .iter()
-        .map(|f| format!("{pad}{}: {}\n", f.name, unparse_type_expr(&f.type_expr)))
+        .map(|f| {
+            let mut anns = String::new();
+            if f.indexed {
+                anns.push_str(" @index");
+            }
+            if f.unique {
+                anns.push_str(" @unique");
+            }
+            format!(
+                "{pad}{}: {}{anns}\n",
+                f.name,
+                unparse_type_expr(&f.type_expr)
+            )
+        })
         .collect()
 }
 

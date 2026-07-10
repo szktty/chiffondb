@@ -65,6 +65,10 @@ struct BoundParamDto {
 struct FieldDefDto {
     name: String,
     type_expr: TypeExprDto,
+    #[serde(default)]
+    indexed: bool,
+    #[serde(default)]
+    unique: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -126,6 +130,8 @@ fn field_to_dto(f: &FieldDef) -> FieldDefDto {
     FieldDefDto {
         name: f.name.clone(),
         type_expr: type_to_dto(&f.type_expr),
+        indexed: f.indexed,
+        unique: f.unique,
     }
 }
 
@@ -182,6 +188,8 @@ fn dto_to_field(f: FieldDefDto) -> FieldDef {
     FieldDef {
         name: f.name,
         type_expr: dto_to_type(f.type_expr),
+        indexed: f.indexed,
+        unique: f.unique,
     }
 }
 
@@ -278,7 +286,11 @@ pub fn register_dynamic_type(
     }
 
     let id = (*next_id).max(1);
-    *next_id = id + 1;
+    // u16 id space: fail rather than wrap (wrapping to 0 → max(1) would re-issue id 1 and
+    // confuse it with an existing type).
+    *next_id = id
+        .checked_add(1)
+        .ok_or_else(|| GraphError::SchemaError("type id space exhausted (u16)".to_string()))?;
     assignments.push((name.to_string(), id));
     write_schema_dto(db, &dto)?;
     Ok((id, true))
@@ -296,7 +308,10 @@ fn load_schema_dto(db: &mut DatabaseFile) -> Result<SchemaDto, GraphError> {
         return Err(GraphError::SchemaError("no schema stored".to_string()));
     }
 
-    // Read the entire page chain
+    // Read the entire page chain. Bound the walk by the total page count so a corrupt/hostile
+    // `next` (e.g. a cycle, or `next=0` re-reading the same page) cannot loop forever or grow
+    // `pages` without limit.
+    let page_count = db.page_count()?;
     let mut pages: Vec<[u8; PAGE_SIZE]> = Vec::new();
     let mut page_id = first_page_id;
     loop {
@@ -306,8 +321,13 @@ fn load_schema_dto(db: &mut DatabaseFile) -> Result<SchemaDto, GraphError> {
         if next == 0xFFFF_FFFF {
             break;
         }
-        // next is a relative index within the chain; convert to an absolute page ID
-        page_id = first_page_id + next;
+        if pages.len() as u32 > page_count {
+            return Err(GraphError::StorageCorrupted(page_id));
+        }
+        // next is a relative index within the chain; convert to an absolute page ID.
+        page_id = first_page_id
+            .checked_add(next)
+            .ok_or(GraphError::StorageCorrupted(page_id))?;
     }
 
     let bytes = read_blob_chain(&pages)?;

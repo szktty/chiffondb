@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use crate::error::GraphError;
 use crate::storage::buffer::PageCache;
 use crate::storage::page::PAGE_SIZE;
+use crate::storage::page_directory::PageDirectory;
 use crate::storage::wal::{wal_path, WalFile};
 
 /// Default in-memory page-cache budget for file-backed databases.
@@ -47,7 +48,9 @@ static OPEN_FILES: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
 fn register_path(path: &Path) -> Result<(), GraphError> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut guard = OPEN_FILES.lock().unwrap();
+    // Recover from a poisoned mutex rather than panicking (project rule: no unwrap): the guarded
+    // HashSet stays consistent regardless of the panic that poisoned it.
+    let mut guard = OPEN_FILES.lock().unwrap_or_else(|e| e.into_inner());
     let set = guard.get_or_insert_with(HashSet::new);
     if !set.insert(canonical) {
         return Err(GraphError::Io(std::io::Error::new(
@@ -74,30 +77,57 @@ pub const MAGIC: &[u8; 8] = b"CHIFFON\0";
 /// On-disk format version. v2 added topology page counts at header offsets 40..48
 /// (file-backed topology, Phase 2). v3 accompanies the product rename to ChiffonDB,
 /// which also changed the magic from `TANABATA` to `CHIFFON\0`; old files are rejected.
-/// A mismatch is rejected by `FileHeader::deserialize` to avoid silently misreading
-/// an older layout.
-pub const VERSION: u32 = 3;
-pub const TOPOLOGY_SEGMENT_DEFAULT_START: u32 = 1;
-pub const PROPERTY_SEGMENT_DEFAULT_START: u32 = 64;
-pub const VECTOR_SEGMENT_DEFAULT_START: u32 = 0;
+/// v4 (variable-topology) adds the property page-directory root/len at offsets 48..56 and
+/// makes property RIDs logical page numbers. v5 removes the now-vestigial segment-start fields
+/// and the unused `page_directory_root` at offsets 16..32 (everything resolves through the
+/// node/edge/property page directories), leaving 16..32 reserved. v6 adds the tier-1 label index
+/// root at offset 16..20 (within that reserved range). v7 adds the tier-2 property index root at
+/// offset 20..24. v8 changes the tier-2 index hash from `DefaultHasher` (not stable across Rust
+/// releases) to a fixed FNV-1a, invalidating persisted index entries — old v7 files are rejected.
+/// A mismatch is rejected by `FileHeader::deserialize` to avoid silently misreading an older
+/// layout.
+pub const VERSION: u32 = 8;
 
 /// Contents of the header page (Page 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub version: u32,
-    pub topology_segment_start: u32,
-    pub property_segment_start: u32,
-    pub vector_segment_start: u32,
-    pub page_directory_root: u32,
+    /// Root page of the tier-1 label index (`0xFFFF_FFFF` = none yet). At offset 16..20, within
+    /// the range freed in v5.
+    pub label_index_root: u32,
+    /// Root of the tier-2 property index bucket directory (`0xFFFF_FFFF` = none yet), offset
+    /// 20..24. The rest of 16..32 (24..32) stays reserved.
+    pub property_index_root: u32,
     pub schema_root: u32,
     /// Version number incremented on every schema change.
     pub schema_version: u32,
-    /// Number of logical node pages in use within the topology segment.
-    /// Persisted so reopen restores the actual used count rather than inferring
-    /// the segment-wide maximum from the pre-allocated layout.
+    /// Number of logical node pages in use. Doubles as the node page directory's mapped length
+    /// (the directory's dense logical space is `0..node_page_count`).
     pub node_page_count: u32,
-    /// Number of logical edge pages in use within the topology segment.
+    /// Number of logical edge pages in use (= the edge page directory's mapped length).
     pub edge_page_count: u32,
+    /// Root physical page of the property page directory (`0xFFFF_FFFF` = none yet).
+    /// Property RIDs are logical page numbers resolved through this directory, so property
+    /// pages no longer need a fixed contiguous range (design §3.4, variable-topology).
+    pub property_dir_root: u32,
+    /// Number of mapped logical property pages.
+    pub property_dir_len: u32,
+    /// Root physical page of the node page directory (`0xFFFF_FFFF` = none yet). Node logical
+    /// pages resolve through this directory instead of a fixed interleaved segment, lifting the
+    /// old ~2000-node cap (design §3.2, variable-topology). Mapped length = `node_page_count`.
+    pub node_dir_root: u32,
+    /// Root physical page of the edge page directory. Mapped length = `edge_page_count`.
+    pub edge_dir_root: u32,
+}
+
+/// Header sentinel for "no page-directory root yet" (matches `PageDirectory::root`'s UNMAPPED).
+pub const NO_DIR_ROOT: u32 = 0xFFFF_FFFF;
+
+/// Selects which topology page directory (node or edge) a page-directory operation targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopologyKind {
+    Node,
+    Edge,
 }
 
 impl Default for FileHeader {
@@ -110,14 +140,17 @@ impl FileHeader {
     pub fn new() -> Self {
         Self {
             version: VERSION,
-            topology_segment_start: TOPOLOGY_SEGMENT_DEFAULT_START,
-            property_segment_start: PROPERTY_SEGMENT_DEFAULT_START,
-            vector_segment_start: VECTOR_SEGMENT_DEFAULT_START,
-            page_directory_root: 0,
+            label_index_root: NO_DIR_ROOT,
+            property_index_root: NO_DIR_ROOT,
             schema_root: 0,
             schema_version: 0,
-            node_page_count: 1,
-            edge_page_count: 1,
+            // Topology directories start empty; the first node/edge alloc maps logical page 0.
+            node_page_count: 0,
+            edge_page_count: 0,
+            property_dir_root: NO_DIR_ROOT,
+            property_dir_len: 0,
+            node_dir_root: NO_DIR_ROOT,
+            edge_dir_root: NO_DIR_ROOT,
         }
     }
 
@@ -126,14 +159,17 @@ impl FileHeader {
         buf[0..8].copy_from_slice(MAGIC);
         buf[8..12].copy_from_slice(&self.version.to_le_bytes());
         buf[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-        buf[16..20].copy_from_slice(&self.topology_segment_start.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.property_segment_start.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.vector_segment_start.to_le_bytes());
-        buf[28..32].copy_from_slice(&self.page_directory_root.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.label_index_root.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.property_index_root.to_le_bytes());
+        // Offsets 24..32 are reserved (left zeroed).
         buf[32..36].copy_from_slice(&self.schema_root.to_le_bytes());
         buf[36..40].copy_from_slice(&self.schema_version.to_le_bytes());
         buf[40..44].copy_from_slice(&self.node_page_count.to_le_bytes());
         buf[44..48].copy_from_slice(&self.edge_page_count.to_le_bytes());
+        buf[48..52].copy_from_slice(&self.property_dir_root.to_le_bytes());
+        buf[52..56].copy_from_slice(&self.property_dir_len.to_le_bytes());
+        buf[56..60].copy_from_slice(&self.node_dir_root.to_le_bytes());
+        buf[60..64].copy_from_slice(&self.edge_dir_root.to_le_bytes());
         buf
     }
 
@@ -151,26 +187,31 @@ impl FileHeader {
                 supported: VERSION,
             });
         }
-        let topology_segment_start = u32::from_le_bytes(buf[16..20].try_into().unwrap());
-        let property_segment_start = u32::from_le_bytes(buf[20..24].try_into().unwrap());
-        let vector_segment_start = u32::from_le_bytes(buf[24..28].try_into().unwrap());
-        let page_directory_root = u32::from_le_bytes(buf[28..32].try_into().unwrap());
+        let label_index_root = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+        let property_index_root = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+        // Offsets 24..32 are reserved (ignored on read).
         let schema_root = u32::from_le_bytes(buf[32..36].try_into().unwrap());
         let schema_version = u32::from_le_bytes(buf[36..40].try_into().unwrap());
-        // node/edge page counts. `.max(1)` defends against a zeroed value (the topology
-        // segment always has at least one logical node and edge page).
-        let node_page_count = u32::from_le_bytes(buf[40..44].try_into().unwrap()).max(1);
-        let edge_page_count = u32::from_le_bytes(buf[44..48].try_into().unwrap()).max(1);
+        // node/edge page counts double as the topology directories' mapped lengths; 0 is valid
+        // (a fresh database has empty directories until the first node/edge is allocated).
+        let node_page_count = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+        let edge_page_count = u32::from_le_bytes(buf[44..48].try_into().unwrap());
+        let property_dir_root = u32::from_le_bytes(buf[48..52].try_into().unwrap());
+        let property_dir_len = u32::from_le_bytes(buf[52..56].try_into().unwrap());
+        let node_dir_root = u32::from_le_bytes(buf[56..60].try_into().unwrap());
+        let edge_dir_root = u32::from_le_bytes(buf[60..64].try_into().unwrap());
         Ok(Self {
             version,
-            topology_segment_start,
-            property_segment_start,
-            vector_segment_start,
-            page_directory_root,
+            label_index_root,
+            property_index_root,
             schema_root,
             schema_version,
             node_page_count,
             edge_page_count,
+            property_dir_root,
+            property_dir_len,
+            node_dir_root,
+            edge_dir_root,
         })
     }
 }
@@ -411,16 +452,23 @@ impl DatabaseFile {
         let lock = acquire_lock(path)?;
 
         let mut file = FsOpenOptions::new().read(true).write(true).open(path)?;
-        let mut buf = [0u8; PAGE_SIZE];
-        file.read_exact(&mut buf)?;
-        let header = FileHeader::deserialize(&buf)?;
 
         let wp = wal_path(path);
         let mut wal = WalFile::open(&wp)?;
 
+        // Checkpoint the WAL into the main file *before* reading the header. The header (page 0)
+        // is updated through the WAL like any other page, so an uncheckpointed WAL may hold a
+        // newer header than the main file. Reading page 0 first would load a stale header and
+        // then the next write_header() would clobber the WAL's newer header, orphaning every
+        // change made since the last flush (ARCHITECTURE.md's crash-recovery guarantee).
         if !wal.is_empty() {
             wal.checkpoint(&mut file)?;
         }
+
+        file.seek(SeekFrom::Start(0))?;
+        let mut buf = [0u8; PAGE_SIZE];
+        file.read_exact(&mut buf)?;
+        let header = FileHeader::deserialize(&buf)?;
 
         let file_len = file.seek(SeekFrom::End(0))?;
         let logical_page_count = (file_len / PAGE_SIZE as u64) as u32;
@@ -485,6 +533,155 @@ impl DatabaseFile {
     pub fn write_header(&mut self) -> Result<(), GraphError> {
         let buf = self.header.serialize();
         self.write_page(0, &buf)
+    }
+
+    // ---- Property page directory ----
+    //
+    // Property pages are addressed by logical page number, resolved to a physical page
+    // through a `PageDirectory` whose root/len live in the header. This keeps property RIDs
+    // stable while their physical pages may be interleaved with topology pages on the append
+    // tail (design §3.4: property RID logicalization).
+
+    /// Builds a `PageDirectory` view over the property directory from the header metadata.
+    fn property_dir(&self) -> PageDirectory {
+        if self.header.property_dir_root == NO_DIR_ROOT {
+            PageDirectory::new()
+        } else {
+            PageDirectory::with_root(
+                self.header.property_dir_root,
+                self.header.property_dir_len as usize,
+            )
+        }
+    }
+
+    /// Persists the property directory metadata back into the header (through the WAL, so a
+    /// crash without flush still recovers a consistent mapping).
+    fn store_property_dir(&mut self, dir: &PageDirectory) -> Result<(), GraphError> {
+        self.header.property_dir_root = dir.root();
+        self.header.property_dir_len = dir.len() as u32;
+        self.write_header()
+    }
+
+    /// Number of mapped logical property pages.
+    pub fn property_page_count(&self) -> usize {
+        self.header.property_dir_len as usize
+    }
+
+    /// Resolves a logical property page number to its physical page id.
+    pub fn resolve_property_page(&mut self, logical: usize) -> Result<u32, GraphError> {
+        let dir = self.property_dir();
+        dir.resolve(self, logical)?
+            .ok_or(GraphError::StorageCorrupted(logical as u32))
+    }
+
+    /// Allocates a fresh physical property page initialized with `data`, maps it into the
+    /// property directory, and returns the assigned logical page number.
+    pub fn alloc_property_page(&mut self, data: &[u8; PAGE_SIZE]) -> Result<usize, GraphError> {
+        let physical = self.append_page(data)?;
+        let mut dir = self.property_dir();
+        let logical = dir.push(self, physical)?;
+        self.store_property_dir(&dir)?;
+        Ok(logical)
+    }
+
+    /// Overwrites the physical page backing logical property page `logical`.
+    pub fn write_property_page(
+        &mut self,
+        logical: usize,
+        data: &[u8; PAGE_SIZE],
+    ) -> Result<(), GraphError> {
+        let physical = self.resolve_property_page(logical)?;
+        self.write_page(physical, data)
+    }
+
+    /// Reads the physical page backing logical property page `logical`.
+    pub fn read_property_page(&mut self, logical: usize) -> Result<[u8; PAGE_SIZE], GraphError> {
+        let physical = self.resolve_property_page(logical)?;
+        self.read_page(physical)
+    }
+
+    // ---- Topology page directories (node / edge) ----
+    //
+    // Node and edge logical pages resolve to physical pages through their own `PageDirectory`,
+    // so topology pages need no fixed interleaved segment and can grow on the append tail next
+    // to property pages. This is what lifts the old ~2000-node cap (design §3.2). The directory
+    // root lives in the header; its mapped length reuses the existing `node_page_count` /
+    // `edge_page_count` fields (single source of truth, no double-counting).
+
+    fn topology_dir(&self, kind: TopologyKind) -> PageDirectory {
+        let (root, len) = match kind {
+            TopologyKind::Node => (self.header.node_dir_root, self.header.node_page_count),
+            TopologyKind::Edge => (self.header.edge_dir_root, self.header.edge_page_count),
+        };
+        if root == NO_DIR_ROOT {
+            PageDirectory::new()
+        } else {
+            PageDirectory::with_root(root, len as usize)
+        }
+    }
+
+    fn store_topology_dir(
+        &mut self,
+        kind: TopologyKind,
+        dir: &PageDirectory,
+    ) -> Result<(), GraphError> {
+        match kind {
+            TopologyKind::Node => {
+                self.header.node_dir_root = dir.root();
+                self.header.node_page_count = dir.len() as u32;
+            }
+            TopologyKind::Edge => {
+                self.header.edge_dir_root = dir.root();
+                self.header.edge_page_count = dir.len() as u32;
+            }
+        }
+        self.write_header()
+    }
+
+    /// Resolves a logical topology page number to its physical page id.
+    pub fn resolve_topology_page(
+        &mut self,
+        kind: TopologyKind,
+        logical: usize,
+    ) -> Result<u32, GraphError> {
+        let dir = self.topology_dir(kind);
+        dir.resolve(self, logical)?
+            .ok_or(GraphError::StorageCorrupted(logical as u32))
+    }
+
+    /// Allocates a fresh physical topology page initialized with `data`, maps it into the
+    /// node/edge directory, and returns the assigned logical page number.
+    pub fn alloc_topology_page(
+        &mut self,
+        kind: TopologyKind,
+        data: &[u8; PAGE_SIZE],
+    ) -> Result<usize, GraphError> {
+        let physical = self.append_page(data)?;
+        let mut dir = self.topology_dir(kind);
+        let logical = dir.push(self, physical)?;
+        self.store_topology_dir(kind, &dir)?;
+        Ok(logical)
+    }
+
+    /// Overwrites the physical page backing logical topology page `logical`.
+    pub fn write_topology_page(
+        &mut self,
+        kind: TopologyKind,
+        logical: usize,
+        data: &[u8; PAGE_SIZE],
+    ) -> Result<(), GraphError> {
+        let physical = self.resolve_topology_page(kind, logical)?;
+        self.write_page(physical, data)
+    }
+
+    /// Reads the physical page backing logical topology page `logical`.
+    pub fn read_topology_page(
+        &mut self,
+        kind: TopologyKind,
+        logical: usize,
+    ) -> Result<[u8; PAGE_SIZE], GraphError> {
+        let physical = self.resolve_topology_page(kind, logical)?;
+        self.read_page(physical)
     }
 
     /// Returns the WAL file path (file backend only; intended for tests).
@@ -642,14 +839,13 @@ mod tests {
 
         let db = DatabaseFile::open(&path).unwrap();
         assert_eq!(db.header.version, VERSION);
-        assert_eq!(
-            db.header.topology_segment_start,
-            TOPOLOGY_SEGMENT_DEFAULT_START
-        );
-        assert_eq!(
-            db.header.property_segment_start,
-            PROPERTY_SEGMENT_DEFAULT_START
-        );
+        // A fresh database has empty page directories (no roots, zero logical pages).
+        assert_eq!(db.header.node_dir_root, NO_DIR_ROOT);
+        assert_eq!(db.header.edge_dir_root, NO_DIR_ROOT);
+        assert_eq!(db.header.property_dir_root, NO_DIR_ROOT);
+        assert_eq!(db.header.node_page_count, 0);
+        assert_eq!(db.header.edge_page_count, 0);
+        assert_eq!(db.header.property_dir_len, 0);
     }
 
     #[test]
@@ -719,8 +915,10 @@ mod tests {
             let mut buf = [0u8; PAGE_SIZE];
             buf[0..8].copy_from_slice(MAGIC);
             buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // legacy v1
-            buf[16..20].copy_from_slice(&TOPOLOGY_SEGMENT_DEFAULT_START.to_le_bytes());
-            buf[20..24].copy_from_slice(&PROPERTY_SEGMENT_DEFAULT_START.to_le_bytes());
+                                                             // Plausible-looking legacy segment-start bytes at the old offsets 16..24; only the
+                                                             // version guard should stand between this file and a misread.
+            buf[16..20].copy_from_slice(&1u32.to_le_bytes());
+            buf[20..24].copy_from_slice(&64u32.to_le_bytes());
             f.write_all(&buf).unwrap();
         }
 
@@ -732,6 +930,142 @@ mod tests {
             Err(e) => panic!("expected UnsupportedVersion for v1, got error {e:?}"),
             Ok(_) => panic!("v1 file was not rejected — silent misread risk"),
         }
+    }
+
+    #[test]
+    fn open_rejects_previous_version_v6() {
+        // v7 added the property-index root at 20..24; a v6 file would be misread under the v7
+        // layout, so the version guard must reject it (no backward compat, design §0).
+        let dir = TempDir::new().unwrap();
+        let path = make_db_path(&dir);
+        {
+            let mut f = FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let mut buf = [0u8; PAGE_SIZE];
+            buf[0..8].copy_from_slice(MAGIC);
+            buf[8..12].copy_from_slice(&6u32.to_le_bytes()); // previous version v6
+            f.write_all(&buf).unwrap();
+        }
+        match DatabaseFile::open(&path) {
+            Err(GraphError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 6);
+                assert_eq!(supported, VERSION);
+            }
+            Err(e) => panic!("expected UnsupportedVersion for v6, got {e:?}"),
+            Ok(_) => panic!("v6 file was not rejected — silent misread risk"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_previous_version_v7() {
+        // v8 changed the tier-2 index hash (DefaultHasher → FNV-1a), invalidating a v7 file's
+        // persisted index; the version guard must reject it (no backward compat, design §0).
+        let dir = TempDir::new().unwrap();
+        let path = make_db_path(&dir);
+        {
+            let mut f = FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let mut buf = [0u8; PAGE_SIZE];
+            buf[0..8].copy_from_slice(MAGIC);
+            buf[8..12].copy_from_slice(&7u32.to_le_bytes()); // previous version v7
+            f.write_all(&buf).unwrap();
+        }
+        match DatabaseFile::open(&path) {
+            Err(GraphError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 7);
+                assert_eq!(supported, VERSION);
+            }
+            Err(e) => panic!("expected UnsupportedVersion for v7, got {e:?}"),
+            Ok(_) => panic!("v7 file was not rejected — silent misread risk"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_previous_version_v5() {
+        // v6 added the label-index root at 16..20; a v5 file has garbage/zero there under the v6
+        // layout, so the version guard must reject it (no backward compat, design §0).
+        let dir = TempDir::new().unwrap();
+        let path = make_db_path(&dir);
+        {
+            let mut f = FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let mut buf = [0u8; PAGE_SIZE];
+            buf[0..8].copy_from_slice(MAGIC);
+            buf[8..12].copy_from_slice(&5u32.to_le_bytes()); // previous version v5
+            f.write_all(&buf).unwrap();
+        }
+        match DatabaseFile::open(&path) {
+            Err(GraphError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 5);
+                assert_eq!(supported, VERSION);
+            }
+            Err(e) => panic!("expected UnsupportedVersion for v5, got {e:?}"),
+            Ok(_) => panic!("v5 file was not rejected — silent misread risk"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_previous_version_v4() {
+        // v5 removed the segment-start fields at offsets 16..32; a v4 file would be misread under
+        // the v5 layout, so the version guard must reject it (no backward compat, design §0).
+        let dir = TempDir::new().unwrap();
+        let path = make_db_path(&dir);
+        {
+            let mut f = FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let mut buf = [0u8; PAGE_SIZE];
+            buf[0..8].copy_from_slice(MAGIC);
+            buf[8..12].copy_from_slice(&4u32.to_le_bytes()); // previous version v4
+            f.write_all(&buf).unwrap();
+        }
+        match DatabaseFile::open(&path) {
+            Err(GraphError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 4);
+                assert_eq!(supported, VERSION);
+            }
+            Err(e) => panic!("expected UnsupportedVersion for v4, got {e:?}"),
+            Ok(_) => panic!("v4 file was not rejected — silent misread risk"),
+        }
+    }
+
+    /// The v7 layout uses 16..20 for the label-index root and 20..24 for the property-index root,
+    /// reserving 24..32. `serialize` must leave 24..32 zeroed, and `deserialize` must ignore
+    /// whatever sits there so stray bytes can never leak into a real field.
+    #[test]
+    fn header_reserved_range_is_zeroed_and_ignored_on_read() {
+        let header = FileHeader::new();
+        let buf = header.serialize();
+        assert!(
+            buf[24..32].iter().all(|&b| b == 0),
+            "serialize must leave the reserved 24..32 range zeroed"
+        );
+
+        // Inject garbage into the reserved range; the round-tripped header must be unchanged.
+        let mut tampered = header.serialize();
+        for b in &mut tampered[24..32] {
+            *b = 0xAB;
+        }
+        let restored = FileHeader::deserialize(&tampered).unwrap();
+        assert_eq!(
+            header, restored,
+            "deserialize must ignore the reserved range, not leak it into a field"
+        );
     }
 
     #[test]

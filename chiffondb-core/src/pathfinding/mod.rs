@@ -225,7 +225,6 @@ impl<'a> PathfindingEngine<'a> {
 mod tests {
     use super::*;
     use crate::storage::file::DatabaseFile;
-    use crate::storage::page::PAGE_SIZE;
     use crate::storage::topology::TopologyStore;
     use proptest::prelude::*;
 
@@ -234,12 +233,9 @@ mod tests {
     }
 
     fn make_store() -> (TopologyStore, DatabaseFile) {
-        let mut file = DatabaseFile::create_in_memory().unwrap();
-        let empty = [0u8; PAGE_SIZE];
-        for _ in 1..64 {
-            file.append_page(&empty).unwrap();
-        }
-        (TopologyStore::new(1, 64), file)
+        // Topology pages map on demand through directories; no pre-allocation needed.
+        let file = DatabaseFile::create_in_memory().unwrap();
+        (TopologyStore::new(), file)
     }
 
     /// Builds a linear graph of N nodes (0→1→...→N-1) and returns the node RecordId list.
