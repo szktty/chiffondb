@@ -139,6 +139,9 @@ impl Database {
         type_id: u16,
         properties: HashMap<String, Value>,
     ) -> Result<NodeRid, GraphError> {
+        // Enforce @unique before writing anything, so a rejected insert leaves the DB unchanged.
+        self.check_unique(type_id, &properties, None)?;
+
         let prop_ref = if properties.is_empty() {
             None
         } else {
@@ -214,6 +217,9 @@ impl Database {
         // stale value entries and add the new ones.
         let type_id = node.node_type_id;
         let old_props = self.get_node_properties_raw(rid)?;
+
+        // Enforce @unique before writing, excluding this node (updating to its own value is fine).
+        self.check_unique(type_id, &properties, Some(rid))?;
 
         let new_pref = if properties.is_empty() {
             None
@@ -436,10 +442,11 @@ impl Database {
         Ok(SchemaRegistry::from_assignments(&nodes, &edges))
     }
 
-    /// Returns the `@index`-annotated field names of the node type `type_id`, as `PropertyPath`s
-    /// (flat, one per indexed field). Empty when there is no schema or no indexed field — the
-    /// tier-2 index is declared, so unannotated types simply have nothing to maintain.
-    fn indexed_paths_for_type(&mut self, type_id: u16) -> Vec<PropertyPath> {
+    /// Returns the indexed paths of node type `type_id` as `(PropertyPath, unique)` pairs. A field
+    /// is index-maintained if it is `@index` **or** `@unique` (a unique field is also indexed, so
+    /// its value is queryable); `unique` marks the ones the constraint is enforced on. Empty when
+    /// there is no schema or no annotated field.
+    fn indexed_paths_for_type(&mut self, type_id: u16) -> Vec<(PropertyPath, bool)> {
         let ast = match load_schema(&mut self.file) {
             Ok(ast) => ast,
             Err(_) => return Vec::new(),
@@ -460,8 +467,8 @@ impl Database {
             .map(|n| {
                 n.fields
                     .iter()
-                    .filter(|f| f.indexed)
-                    .map(|f| PropertyPath::Flat(f.name.clone()))
+                    .filter(|f| f.indexed || f.unique)
+                    .map(|f| (PropertyPath::Flat(f.name.clone()), f.unique))
                     .collect()
             })
             .unwrap_or_default()
@@ -482,7 +489,7 @@ impl Database {
             return Ok(());
         }
         let mut index = PropertyIndex::new(&mut self.file);
-        for path in paths {
+        for (path, _unique) in paths {
             let value = match path.resolve(props) {
                 Some(v) if is_indexable_value(v) => v,
                 _ => continue, // missing or non-scalar → excluded (partial index)
@@ -497,11 +504,44 @@ impl Database {
         Ok(())
     }
 
+    /// Enforces `@unique` constraints for `type_id` against `props` **before** the value is
+    /// persisted. For each unique `(type, path)` whose value is a scalar, if a *different* live
+    /// node already holds that value, returns `UniqueViolation`. `exclude` is the node being
+    /// updated (its own current entry must not count as a conflict); `None` for a fresh insert.
+    /// Missing / non-scalar values are unconstrained (partial semantics, like the index).
+    fn check_unique(
+        &mut self,
+        type_id: u16,
+        props: &HashMap<String, Value>,
+        exclude: Option<RecordId>,
+    ) -> Result<(), GraphError> {
+        let unique_paths: Vec<PropertyPath> = self
+            .indexed_paths_for_type(type_id)
+            .into_iter()
+            .filter_map(|(p, unique)| unique.then_some(p))
+            .collect();
+        for path in unique_paths {
+            let value = match path.resolve(props) {
+                Some(v) if is_indexable_value(v) => v.clone(),
+                _ => continue,
+            };
+            // The index-backed find already confirms candidates against real values.
+            let existing = self.find_all_nodes(type_id, &path, &value)?;
+            if existing.iter().any(|&rid| Some(rid) != exclude) {
+                return Err(GraphError::UniqueViolation {
+                    field: path.display_name(),
+                    value: value.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Whether type `type_id` has a tier-2 index on `path`.
     fn is_path_indexed(&mut self, type_id: u16, path: &PropertyPath) -> bool {
         self.indexed_paths_for_type(type_id)
             .iter()
-            .any(|p| p == path)
+            .any(|(p, _)| p == path)
     }
 
     /// Finds all nodes of `type_id` whose `path` equals `value`, using the tier-2 index when the
@@ -2925,6 +2965,152 @@ mod tests {
                 prop_assert_eq!(got, expected, "property index drifted for value {}", v);
             }
         }
+    }
+
+    // ---- Phase 6: tier-3 unique constraint ----
+
+    /// Builds a DB whose `User.email` is `@unique` (plus a plain `name`).
+    fn make_db_with_unique_schema() -> (Database, u16) {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { email: String @unique  name: String }")
+            .unwrap();
+        let type_id = db
+            .load_schema_registry()
+            .unwrap()
+            .node_type_id("User")
+            .unwrap();
+        (db, type_id)
+    }
+
+    fn user(email: &str) -> HashMap<String, Value> {
+        HashMap::from([
+            ("email".to_string(), json!(email)),
+            ("name".to_string(), json!("n")),
+        ])
+    }
+
+    /// A second node with a duplicate `@unique` value is rejected, and the DB is unchanged.
+    #[test]
+    fn unique_rejects_duplicate_insert() {
+        let (mut db, type_id) = make_db_with_unique_schema();
+        let first = db.insert_node_by_name("User", user("a@x")).unwrap();
+        let err = db.insert_node_by_name("User", user("a@x"));
+        assert!(matches!(err, Err(GraphError::UniqueViolation { .. })));
+        // The DB is unchanged: still exactly one User with a@x, and it is `first`.
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+        let path = PropertyPath::from("email");
+        assert_eq!(
+            db.find_node(type_id, &path, &json!("a@x")).unwrap(),
+            Some(first.0)
+        );
+    }
+
+    /// A `@unique` field is also queryable via the index (it is indexed too).
+    #[test]
+    fn unique_field_is_indexed() {
+        let (mut db, type_id) = make_db_with_unique_schema();
+        let n = db.insert_node_by_name("User", user("q@x")).unwrap();
+        let path = PropertyPath::from("email");
+        assert!(db.is_path_indexed(type_id, &path));
+        assert_eq!(
+            db.find_node(type_id, &path, &json!("q@x")).unwrap(),
+            Some(n.0)
+        );
+    }
+
+    /// Updating to a value another node has fails; to a fresh value succeeds; to the node's own
+    /// current value is a no-op success (self-exclusion).
+    #[test]
+    fn unique_update_enforces_and_self_excludes() {
+        let (mut db, _type_id) = make_db_with_unique_schema();
+        let a = db.insert_node_by_name("User", user("a@x")).unwrap();
+        let b = db.insert_node_by_name("User", user("b@x")).unwrap();
+
+        // b → a@x collides with a.
+        assert!(matches!(
+            db.update_node_properties(b, user("a@x")),
+            Err(GraphError::UniqueViolation { .. })
+        ));
+        // b → its own current value b@x is fine (self-exclusion).
+        db.update_node_properties(b, user("b@x")).unwrap();
+        // b → a fresh value is fine.
+        db.update_node_properties(b, user("c@x")).unwrap();
+        // a is untouched by all of the above.
+        assert_eq!(
+            db.get_node_properties(a).unwrap().get("email"),
+            Some(&json!("a@x"))
+        );
+    }
+
+    /// Deleting a node frees its unique value for reuse.
+    #[test]
+    fn unique_delete_frees_value() {
+        let (mut db, _type_id) = make_db_with_unique_schema();
+        let a = db.insert_node_by_name("User", user("a@x")).unwrap();
+        // Duplicate insert fails while `a` holds a@x.
+        assert!(db.insert_node_by_name("User", user("a@x")).is_err());
+        db.delete_node(a).unwrap();
+        // After delete the value is free: insert now succeeds.
+        assert!(db.insert_node_by_name("User", user("a@x")).is_ok());
+    }
+
+    /// Missing / non-scalar `@unique` values are unconstrained (partial semantics): two nodes
+    /// that both omit the unique field insert fine.
+    #[test]
+    fn unique_absent_value_is_unconstrained() {
+        let (mut db, _) = make_db();
+        // No schema validation here; use the low-level insert with the unique field absent.
+        db.apply_schema("node User { email: String @unique  name: String }")
+            .unwrap();
+        let type_id = db
+            .load_schema_registry()
+            .unwrap()
+            .node_type_id("User")
+            .unwrap();
+        // Insert two nodes of `User` with no `email` property at all (low-level, bypassing
+        // name-based validation), so the unique field resolves to None for both.
+        db.insert_node(type_id, HashMap::from([("name".to_string(), json!("x"))]))
+            .unwrap();
+        db.insert_node(type_id, HashMap::from([("name".to_string(), json!("y"))]))
+            .unwrap();
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 2);
+    }
+
+    /// Reviewer-added (review-2026-07-09a): the same absent-value scenario, but reached through
+    /// the realistic high-level `insert_node_by_name` path (schema-validated) rather than the
+    /// low-level `insert_node`. Confirms `validate_properties` does not itself require a declared
+    /// field to be present, so the low-level exercise in `unique_absent_value_is_unconstrained`
+    /// was not testing an unreachable/unfair state — the same partial semantics are reachable via
+    /// the API applications actually call.
+    #[test]
+    fn unique_absent_value_is_unconstrained_via_high_level_api() {
+        let (mut db, _type_id) = make_db_with_unique_schema();
+        // Two nodes inserted via the schema-validated path, both omitting the `@unique` `email`
+        // field entirely.
+        db.insert_node_by_name("User", HashMap::from([("name".to_string(), json!("x"))]))
+            .unwrap();
+        db.insert_node_by_name("User", HashMap::from([("name".to_string(), json!("y"))]))
+            .unwrap();
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 2);
+    }
+
+    /// A rejected insert (or a whole transaction) rolls back cleanly: the unique value is released.
+    #[test]
+    fn unique_releases_value_on_rollback() {
+        let (mut db, _type_id) = make_db_with_unique_schema();
+        db.insert_node_by_name("User", user("base@x")).unwrap();
+        db.flush().unwrap();
+
+        let snap = db.take_snapshot();
+        let n = db.insert_node_by_name("User", user("tx@x")).unwrap();
+        assert!(db.node_exists(n));
+        // While tx@x is held, a duplicate fails.
+        assert!(db.insert_node_by_name("User", user("tx@x")).is_err());
+
+        db.restore_snapshot(snap);
+
+        // After rollback the value is free: insert with tx@x now succeeds.
+        assert!(db.insert_node_by_name("User", user("tx@x")).is_ok());
     }
 
     #[test]

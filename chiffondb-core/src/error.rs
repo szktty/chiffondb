@@ -16,6 +16,8 @@ pub enum GraphError {
     TypeMismatch { expected: String, actual: String },
     #[error("Validation error: {0}")]
     ValidationError(String),
+    #[error("Unique constraint violation on '{field}': value {value} already exists")]
+    UniqueViolation { field: String, value: String },
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
