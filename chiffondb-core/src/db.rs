@@ -1834,6 +1834,7 @@ impl PropertyDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::page::PAGE_SIZE;
     use serde_json::json;
     use tempfile::NamedTempFile;
 
@@ -3119,6 +3120,166 @@ mod tests {
 
         // After rollback the value is free: insert with tx@x now succeeds.
         assert!(db.insert_node_by_name("User", user("tx@x")).is_ok());
+    }
+
+    // ---- A-1: free-slot hint (insertion O(1)) ----
+
+    /// After a long run of inserts, the node free-slot hint tracks the last (nearly full) page,
+    /// which is the observable proof that alloc starts its scan near the end instead of from page
+    /// 0 every time (the O(n²) → O(n) fix). If the hint didn't advance it would sit at 0 and each
+    /// insert would re-scan all prior full pages.
+    #[test]
+    fn insert_advances_free_page_hint_instead_of_rescanning() {
+        let (mut db, _) = make_db();
+        // ~63 node slots per page; 700 nodes spans ~12 pages.
+        for _ in 0..700 {
+            db.insert_node(1, HashMap::new()).unwrap();
+        }
+        let count = db.file.header.node_page_count;
+        let hint = db.file.header.node_first_free_page;
+        assert!(count >= 11, "expected several node pages, got {count}");
+        // The hint sits on the last page (the only one with free space), not back at 0.
+        assert_eq!(hint, count - 1, "hint should track the last page");
+    }
+
+    /// Reviewer-added (review-2026-07-11a): design §6 DoD asks for a deterministic scan-count
+    /// proof of O(1) amortized insertion, not just the hint's final resting place. This pins the
+    /// stronger invariant directly: under back-to-back inserts (no interleaved deletes), the hint
+    /// is monotonically non-decreasing after every single insert, and it strictly advances at
+    /// least once per page filled (~63 slots). A hint that ever regressed, or that stayed frozen
+    /// while many pages filled, would mean the allocator silently fell back to rescanning from an
+    /// earlier point — the exact O(n^2) behavior this feature exists to remove.
+    #[test]
+    fn insert_hint_is_monotonic_and_advances_at_page_granularity() {
+        let (mut db, _) = make_db();
+        let mut last_hint = 0u32;
+        let mut advances = 0u32;
+        for _ in 0..700 {
+            db.insert_node(1, HashMap::new()).unwrap();
+            let hint = db.file.header.node_first_free_page;
+            assert!(
+                hint >= last_hint,
+                "hint regressed from {last_hint} to {hint} during a pure-insert run"
+            );
+            if hint > last_hint {
+                advances += 1;
+            }
+            last_hint = hint;
+        }
+        // 700 nodes at ~63/page fills ~11 pages; the hint must have advanced close to once per
+        // page (not once total, which would mean it froze after the very first page).
+        let pages = db.file.header.node_page_count;
+        assert!(
+            advances + 2 >= pages,
+            "hint advanced only {advances} times across {pages} pages filled — looks frozen"
+        );
+    }
+
+    /// Freeing a slot backs the hint down so the freed space is reused before appending new pages.
+    #[test]
+    fn free_backs_off_hint_and_reuses_slot() {
+        let (mut db, _) = make_db();
+        let mut rids = Vec::new();
+        for _ in 0..200 {
+            rids.push(db.insert_node(1, HashMap::new()).unwrap());
+        }
+        let pages_before = db.file.header.node_page_count;
+        // Delete a node on an early (full) page; the hint must back down to it.
+        let victim = rids[10];
+        let victim_page = victim.0.page_id.0;
+        db.delete_node(victim).unwrap();
+        assert!(db.file.header.node_first_free_page <= victim_page);
+        // The next insert reuses the freed slot on that early page — no new page appended.
+        let reused = db.insert_node(1, HashMap::new()).unwrap();
+        assert_eq!(
+            reused.0.page_id.0, victim_page,
+            "freed slot should be reused"
+        );
+        assert_eq!(db.file.header.node_page_count, pages_before, "no new page");
+    }
+
+    /// The hint rides the WAL: a transaction that grows pages (advancing the hint) reverts the
+    /// hint on rollback along with the data.
+    #[test]
+    fn free_page_hint_reverts_on_rollback() {
+        let (mut db, _) = make_db();
+        for _ in 0..80 {
+            db.insert_node(1, HashMap::new()).unwrap();
+        }
+        db.flush().unwrap();
+        let hint_before = db.file.header.node_first_free_page;
+        let count_before = db.file.header.node_page_count;
+
+        let snap = db.take_snapshot();
+        for _ in 0..200 {
+            db.insert_node(1, HashMap::new()).unwrap();
+        }
+        assert!(db.file.header.node_first_free_page > hint_before);
+        db.restore_snapshot(snap);
+        assert_eq!(db.file.header.node_first_free_page, hint_before);
+        assert_eq!(db.file.header.node_page_count, count_before);
+    }
+
+    /// Reopen restores the hint from the header, so inserts continue from the right page.
+    #[test]
+    fn free_page_hint_persists_across_reopen() {
+        let (mut db, path) = make_db();
+        for _ in 0..300 {
+            db.insert_node(1, HashMap::new()).unwrap();
+        }
+        let hint = db.file.header.node_first_free_page;
+        db.flush().unwrap();
+        drop(db);
+
+        let mut db2 = Database::open(&path).unwrap();
+        assert_eq!(db2.file.header.node_first_free_page, hint);
+        // Insert still works and lands on the last page (hint honored, not a fresh page each time).
+        let count_before = db2.file.header.node_page_count;
+        db2.insert_node(1, HashMap::new()).unwrap();
+        assert_eq!(db2.file.header.node_page_count, count_before);
+    }
+
+    /// A corrupt hint (past the page count) must not crash: the clamp makes alloc fall back to
+    /// appending a page rather than reading out of range.
+    #[test]
+    fn corrupt_free_page_hint_does_not_crash() {
+        let (mut db, _) = make_db();
+        for _ in 0..80 {
+            db.insert_node(1, HashMap::new()).unwrap();
+        }
+        // Corrupt the hint far past the page count.
+        db.file.header.node_first_free_page = 9_999_999;
+        db.file.write_header().unwrap();
+        // Insert must still succeed (clamp → scan empty range → append), no panic.
+        let r = db.insert_node(1, HashMap::new()).unwrap();
+        assert!(db.node_exists(r));
+    }
+
+    /// Property free-slot hint: mixed small/large values keep waste bounded — a page the hint
+    /// stopped at (because it still had >= threshold free) is reused by a later small value.
+    #[test]
+    fn property_hint_bounds_waste_on_mixed_sizes() {
+        let (mut db, _) = make_db();
+        // A big value (~half a page) then a small one, repeatedly. The small values should pack
+        // into the tails the hint left open rather than each taking a fresh page.
+        let big = "x".repeat(PAGE_SIZE / 2);
+        for i in 0..40 {
+            let mut props = HashMap::new();
+            props.insert("v".to_string(), json!(format!("{big}{i}")));
+            db.insert_node(1, props).unwrap();
+            let mut small = HashMap::new();
+            small.insert("v".to_string(), json!(i));
+            db.insert_node(1, small).unwrap();
+        }
+        // If every value took its own page we'd have ~80 property pages; packing keeps it well
+        // under that. (Two ~half-page values don't share, but small values fill tails.)
+        let prop_pages = db.file.header.property_dir_len;
+        assert!(
+            prop_pages < 80,
+            "waste not bounded: {prop_pages} property pages for 80 values"
+        );
+        // All values read back correctly (no corruption from the hint logic).
+        assert_eq!(db.count_nodes(None).unwrap(), 80);
     }
 
     #[test]

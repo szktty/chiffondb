@@ -178,6 +178,12 @@ impl PropertyStore {
 /// Sentinel `slot_id` marking a RID whose `page_id` is the head of a blob page chain.
 const CHAIN_HEAD_SLOT: u16 = 0xFFFF;
 
+/// A property page with less than this many free bytes is treated as "effectively full" by the
+/// free-page hint: the hint may advance past it, wasting at most this much per page (~1.6% of a
+/// 4 KB page). Small enough to keep the waste negligible, large enough that pages the hint stops
+/// at can still hold a useful value (design §3.3).
+const HINT_FULL_THRESHOLD: usize = 64;
+
 /// Writes `bytes` into the property store and returns its RecordId.
 ///
 /// The RID's `page_id` is a *logical* property page number (resolved through the property page
@@ -186,25 +192,51 @@ const CHAIN_HEAD_SLOT: u16 = 0xFFFF;
 /// dense in logical-page space and needs no physical contiguity (design §3.4).
 fn write_property_bytes(db: &mut DatabaseFile, bytes: &[u8]) -> Result<RecordId, GraphError> {
     if bytes.len() + 6 <= PAGE_SIZE {
-        // Try to reuse a slot in an existing logical property page.
+        // Try to reuse a slot, scanning from the free-page hint (design §3.3, bounded-waste rule).
+        // A page counts as "effectively full" — the hint may advance past it — if it's not a
+        // slotted page (blob-chain page, never written again) or has less than HINT_FULL_THRESHOLD
+        // free. A page with >= HINT_FULL_THRESHOLD free stops the hint even if this value didn't
+        // fit, so small later values can still use its tail (waste bounded to the threshold).
         let logical_count = db.property_page_count();
-        for logical in 0..logical_count {
+        let start = db.property_first_free_hint();
+        // Advance the hint over the leading run of effectively-full pages we scan past.
+        let mut new_hint = start;
+        let mut hint_frozen = false;
+        for logical in start..logical_count {
             let raw = db.read_property_page(logical)?;
             let mut spage = SlottedPage::from_bytes(raw);
-            if !spage.is_valid() {
-                continue;
+            let usable = spage.is_valid();
+            if usable {
+                if let Ok(slot) = spage.write_property(bytes) {
+                    db.write_property_page(logical, spage.as_bytes())?;
+                    if !hint_frozen && new_hint != start {
+                        db.set_property_first_free_hint(new_hint)?;
+                    }
+                    return Ok(RecordId::new(logical as u32, slot.0));
+                }
             }
-            if let Ok(slot) = spage.write_property(bytes) {
-                db.write_property_page(logical, spage.as_bytes())?;
-                return Ok(RecordId::new(logical as u32, slot.0));
+            // Value didn't fit here (or page unusable). If the page still has room for smaller
+            // values, freeze the hint at it; otherwise it's effectively full and the hint moves on.
+            if !hint_frozen {
+                if usable && spage.free_space() >= HINT_FULL_THRESHOLD {
+                    hint_frozen = true; // keep new_hint at this page
+                } else {
+                    new_hint = logical + 1;
+                }
             }
         }
-        // No space: map a fresh logical property page.
+        // No space in any scanned page: map a fresh logical property page.
         let mut spage = SlottedPage::new();
         let slot = spage
             .write_property(bytes)
             .map_err(|_| GraphError::StorageCorrupted(0))?;
         let logical = db.alloc_property_page(spage.as_bytes())?;
+        // The new page has room, so the hint should point at the first still-open page: the frozen
+        // one if any, else this new page.
+        let final_hint = if hint_frozen { new_hint } else { logical };
+        if final_hint != start {
+            db.set_property_first_free_hint(final_hint)?;
+        }
         Ok(RecordId::new(logical as u32, slot.0))
     } else {
         // Blob chain: each chunk page is mapped into the directory. `write_blob_chain` links

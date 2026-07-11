@@ -39,7 +39,7 @@ misreading an older layout (there is no backward compatibility — see the versi
 | Offset | Field | Size | Contents |
 |--------|-------|------|----------|
 | 0 | magic | 8 | `CHIFFON\0` |
-| 8 | version | 4 | Format version (u32), currently 8 |
+| 8 | version | 4 | Format version (u32), currently 9 |
 | 12 | page_size | 4 | Page size (fixed at 4096) |
 | 16 | label_index_root | 4 | Root page of the tier-1 label index (`0xFFFFFFFF` = none) |
 | 20 | property_index_root | 4 | Root page of the tier-2/3 property index (`0xFFFFFFFF` = none) |
@@ -52,7 +52,10 @@ misreading an older layout (there is no backward compatibility — see the versi
 | 52 | property_dir_len | 4 | Mapped length of the property page directory |
 | 56 | node_dir_root | 4 | Root of the node page directory (`0xFFFFFFFF` = none) |
 | 60 | edge_dir_root | 4 | Root of the edge page directory (`0xFFFFFFFF` = none) |
-| 64.. | *(reserved)* | remainder | Zero-filled |
+| 64 | node_first_free_page | 4 | Free-slot search hint for node pages (0 = from start) |
+| 68 | edge_first_free_page | 4 | Free-slot search hint for edge pages |
+| 72 | property_first_free_page | 4 | Free-slot search hint for property pages |
+| 76.. | *(reserved)* | remainder | Zero-filled |
 
 The header is the single in-memory source of truth for all directory/index roots and page counts.
 It is updated **through the WAL** like any other page, and reverts in full on rollback (so the
@@ -68,6 +71,7 @@ whole header is treated as transaction state and moves in lockstep with the data
 | 6 | Tier-1 label index (root at offset 16). |
 | 7 | Tier-2 property index (root at offset 20). |
 | 8 | Tier-2 index hash changed from `DefaultHasher` (not stable across Rust releases) to a fixed FNV-1a, invalidating persisted index entries. |
+| 9 | Added per-kind free-slot search hints (offsets 64..76), making insertion amortized O(1). |
 
 ---
 
@@ -268,11 +272,14 @@ The file backend routes its page I/O through a single bounded LRU page cache (`s
 > the append tail, resolved through per-kind page directories. The ceiling is now the u32 logical
 > page space (billions of nodes), bounded in practice by disk.
 >
+> **Insertion cost.** The slot allocators no longer scan from page 0 on every insert. A per-kind
+> free-slot search hint in the header (offsets 64..76) starts the scan at the first page that may
+> have room, so contiguous inserts are amortized O(1). `free`/`delete` walks the hint back so freed
+> slots are reused. For fixed-size node/edge pages this is exact; for variable-size property pages
+> the hint advances past pages with less than 64 bytes free (bounded waste), and a delete-heavy
+> adversarial pattern can still cost O(pages) per op (single-hint limitation, not a free-list).
+>
 > **Known limitations (not addressed on this branch).**
-> - **Insertion is O(n²) at scale.** `alloc_node_slot` / `alloc_edge_slot` and the property
->   free-slot search scan all existing pages linearly on every insert. This is the main bottleneck
->   against the "hundreds of millions of nodes" goal; a free-list or a "first page with space" hint
->   would make it O(1). Small datasets do not show it.
 > - **Space is not reclaimed in place.** `update` / `delete` / label changes do not free the old
 >   property slot, blob chain, or schema chain — space is reclaimed only by a full rebuild (vacuum).
 > - **`live_node_rids` materializes every RecordId into a `Vec`**, which is O(nodes) memory at call

@@ -88,6 +88,16 @@ impl SlottedPage {
         Ok(SlotId(slot_id))
     }
 
+    /// Bytes available for the *next* value written to this page: the gap between the data area
+    /// and the slot directory after reserving one more directory entry. `write_property(v)`
+    /// succeeds iff `v.len() <= free_space()`. Used by the property allocator's free-page hint to
+    /// decide whether a page is "effectively full" (design §3.3).
+    pub fn free_space(&self) -> usize {
+        let count = self.slot_count() as usize;
+        let dir_end = HEADER_SIZE + (count + 1) * SLOT_ENTRY_SIZE;
+        self.data_end().saturating_sub(dir_end)
+    }
+
     /// Reads data from a slot.
     pub fn read_property(&self, slot: SlotId) -> Result<&[u8], GraphError> {
         let idx = slot.0 as usize;

@@ -35,6 +35,26 @@ triad exec --session "$SID" -- <cmd> [args...]
 a reason + alternative (do that instead); `escalate` blocks until the user answers. Do
 **not** bypass it by calling `git`/`cargo` directly — that defeats the safety gate.
 
+Two helpers around the gate:
+
+- **Dry-run**: `triad exec --check -- <cmd>` returns the verdict (allowed / denied /
+  would-escalate) without running anything and without parking a question in the user's
+  queue. Use it when unsure whether a command would escalate, and after editing
+  `.triad.toml` to confirm the change actually took effect.
+- **Withdraw a mistaken escalation**: if you escalated a command by mistake, take it
+  back yourself instead of leaving it in the user's queue:
+  ```bash
+  curl -sS -X POST localhost:8787/cancel \
+    -H 'content-type: application/json' -d "{\"session_id\":\"$SID\"}"
+  ```
+  (add `"id": N` to withdraw one specific escalation; ids are in `GET /state`). The
+  blocked `triad exec` returns immediately with a deny.
+
+`.triad.toml` edits take effect on the **next** `triad exec` automatically — the server
+reloads the file when it changes; no restart is needed. While an edited config fails to
+load (parse error, or an unsafe allow entry), the gate fails closed: every command is
+denied with the load error until the file is fixed.
+
 ## `register <role> <session-id>` — join and start the loop
 
 `<role>` is `worker` or `reviewer`. `<session-id>` is any stable string unique to this
@@ -120,6 +140,21 @@ stop; the other session should handle it.
 
 A **409** means the event did not fit the current state (out of order, or it would break
 the verifier≠fixer rule). Read the message; do not force it.
+
+## A note without a turn — `/note`
+
+When something is worth telling the human (or the other session) but there is no FSM
+event to report — "done, but nothing to issue" one-liners like an environment quirk or
+a config caveat — post it without moving any state:
+
+```bash
+curl -sS -X POST localhost:8787/note \
+  -H 'content-type: application/json' \
+  -d "{\"session_id\":\"$SID\",\"message\":\"...\"}"
+```
+
+It only updates `last_message` in `GET /state` (prefixed with your session id); it wakes
+nobody. Anything that must reach a session's long-poll still goes through `/done`.
 
 ## WIP snapshot (reviewer, at verify start)
 

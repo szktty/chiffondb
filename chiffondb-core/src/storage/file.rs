@@ -84,9 +84,9 @@ pub const MAGIC: &[u8; 8] = b"CHIFFON\0";
 /// root at offset 16..20 (within that reserved range). v7 adds the tier-2 property index root at
 /// offset 20..24. v8 changes the tier-2 index hash from `DefaultHasher` (not stable across Rust
 /// releases) to a fixed FNV-1a, invalidating persisted index entries — old v7 files are rejected.
-/// A mismatch is rejected by `FileHeader::deserialize` to avoid silently misreading an older
-/// layout.
-pub const VERSION: u32 = 8;
+/// v9 adds the per-kind free-slot search hints at offsets 64..76. A mismatch is rejected by
+/// `FileHeader::deserialize` to avoid silently misreading an older layout.
+pub const VERSION: u32 = 9;
 
 /// Contents of the header page (Page 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +118,15 @@ pub struct FileHeader {
     pub node_dir_root: u32,
     /// Root physical page of the edge page directory. Mapped length = `edge_page_count`.
     pub edge_dir_root: u32,
+    /// Logical page number to start the free-slot search from, per kind (offsets 64..76). The
+    /// slot allocators scan `hint..count` instead of `0..count`, making insertion amortized O(1)
+    /// instead of O(n) per call. Invariant: pages below the hint were full when it was set (for
+    /// property, "effectively full" = less than `HINT_FULL_THRESHOLD` free). The hint never
+    /// affects correctness — only space efficiency — so it is read with a `min(_, count)` clamp
+    /// and freely reset on rollback. `0` on a fresh DB (scan from the start, as before).
+    pub node_first_free_page: u32,
+    pub edge_first_free_page: u32,
+    pub property_first_free_page: u32,
 }
 
 /// Header sentinel for "no page-directory root yet" (matches `PageDirectory::root`'s UNMAPPED).
@@ -151,6 +160,9 @@ impl FileHeader {
             property_dir_len: 0,
             node_dir_root: NO_DIR_ROOT,
             edge_dir_root: NO_DIR_ROOT,
+            node_first_free_page: 0,
+            edge_first_free_page: 0,
+            property_first_free_page: 0,
         }
     }
 
@@ -170,6 +182,9 @@ impl FileHeader {
         buf[52..56].copy_from_slice(&self.property_dir_len.to_le_bytes());
         buf[56..60].copy_from_slice(&self.node_dir_root.to_le_bytes());
         buf[60..64].copy_from_slice(&self.edge_dir_root.to_le_bytes());
+        buf[64..68].copy_from_slice(&self.node_first_free_page.to_le_bytes());
+        buf[68..72].copy_from_slice(&self.edge_first_free_page.to_le_bytes());
+        buf[72..76].copy_from_slice(&self.property_first_free_page.to_le_bytes());
         buf
     }
 
@@ -200,6 +215,9 @@ impl FileHeader {
         let property_dir_len = u32::from_le_bytes(buf[52..56].try_into().unwrap());
         let node_dir_root = u32::from_le_bytes(buf[56..60].try_into().unwrap());
         let edge_dir_root = u32::from_le_bytes(buf[60..64].try_into().unwrap());
+        let node_first_free_page = u32::from_le_bytes(buf[64..68].try_into().unwrap());
+        let edge_first_free_page = u32::from_le_bytes(buf[68..72].try_into().unwrap());
+        let property_first_free_page = u32::from_le_bytes(buf[72..76].try_into().unwrap());
         Ok(Self {
             version,
             label_index_root,
@@ -212,6 +230,9 @@ impl FileHeader {
             property_dir_len,
             node_dir_root,
             edge_dir_root,
+            node_first_free_page,
+            edge_first_free_page,
+            property_first_free_page,
         })
     }
 }
@@ -567,6 +588,20 @@ impl DatabaseFile {
         self.header.property_dir_len as usize
     }
 
+    /// Free-slot search hint for property pages, clamped to the current page count (see
+    /// `topology_first_free_hint` for why the clamp is safe).
+    pub fn property_first_free_hint(&self) -> usize {
+        self.header
+            .property_first_free_page
+            .min(self.header.property_dir_len) as usize
+    }
+
+    /// Records the property free-slot search hint (persisted through the WAL).
+    pub fn set_property_first_free_hint(&mut self, hint: usize) -> Result<(), GraphError> {
+        self.header.property_first_free_page = hint as u32;
+        self.write_header()
+    }
+
     /// Resolves a logical property page number to its physical page id.
     pub fn resolve_property_page(&mut self, logical: usize) -> Result<u32, GraphError> {
         let dir = self.property_dir();
@@ -634,6 +669,39 @@ impl DatabaseFile {
                 self.header.edge_dir_root = dir.root();
                 self.header.edge_page_count = dir.len() as u32;
             }
+        }
+        self.write_header()
+    }
+
+    /// Free-slot search hint for `kind`, clamped to the current page count. The clamp defends
+    /// against a corrupt hint that exceeds `count` (which would make every alloc append a new
+    /// page and silently grow the file); the hint never affects correctness, only where the scan
+    /// starts, so clamping is always safe.
+    pub fn topology_first_free_hint(&self, kind: TopologyKind) -> usize {
+        let (hint, count) = match kind {
+            TopologyKind::Node => (
+                self.header.node_first_free_page,
+                self.header.node_page_count,
+            ),
+            TopologyKind::Edge => (
+                self.header.edge_first_free_page,
+                self.header.edge_page_count,
+            ),
+        };
+        hint.min(count) as usize
+    }
+
+    /// Records the free-slot search hint for `kind` (persisted through the WAL, so it reverts with
+    /// the data on rollback).
+    pub fn set_topology_first_free_hint(
+        &mut self,
+        kind: TopologyKind,
+        hint: usize,
+    ) -> Result<(), GraphError> {
+        let hint = hint as u32;
+        match kind {
+            TopologyKind::Node => self.header.node_first_free_page = hint,
+            TopologyKind::Edge => self.header.edge_first_free_page = hint,
         }
         self.write_header()
     }
@@ -957,6 +1025,34 @@ mod tests {
             }
             Err(e) => panic!("expected UnsupportedVersion for v6, got {e:?}"),
             Ok(_) => panic!("v6 file was not rejected — silent misread risk"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_previous_version_v8() {
+        // v9 adds the free-slot hints at 64..76; a v8 file has zeros there, but the version guard
+        // must still reject it (no backward compat, design §0).
+        let dir = TempDir::new().unwrap();
+        let path = make_db_path(&dir);
+        {
+            let mut f = FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let mut buf = [0u8; PAGE_SIZE];
+            buf[0..8].copy_from_slice(MAGIC);
+            buf[8..12].copy_from_slice(&8u32.to_le_bytes()); // previous version v8
+            f.write_all(&buf).unwrap();
+        }
+        match DatabaseFile::open(&path) {
+            Err(GraphError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 8);
+                assert_eq!(supported, VERSION);
+            }
+            Err(e) => panic!("expected UnsupportedVersion for v8, got {e:?}"),
+            Ok(_) => panic!("v8 file was not rejected — silent misread risk"),
         }
     }
 

@@ -262,7 +262,9 @@ impl TopologyStore {
         let logical = edge_rid.page_id.0 as usize;
         let mut page = self.load_edge_page(file, logical)?;
         page.free_slot(edge_rid.slot_id)?;
-        file.write_topology_page(TopologyKind::Edge, logical, page.as_bytes())
+        file.write_topology_page(TopologyKind::Edge, logical, page.as_bytes())?;
+        // Freed a slot on this page — back the edge search hint down to it (see free_node).
+        self.back_off_topology_hint(file, TopologyKind::Edge, logical)
     }
 
     /// Collects the outgoing edges of a node.
@@ -315,42 +317,76 @@ impl TopologyStore {
         let logical = rid.page_id.0 as usize;
         let mut page = self.load_node_page(file, logical)?;
         page.free_slot(rid.slot_id)?;
-        file.write_topology_page(TopologyKind::Node, logical, page.as_bytes())
+        file.write_topology_page(TopologyKind::Node, logical, page.as_bytes())?;
+        // This page now has a free slot, so back the search hint down to it (min) so the next
+        // alloc reuses the freed space instead of starting past it.
+        self.back_off_topology_hint(file, TopologyKind::Node, logical)
     }
 
     // ---- Internal helpers ----
 
     /// Finds (or creates) a free node slot, returning its (logical page, slot).
     fn alloc_node_slot(&mut self, file: &mut DatabaseFile) -> Result<(usize, SlotId), GraphError> {
-        for logical in 0..self.node_page_count(file) {
-            let mut page = self.load_node_page(file, logical)?;
-            if let Some(slot) = page.alloc_slot() {
-                file.write_topology_page(TopologyKind::Node, logical, page.as_bytes())?;
-                return Ok((logical, slot));
-            }
-        }
-        // All pages full: map a fresh logical node page through the directory (append + push +
-        // header persist, all crash-safe via the WAL). No fixed-segment capacity check — the
-        // only ceiling now is the u32 logical page space.
-        let mut page = Page::new(NODE_RECORD_SIZE);
-        let slot = page.alloc_slot().ok_or(GraphError::StorageCorrupted(0))?;
-        let logical = file.alloc_topology_page(TopologyKind::Node, page.as_bytes())?;
-        Ok((logical, slot))
+        self.alloc_topology_slot(file, TopologyKind::Node, NODE_RECORD_SIZE)
     }
 
     /// Finds (or creates) a free edge slot, returning its (logical page, slot).
     fn alloc_edge_slot(&mut self, file: &mut DatabaseFile) -> Result<(usize, SlotId), GraphError> {
-        for logical in 0..self.edge_page_count(file) {
-            let mut page = self.load_edge_page(file, logical)?;
+        self.alloc_topology_slot(file, TopologyKind::Edge, EDGE_RECORD_SIZE)
+    }
+
+    /// Shared slot allocator for node/edge pages. Scans from the free-slot hint (`hint..count`)
+    /// instead of page 0, and advances the hint to the page it succeeds on, so repeated inserts
+    /// don't re-scan pages already known full (design §3.2). Fixed-size slots make "full" a
+    /// binary check, so the hint invariant ("pages below the hint are full") holds exactly.
+    fn alloc_topology_slot(
+        &mut self,
+        file: &mut DatabaseFile,
+        kind: TopologyKind,
+        record_size: usize,
+    ) -> Result<(usize, SlotId), GraphError> {
+        let count = match kind {
+            TopologyKind::Node => self.node_page_count(file),
+            TopologyKind::Edge => self.edge_page_count(file),
+        };
+        let start = file.topology_first_free_hint(kind);
+        for logical in start..count {
+            let mut page = match kind {
+                TopologyKind::Node => self.load_node_page(file, logical)?,
+                TopologyKind::Edge => self.load_edge_page(file, logical)?,
+            };
             if let Some(slot) = page.alloc_slot() {
-                file.write_topology_page(TopologyKind::Edge, logical, page.as_bytes())?;
+                file.write_topology_page(kind, logical, page.as_bytes())?;
+                // The scanned-past pages [start, logical) were full; advance the hint so the next
+                // alloc starts here rather than re-confirming them.
+                if logical != start {
+                    file.set_topology_first_free_hint(kind, logical)?;
+                }
                 return Ok((logical, slot));
             }
         }
-        let mut page = Page::new(EDGE_RECORD_SIZE);
+        // All pages from the hint on are full: map a fresh logical page (append + push + header
+        // persist, crash-safe via the WAL). Its logical number becomes the new hint. No capacity
+        // check — the only ceiling is the u32 logical page space.
+        let mut page = Page::new(record_size);
         let slot = page.alloc_slot().ok_or(GraphError::StorageCorrupted(0))?;
-        let logical = file.alloc_topology_page(TopologyKind::Edge, page.as_bytes())?;
+        let logical = file.alloc_topology_page(kind, page.as_bytes())?;
+        file.set_topology_first_free_hint(kind, logical)?;
         Ok((logical, slot))
+    }
+
+    /// Backs the free-slot hint down to `logical` if it currently points past it (`min`), so a
+    /// freed slot on `logical` is reused by the next alloc. No-op if the hint is already ≤ logical.
+    fn back_off_topology_hint(
+        &mut self,
+        file: &mut DatabaseFile,
+        kind: TopologyKind,
+        logical: usize,
+    ) -> Result<(), GraphError> {
+        if logical < file.topology_first_free_hint(kind) {
+            file.set_topology_first_free_hint(kind, logical)?;
+        }
+        Ok(())
     }
 
     fn remove_from_out_list(
