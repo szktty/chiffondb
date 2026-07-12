@@ -22,7 +22,7 @@ name = "chiffon"
 path = "src/main.rs"
 
 [dependencies]
-chiffondb-core = { path = "../chiffondb-core", version = "0.1.0" }
+chiffondb-core = { path = "../chiffondb-core", version = "0.2.0" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

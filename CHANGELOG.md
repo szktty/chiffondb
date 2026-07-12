@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-07-13
 
 ### Added
 
@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - FFI: the dynamic-label API is exposed on `Connection` for the language bindings. Assignments
   are returned as JSON object strings (`{"id":<u16>,"created":<bool>}`), consistent with the
   existing label getters; the node insert returns a `DynamicInsertResult { rid, assignments_json }`.
+- Insertion is now amortized O(1): per-kind free-slot hints in the header let node/edge/property
+  inserts reuse freed slots without a linear scan.
+- Property-store space reclaim: deleting or updating a node/edge now returns its property space
+  to an intrusive free-page list for reuse; freed slots are tombstoned and a page rejoins the free
+  list once it is fully empty (page-granular reclaim, not intra-page compaction).
+- On-disk format bumped to version 10 (from 8); older files are rejected (no backward
+  compatibility).
 
 ### Fixed
 
