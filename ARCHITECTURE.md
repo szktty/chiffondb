@@ -55,7 +55,8 @@ misreading an older layout (there is no backward compatibility — see the versi
 | 64 | node_first_free_page | 4 | Free-slot search hint for node pages (0 = from start) |
 | 68 | edge_first_free_page | 4 | Free-slot search hint for edge pages |
 | 72 | property_first_free_page | 4 | Free-slot search hint for property pages |
-| 76.. | *(reserved)* | remainder | Zero-filled |
+| 76 | property_free_list_head | 4 | Head of the property free-page list (`0xFFFFFFFF` = empty) |
+| 80.. | *(reserved)* | remainder | Zero-filled |
 
 The header is the single in-memory source of truth for all directory/index roots and page counts.
 It is updated **through the WAL** like any other page, and reverts in full on rollback (so the
@@ -72,6 +73,7 @@ whole header is treated as transaction state and moves in lockstep with the data
 | 7 | Tier-2 property index (root at offset 20). |
 | 8 | Tier-2 index hash changed from `DefaultHasher` (not stable across Rust releases) to a fixed FNV-1a, invalidating persisted index entries. |
 | 9 | Added per-kind free-slot search hints (offsets 64..76), making insertion amortized O(1). |
+| 10 | Property space reclaim (A-2): property free-page list head at offset 76; slotted-page header grows a `live_count` field and gains slot tombstones — old v9 property pages are rejected. |
 
 ---
 
@@ -275,13 +277,26 @@ The file backend routes its page I/O through a single bounded LRU page cache (`s
 > **Insertion cost.** The slot allocators no longer scan from page 0 on every insert. A per-kind
 > free-slot search hint in the header (offsets 64..76) starts the scan at the first page that may
 > have room, so contiguous inserts are amortized O(1). `free`/`delete` walks the hint back so freed
-> slots are reused. For fixed-size node/edge pages this is exact; for variable-size property pages
+> slots are reused (for property, the hint also backs off when the free-page list reuses a low
+> logical page). For fixed-size node/edge pages this is exact; for variable-size property pages
 > the hint advances past pages with less than 64 bytes free (bounded waste), and a delete-heavy
 > adversarial pattern can still cost O(pages) per op (single-hint limitation, not a free-list).
 >
+> **Property space reclaim (A-2).** `update` / `delete` on a node or edge now frees the property
+> space it held. Freed property pages go on an intrusive free-page list (head at header offset 76;
+> each free page carries a `FREE_PAGE_MARKER` in its `slot_count` field and links to the next free
+> page), and `alloc_property_page` pops that list before appending — so deleted space is reused, not
+> leaked. Slotted values are freed by tombstoning the slot (offset `0xFFFF`, `live_count` decremented);
+> a page returns to the free-list once its `live_count` hits 0. Reclaim is **page-granular**: a
+> partly-live page keeps its dead slots' bytes until it fully empties (intra-page compaction is a
+> deferred follow-up, A-2b). Reading a freed slot returns `PropertySlotFreed`, distinct from
+> `StorageCorrupted`.
+>
 > **Known limitations (not addressed on this branch).**
-> - **Space is not reclaimed in place.** `update` / `delete` / label changes do not free the old
->   property slot, blob chain, or schema chain — space is reclaimed only by a full rebuild (vacuum).
+> - **Property reclaim is page-granular, not compacting** (A-2b): a page with one immortal live slot
+>   holds its other freed slots' bytes until that slot is freed too.
+> - **Schema-chain space is still not reclaimed in place.** Schema-chain rewrites reclaim only by a
+>   full rebuild (vacuum).
 > - **`live_node_rids` materializes every RecordId into a `Vec`**, which is O(nodes) memory at call
 >   time (not bounded by the cache budget). Full scans that use it are the exception to the
 >   resident-memory bound above.

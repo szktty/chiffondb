@@ -8,6 +8,7 @@ use crate::error::GraphError;
 use crate::storage::buffer::PageCache;
 use crate::storage::page::PAGE_SIZE;
 use crate::storage::page_directory::PageDirectory;
+use crate::storage::property::FREE_PAGE_MARKER;
 use crate::storage::wal::{wal_path, WalFile};
 
 /// Default in-memory page-cache budget for file-backed databases.
@@ -84,9 +85,11 @@ pub const MAGIC: &[u8; 8] = b"CHIFFON\0";
 /// root at offset 16..20 (within that reserved range). v7 adds the tier-2 property index root at
 /// offset 20..24. v8 changes the tier-2 index hash from `DefaultHasher` (not stable across Rust
 /// releases) to a fixed FNV-1a, invalidating persisted index entries — old v7 files are rejected.
-/// v9 adds the per-kind free-slot search hints at offsets 64..76. A mismatch is rejected by
-/// `FileHeader::deserialize` to avoid silently misreading an older layout.
-pub const VERSION: u32 = 9;
+/// v9 adds the per-kind free-slot search hints at offsets 64..76. v10 (A-2 space reclaim) adds the
+/// property free-page list head at offset 76..80 and grows the slotted-page header with a
+/// `live_count` field (page format change), so old v9 property pages are rejected. A mismatch is
+/// rejected by `FileHeader::deserialize` to avoid silently misreading an older layout.
+pub const VERSION: u32 = 10;
 
 /// Contents of the header page (Page 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,10 +130,21 @@ pub struct FileHeader {
     pub node_first_free_page: u32,
     pub edge_first_free_page: u32,
     pub property_first_free_page: u32,
+    /// Head of the property free-page list: the logical property page id of the first reusable
+    /// (freed) page, or `NO_FREE_PAGE` if the list is empty (offset 76..80, A-2). Freed property
+    /// pages stay mapped in the directory and form an intrusive stack (each free page stores the
+    /// next free logical id in its body); `alloc_property_page` pops this list before appending, so
+    /// deleted property space is reused instead of leaking. Header-truth, WAL-updated, reverts on
+    /// rollback with the rest of the header — like the A-1 hints above.
+    pub property_free_list_head: u32,
 }
 
 /// Header sentinel for "no page-directory root yet" (matches `PageDirectory::root`'s UNMAPPED).
 pub const NO_DIR_ROOT: u32 = 0xFFFF_FFFF;
+
+/// Header sentinel for "property free-page list is empty" (A-2). A real logical property page id
+/// can never be `0xFFFF_FFFF` (that would need a ~16 TB file), so it's an unambiguous "no head".
+pub const NO_FREE_PAGE: u32 = 0xFFFF_FFFF;
 
 /// Selects which topology page directory (node or edge) a page-directory operation targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +177,7 @@ impl FileHeader {
             node_first_free_page: 0,
             edge_first_free_page: 0,
             property_first_free_page: 0,
+            property_free_list_head: NO_FREE_PAGE,
         }
     }
 
@@ -185,6 +200,7 @@ impl FileHeader {
         buf[64..68].copy_from_slice(&self.node_first_free_page.to_le_bytes());
         buf[68..72].copy_from_slice(&self.edge_first_free_page.to_le_bytes());
         buf[72..76].copy_from_slice(&self.property_first_free_page.to_le_bytes());
+        buf[76..80].copy_from_slice(&self.property_free_list_head.to_le_bytes());
         buf
     }
 
@@ -218,6 +234,7 @@ impl FileHeader {
         let node_first_free_page = u32::from_le_bytes(buf[64..68].try_into().unwrap());
         let edge_first_free_page = u32::from_le_bytes(buf[68..72].try_into().unwrap());
         let property_first_free_page = u32::from_le_bytes(buf[72..76].try_into().unwrap());
+        let property_free_list_head = u32::from_le_bytes(buf[76..80].try_into().unwrap());
         Ok(Self {
             version,
             label_index_root,
@@ -233,6 +250,7 @@ impl FileHeader {
             node_first_free_page,
             edge_first_free_page,
             property_first_free_page,
+            property_free_list_head,
         })
     }
 }
@@ -609,14 +627,72 @@ impl DatabaseFile {
             .ok_or(GraphError::StorageCorrupted(logical as u32))
     }
 
-    /// Allocates a fresh physical property page initialized with `data`, maps it into the
-    /// property directory, and returns the assigned logical page number.
+    /// Allocates a logical property page initialized with `data`, returning its logical number.
+    ///
+    /// Reuses a freed page from the property free-page list first (A-2): a popped page stays mapped
+    /// at its old logical id, so this overwrites its physical page in place — no directory change.
+    /// Only when the free-list is empty does it append a fresh physical page and map a new logical
+    /// id. Callers are unchanged: they still just get back a logical number.
     pub fn alloc_property_page(&mut self, data: &[u8; PAGE_SIZE]) -> Result<usize, GraphError> {
+        if let Some(logical) = self.pop_property_free_page()? {
+            // The freed page is still mapped; overwrite its physical page with the real content.
+            // This clears the free-page marker, since `data` is a genuine slotted/chain page.
+            self.write_property_page(logical, data)?;
+            return Ok(logical);
+        }
         let physical = self.append_page(data)?;
         let mut dir = self.property_dir();
         let logical = dir.push(self, physical)?;
         self.store_property_dir(&dir)?;
         Ok(logical)
+    }
+
+    /// Head of the property free-page list (`None` if empty).
+    fn property_free_list_head(&self) -> Option<usize> {
+        let head = self.header.property_free_list_head;
+        if head == NO_FREE_PAGE {
+            None
+        } else {
+            Some(head as usize)
+        }
+    }
+
+    /// Pushes logical property page `logical` onto the free-page list, stamping the page's free
+    /// marker and linking it to the previous head (A-2). The page must no longer be referenced by
+    /// any live RID before this is called (the caller frees the RID first).
+    ///
+    /// On-disk: the freed page's `slot_count` field (`[0..2]`) is set to `FREE_PAGE_MARKER` so the
+    /// ordinary allocator scan skips it (`SlottedPage::is_valid()` rejects the marker), and the
+    /// previous head logical id is stored in `[4..8]` as the intrusive "next free" link.
+    pub fn free_property_page(&mut self, logical: usize) -> Result<(), GraphError> {
+        let prev_head = self.header.property_free_list_head;
+        let mut page = [0u8; PAGE_SIZE];
+        page[0..2].copy_from_slice(&FREE_PAGE_MARKER.to_le_bytes());
+        page[4..8].copy_from_slice(&prev_head.to_le_bytes());
+        self.write_property_page(logical, &page)?;
+        self.header.property_free_list_head = logical as u32;
+        self.write_header()
+    }
+
+    /// Pops the head of the property free-page list, returning its logical id (`None` if empty).
+    /// The returned page is still mapped in the directory; the caller overwrites its content.
+    fn pop_property_free_page(&mut self) -> Result<Option<usize>, GraphError> {
+        let Some(head) = self.property_free_list_head() else {
+            return Ok(None);
+        };
+        let page = self.read_property_page(head)?;
+        // Defensive: a head page must carry the free marker; if not, the list is corrupt — stop
+        // reusing rather than clobber live data. Treat as empty (degrades to append, never wrong).
+        let marker = u16::from_le_bytes(page[0..2].try_into().unwrap_or([0; 2]));
+        if marker != FREE_PAGE_MARKER {
+            self.header.property_free_list_head = NO_FREE_PAGE;
+            self.write_header()?;
+            return Ok(None);
+        }
+        let next = u32::from_le_bytes(page[4..8].try_into().unwrap_or([0xFF; 4]));
+        self.header.property_free_list_head = next;
+        self.write_header()?;
+        Ok(Some(head))
     }
 
     /// Overwrites the physical page backing logical property page `logical`.
@@ -1053,6 +1129,35 @@ mod tests {
             }
             Err(e) => panic!("expected UnsupportedVersion for v8, got {e:?}"),
             Ok(_) => panic!("v8 file was not rejected — silent misread risk"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_previous_version_v9() {
+        // v10 (A-2) adds the property free-list head at 76..80 and grows the slotted-page header
+        // with live_count; a v9 file's property pages would be misread, so the version guard must
+        // reject it (no backward compat, design §0).
+        let dir = TempDir::new().unwrap();
+        let path = make_db_path(&dir);
+        {
+            let mut f = FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let mut buf = [0u8; PAGE_SIZE];
+            buf[0..8].copy_from_slice(MAGIC);
+            buf[8..12].copy_from_slice(&9u32.to_le_bytes()); // previous version v9
+            f.write_all(&buf).unwrap();
+        }
+        match DatabaseFile::open(&path) {
+            Err(GraphError::UnsupportedVersion { found, supported }) => {
+                assert_eq!(found, 9);
+                assert_eq!(supported, VERSION);
+            }
+            Err(e) => panic!("expected UnsupportedVersion for v9, got {e:?}"),
+            Ok(_) => panic!("v9 file was not rejected — silent misread risk"),
         }
     }
 

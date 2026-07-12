@@ -21,9 +21,12 @@ including the indexes, go through a fixed-size LRU cache; no in-memory index gro
 except `live_node_rids`, which materializes RecordIds during a full scan). Node/edge/property
 pages grow on the file's append tail via per-kind page directories, so the old ~2000-node cap is
 gone (ceiling is now the u32 logical page space). Insertion is amortized O(1) via per-kind
-free-slot hints in the header. On-disk `VERSION` is 9. See `ARCHITECTURE.md` for the format, the
-label/property/unique indexes, and the remaining known limitations (space is not reclaimed in
-place; crash atomicity is not guaranteed per API call).
+free-slot hints in the header. Deleting/updating a node or edge now reclaims its property space
+(A-2): freed property pages go on an intrusive free-page list and are reused; freed slots are
+tombstoned (page-granular reclaim — a page returns to the list once fully empty). On-disk `VERSION`
+is 10. See `ARCHITECTURE.md` for the format, the label/property/unique indexes, and the remaining
+known limitations (property space reclaim is page-granular, not intra-page compaction; schema-chain
+space is still not reclaimed; crash atomicity is not guaranteed per API call).
 
 ## Development rules
 

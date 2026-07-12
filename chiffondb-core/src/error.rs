@@ -8,6 +8,8 @@ pub enum GraphError {
     SchemaError(String),
     #[error("Storage corrupted at page {0}")]
     StorageCorrupted(u32),
+    #[error("Property slot has been freed")]
+    PropertySlotFreed,
     #[error("Unsupported file format version: found {found}, supported {supported}")]
     UnsupportedVersion { found: u32, supported: u32 },
     #[error("Invalid traversal command: {0}")]

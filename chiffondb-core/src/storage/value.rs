@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::error::GraphError;
 use crate::storage::file::DatabaseFile;
 use crate::storage::page::{RecordId, PAGE_SIZE};
-use crate::storage::property::{pages_needed, write_blob_chain, SlottedPage};
+use crate::storage::property::{pages_needed, write_blob_chain, SlottedPage, FREE_PAGE_MARKER};
 
 // ---- Value tag definitions ----
 const TAG_NULL: u8 = 0;
@@ -173,6 +173,21 @@ impl PropertyStore {
 
         rmp_serde::from_slice(&bytes).map_err(|e| GraphError::SchemaError(e.to_string()))
     }
+
+    /// Frees the property record at `rid`, making its space reusable by later writes (A-2).
+    ///
+    /// Dispatches on the RID shape (blob chain vs. slotted), the same way `read` does:
+    /// - **Blob chain** (`slot_id == CHAIN_HEAD_SLOT`): every logical page in the chain is returned
+    ///   to the property free-page list.
+    /// - **Slotted**: the slot is tombstoned; when its page has no live slots left, the whole
+    ///   logical page is returned to the free-page list.
+    ///
+    /// Idempotent (O-5): freeing an already-freed slotted slot is a silent no-op; a chain page
+    /// already on the free-list is skipped. Freeing backs off the property free-slot hint so the
+    /// reopened space is found by the ordinary scan (the A-1 hand-off, design §3.4).
+    pub fn free(db: &mut DatabaseFile, rid: RecordId) -> Result<(), GraphError> {
+        free_property_bytes(db, rid)
+    }
 }
 
 /// Sentinel `slot_id` marking a RID whose `page_id` is the head of a blob page chain.
@@ -231,12 +246,14 @@ fn write_property_bytes(db: &mut DatabaseFile, bytes: &[u8]) -> Result<RecordId,
             .write_property(bytes)
             .map_err(|_| GraphError::StorageCorrupted(0))?;
         let logical = db.alloc_property_page(spage.as_bytes())?;
-        // The new page has room, so the hint should point at the first still-open page: the frozen
-        // one if any, else this new page.
-        let final_hint = if hint_frozen { new_hint } else { logical };
-        if final_hint != start {
-            db.set_property_first_free_hint(final_hint)?;
-        }
+        // The new page has room, so the hint should point at the first still-open page. Take the
+        // minimum of the frozen page (if any) and the allocated page: `alloc_property_page` may have
+        // *reused* a freed page whose logical id is below `start` (free-list reuse), and that page
+        // now has room — so the hint must back off to it, or the ordinary scan (which only looks at
+        // `hint..count`) would never revisit it and would append a fresh page for every later value.
+        let candidate = if hint_frozen { new_hint } else { logical };
+        let final_hint = candidate.min(logical);
+        db.set_property_first_free_hint(final_hint)?;
         Ok(RecordId::new(logical as u32, slot.0))
     } else {
         // Blob chain: each chunk page is mapped into the directory. `write_blob_chain` links
@@ -286,6 +303,80 @@ fn read_property_bytes(db: &mut DatabaseFile, rid: RecordId) -> Result<Vec<u8>, 
         let spage = SlottedPage::from_bytes(raw);
         Ok(spage.read_property(rid.slot_id)?.to_vec())
     }
+}
+
+/// Frees the property record at `rid` (slotted slot or blob chain); see `PropertyStore::free`.
+fn free_property_bytes(db: &mut DatabaseFile, rid: RecordId) -> Result<(), GraphError> {
+    if rid.slot_id.0 == CHAIN_HEAD_SLOT {
+        // Idempotence (O-5): a chain head already on the free-list carries FREE_PAGE_MARKER in its
+        // `slot_count` field. Freeing it again must be a no-op, not misread the marker bytes as a
+        // `next` link (which would resolve to logical 65535 → StorageCorrupted). This is the
+        // documented "a chain page already on the free-list is skipped" behavior (M-1, review-d).
+        let head = db.read_property_page(rid.page_id.0 as usize)?;
+        if page_is_free_marked(&head) {
+            return Ok(());
+        }
+        // Collect the chain's logical pages first, then free them — so a mid-walk error can't leave
+        // a half-freed chain (we only touch the free-list once the whole chain is gathered).
+        let mut logicals = Vec::new();
+        let mut logical = rid.page_id.0 as usize;
+        let limit = db.property_page_count();
+        loop {
+            let page = db.read_property_page(logical)?;
+            let next = u32::from_le_bytes(page[0..4].try_into().unwrap_or([0xFF; 4]));
+            logicals.push(logical);
+            if next == 0xFFFF_FFFF {
+                break;
+            }
+            logical = next as usize;
+            if logicals.len() > limit {
+                return Err(GraphError::StorageCorrupted(logical as u32));
+            }
+        }
+        for logical in logicals {
+            db.free_property_page(logical)?;
+            back_off_property_hint(db, logical)?;
+        }
+        Ok(())
+    } else {
+        let logical = rid.page_id.0 as usize;
+        let raw = db.read_property_page(logical)?;
+        // Idempotence (O-5): if this page is already free-listed (marker), freeing a slot on it
+        // would push it onto the free-list a second time, creating a cycle. No-op instead (M-1).
+        if page_is_free_marked(&raw) {
+            return Ok(());
+        }
+        let mut spage = SlottedPage::from_bytes(raw);
+        spage.free_slot(rid.slot_id)?; // idempotent no-op if already freed (O-5)
+        if spage.live_count() == 0 {
+            // The page holds no live values — return the whole logical page to the free-list.
+            db.free_property_page(logical)?;
+        } else {
+            db.write_property_page(logical, spage.as_bytes())?;
+        }
+        back_off_property_hint(db, logical)?;
+        Ok(())
+    }
+}
+
+/// True if `page` is on the property free-page list: its `slot_count` field (`[0..2]`) holds
+/// `FREE_PAGE_MARKER`. Used to make freeing idempotent against a stale RID whose page was already
+/// reclaimed (M-1). Note the R-1 caveat: a live blob-chain *tail* page's `[0..2]` also equals
+/// `0xFFFF` (low half of the `0xFFFF_FFFF` end-sentinel), so this is only ever consulted on a page
+/// reached as a *head* (chain head or slotted page), never a chain tail.
+fn page_is_free_marked(page: &[u8; PAGE_SIZE]) -> bool {
+    u16::from_le_bytes(page[0..2].try_into().unwrap_or([0; 2])) == FREE_PAGE_MARKER
+}
+
+/// Backs off the property free-slot hint so a freed page/slot below the current hint is found again
+/// by the ordinary forward scan (`hint = min(hint, freed_logical)`). This is the property-side
+/// counterpart to `back_off_topology_hint`, the debt A-1 deferred until A-2's free path existed
+/// (alloc-hint design §5, §8-1; this design §3.4).
+fn back_off_property_hint(db: &mut DatabaseFile, freed_logical: usize) -> Result<(), GraphError> {
+    if freed_logical < db.property_first_free_hint() {
+        db.set_property_first_free_hint(freed_logical)?;
+    }
+    Ok(())
 }
 
 /// Rewrites the `next` link of each chain page from `write_blob_chain`'s relative index to the

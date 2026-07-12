@@ -221,6 +221,11 @@ impl Database {
         // Enforce @unique before writing, excluding this node (updating to its own value is fine).
         self.check_unique(type_id, &properties, Some(rid))?;
 
+        // Capture the old property RID *before* the overwrite below drops it. `node` is mutated in
+        // place, so after line `node.property_ref = new_pref` the old RID is unrecoverable — and
+        // leaving it unfreed leaks the old value's pages on every update (O-4, A-2).
+        let old_pref = node.property_ref;
+
         let new_pref = if properties.is_empty() {
             None
         } else {
@@ -232,6 +237,12 @@ impl Database {
         // Keep the property index consistent: remove old value entries, add new ones.
         self.maintain_property_index(type_id, rid, &old_props, IndexOp::Remove)?;
         self.maintain_property_index(type_id, rid, &properties, IndexOp::Add)?;
+
+        // Reclaim the old property's space now that the new value is written and the index no
+        // longer needs the old bytes (it used the decoded `old_props`, not the RID).
+        if let Some(old) = old_pref {
+            PropertyStore::free(&mut self.file, old)?;
+        }
         Ok(())
     }
 
@@ -254,11 +265,31 @@ impl Database {
             .iter()
             .map(|e| e.id)
             .collect();
+        // Deduplicate the cascade: a self-loop edge (from == to) appears in *both* out_edges and
+        // in_edges, so without this it would be visited twice — and since A-2, the second visit
+        // reads the now-freed edge's stale property_ref (topology read_slot doesn't consult the
+        // used-bitmap) and double-frees its property (chain → StorageCorrupted, slotted → a
+        // free-list cycle). Visit each edge exactly once (M-1, review-2026-07-12d).
+        let mut seen = std::collections::HashSet::new();
         for eid in out_edges.into_iter().chain(in_edges) {
+            if !seen.insert(eid) {
+                continue;
+            }
+            // Reclaim each cascaded edge's property before freeing the edge itself (A-2); the
+            // topology delete_edge only frees the edge's slot, not its property pages.
+            if let Ok(edge) = self.topo.read_edge(&mut self.file, eid) {
+                if let Some(pref) = edge.property_ref {
+                    PropertyStore::free(&mut self.file, pref)?;
+                }
+            }
             self.topo.delete_edge(&mut self.file, eid)?;
         }
+        // Read the node record once: it yields both the primary type (for the index removal) and
+        // the property RID (for the space reclaim below) — no extra read path (O-1).
+        let node = self.topo.read_node(&mut self.file, rid)?;
+        let primary_type = node.node_type_id;
+        let node_pref = node.property_ref;
         // Remove the node's tier-2 property index entries (primary type's indexed fields).
-        let primary_type = self.topo.read_node(&mut self.file, rid)?.node_type_id;
         let props = self.get_node_properties_raw(rid)?;
         self.maintain_property_index(primary_type, rid, &props, IndexOp::Remove)?;
         // Remove the node from every label set it was registered under (primary + additional).
@@ -268,6 +299,10 @@ impl Database {
             for id in type_ids {
                 index.remove(id, rid)?;
             }
+        }
+        // Reclaim the node's own property space after the index no longer needs the bytes (A-2).
+        if let Some(pref) = node_pref {
+            PropertyStore::free(&mut self.file, pref)?;
         }
         self.topo.free_node(&mut self.file, rid)
     }
@@ -367,8 +402,14 @@ impl Database {
             Some(PropertyStore::write(&mut self.file, &properties)?)
         };
         let mut edge = self.topo.read_edge(&mut self.file, rid)?;
+        // Capture the old RID before overwriting so its space can be reclaimed, not leaked (O-4).
+        let old_pref = edge.property_ref;
         edge.property_ref = new_pref;
-        self.topo.write_edge(&mut self.file, &edge)
+        self.topo.write_edge(&mut self.file, &edge)?;
+        if let Some(old) = old_pref {
+            PropertyStore::free(&mut self.file, old)?;
+        }
+        Ok(())
     }
 
     /// Deletes an edge.
@@ -376,6 +417,10 @@ impl Database {
         let rid = rid.0;
         if !self.edge_exists_raw(rid) {
             return Err(GraphError::EdgeNotFound(format!("{:?}", rid)));
+        }
+        // Reclaim the edge's property space before freeing the topology slot (A-2, O-1).
+        if let Some(pref) = self.topo.read_edge(&mut self.file, rid)?.property_ref {
+            PropertyStore::free(&mut self.file, pref)?;
         }
         self.topo.delete_edge(&mut self.file, rid)
     }
@@ -3282,6 +3327,276 @@ mod tests {
         assert_eq!(db.count_nodes(None).unwrap(), 80);
     }
 
+    // ---- A-2: property-store space reclaim (design docs/review-request-2026-07-12a) ----
+
+    /// Helper: a property map whose serialized form is a few hundred bytes, so ~10 fit per slotted
+    /// page — big enough that reclaiming pages is observable, small enough to stay slotted.
+    fn midsize_props(tag: usize) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("v".to_string(), json!("y".repeat(300)));
+        m.insert("tag".to_string(), json!(tag));
+        m
+    }
+
+    /// Deleting nodes reclaims their property space: after deleting everything and re-inserting the
+    /// same volume, the property page count does not grow (freed pages are reused, not leaked).
+    #[test]
+    fn delete_reclaims_property_space() {
+        let (mut db, _) = make_db();
+        let mut rids = Vec::new();
+        for i in 0..200 {
+            rids.push(db.insert_node(1, midsize_props(i)).unwrap());
+        }
+        let pages_after_insert = db.file.header.property_dir_len;
+        for rid in &rids {
+            db.delete_node(*rid).unwrap();
+        }
+        // Re-insert the same volume; the reclaimed pages must be reused, not appended.
+        for i in 0..200 {
+            db.insert_node(1, midsize_props(i)).unwrap();
+        }
+        assert_eq!(
+            db.file.header.property_dir_len, pages_after_insert,
+            "re-insert after delete grew property pages — space was leaked, not reclaimed"
+        );
+    }
+
+    /// A large-blob property (multi-page chain) is reclaimed on delete: its logical pages return to
+    /// the free-list and are reused by the next large blob, keeping the page count stable.
+    #[test]
+    fn blob_chain_pages_return_to_free_list() {
+        let (mut db, _) = make_db();
+        let big = "z".repeat(PAGE_SIZE * 3);
+        let mut props = HashMap::new();
+        props.insert("blob".to_string(), json!(big.clone()));
+        let rid = db.insert_node(1, props.clone()).unwrap();
+        let pages_after = db.file.header.property_dir_len;
+        assert!(pages_after >= 3, "expected a multi-page chain");
+        db.delete_node(rid).unwrap();
+        // The next equally-large blob must reuse the freed chain pages, not append fresh ones.
+        db.insert_node(1, props).unwrap();
+        assert_eq!(
+            db.file.header.property_dir_len, pages_after,
+            "chain pages were not returned to the free-list"
+        );
+    }
+
+    /// Updating a node's properties frees the old value's space (O-4): repeated updates on the same
+    /// node do not grow the property page count without bound.
+    #[test]
+    fn update_frees_old_property() {
+        let (mut db, _) = make_db();
+        let rid = db.insert_node(1, midsize_props(0)).unwrap();
+        let pages_after_first = db.file.header.property_dir_len;
+        // Many updates; each writes a new value and must free the previous one.
+        for i in 1..100 {
+            db.update_node_properties(rid, midsize_props(i)).unwrap();
+        }
+        // Without O-4's fix this would grow ~1 page per few updates; with it the freed pages cycle.
+        assert!(
+            db.file.header.property_dir_len <= pages_after_first + 1,
+            "update leaked old property pages: {} started at {}",
+            db.file.header.property_dir_len,
+            pages_after_first
+        );
+        // The latest value is intact.
+        assert_eq!(db.get_node_properties(rid).unwrap(), midsize_props(99));
+    }
+
+    /// A freed logical page sits on the free-list carrying the FREE_PAGE_MARKER; the ordinary
+    /// allocator scan must skip it (it's not a live SlottedPage) — a normal insert while the page
+    /// is free must not land on it and clobber the free-list link. Then a pop claims it cleanly.
+    /// (Regression for the review-2026-07-12b Should-fix.)
+    #[test]
+    fn free_listed_page_is_skipped_then_reused_cleanly() {
+        let (mut db, _) = make_db();
+        // Fill one page's worth of midsize values, then delete them all so the page fully empties
+        // and is pushed onto the free-list.
+        let mut rids = Vec::new();
+        for i in 0..12 {
+            rids.push(db.insert_node(1, midsize_props(i)).unwrap());
+        }
+        let target_page = rids[0].0.page_id.0; // first property page
+        for rid in &rids {
+            db.delete_node(*rid).unwrap();
+        }
+        // The emptied page should now be the free-list head.
+        assert_eq!(
+            db.file.header.property_free_list_head, target_page,
+            "fully-emptied page should be on the free-list"
+        );
+        // The next property insert pops that page and reuses it — page count unchanged, and the
+        // value reads back correctly (no free-list-link corruption).
+        let pages_before = db.file.header.property_dir_len;
+        let reused = db.insert_node(1, midsize_props(999)).unwrap();
+        assert_eq!(
+            db.file.header.property_dir_len, pages_before,
+            "reused a free-listed page, so no new page"
+        );
+        assert_eq!(db.get_node_properties(reused).unwrap(), midsize_props(999));
+        // Free-list is now empty again (single freed page consumed).
+        assert_eq!(
+            db.file.header.property_free_list_head,
+            crate::storage::file::NO_FREE_PAGE
+        );
+    }
+
+    /// M-1 regression (review-2026-07-12d): deleting a node with a self-loop edge carrying a
+    /// **chain** (>4 KB) property must succeed. The self-loop appears in both out_edges and
+    /// in_edges; before the cascade dedup + free idempotence this double-freed the chain and failed
+    /// with StorageCorrupted(65535), leaving the node half-deleted.
+    #[test]
+    fn delete_node_with_self_loop_chain_property_reclaims() {
+        let (mut db, _) = make_db();
+        let n = db.insert_node(1, HashMap::new()).unwrap();
+        let mut props = HashMap::new();
+        props.insert("blob".to_string(), json!("z".repeat(PAGE_SIZE * 3)));
+        db.insert_edge(1, n, n, props).unwrap(); // self-loop with a chain property
+        let pages_with = db.file.header.property_dir_len;
+        assert!(pages_with >= 3, "expected a multi-page chain property");
+        // Must not error (was StorageCorrupted(65535) before the fix).
+        db.delete_node(n).unwrap();
+        assert!(!db.node_exists(n));
+        // The chain pages were reclaimed exactly once: a fresh equally-large blob reuses them.
+        let m = db.insert_node(1, HashMap::new()).unwrap();
+        let mut props2 = HashMap::new();
+        props2.insert("blob".to_string(), json!("w".repeat(PAGE_SIZE * 3)));
+        db.insert_edge(1, m, m, props2).unwrap();
+        assert!(
+            db.file.header.property_dir_len <= pages_with,
+            "self-loop chain pages were not reclaimed cleanly"
+        );
+    }
+
+    /// M-1 regression: same for a self-loop edge with a **slotted** (small) property. Before the
+    /// fix the second cascade visit pushed the emptied page onto the free-list twice (a cycle);
+    /// after the fix the free-list stays acyclic and later inserts read back correctly.
+    #[test]
+    fn delete_node_with_self_loop_slotted_property_keeps_free_list_acyclic() {
+        let (mut db, _) = make_db();
+        let n = db.insert_node(1, HashMap::new()).unwrap();
+        let mut props = HashMap::new();
+        props.insert("role".to_string(), json!("self"));
+        db.insert_edge(1, n, n, props).unwrap(); // self-loop with a slotted property
+        db.delete_node(n).unwrap();
+        assert!(!db.node_exists(n));
+        // Insert several fresh nodes with properties; if the free-list had a cycle, allocation would
+        // loop or reuse a page twice and corrupt reads. All must read back correctly.
+        for i in 0..20 {
+            let r = db.insert_node(1, midsize_props(i)).unwrap();
+            assert_eq!(db.get_node_properties(r).unwrap(), midsize_props(i));
+        }
+    }
+
+    /// T-2 (review-2026-07-12d): double-free where the page fully empties (so it's free-listed),
+    /// then free the same RID again — must be a no-op for both slotted and chain RIDs, not a second
+    /// free-list push.
+    #[test]
+    fn double_free_page_empty_is_a_noop() {
+        use crate::storage::value::PropertyStore;
+        let (mut db, _) = make_db();
+        // Slotted, sole value on its page → page empties and free-lists on first free.
+        let mut small = HashMap::new();
+        small.insert("v".to_string(), json!("only"));
+        let ps = PropertyStore::write(&mut db.file, &small).unwrap();
+        // Chain (>4 KB) → its own pages.
+        let mut big = HashMap::new();
+        big.insert("v".to_string(), json!("z".repeat(PAGE_SIZE * 2)));
+        let pc = PropertyStore::write(&mut db.file, &big).unwrap();
+
+        PropertyStore::free(&mut db.file, ps).unwrap();
+        PropertyStore::free(&mut db.file, ps).unwrap(); // no-op, no second push
+        PropertyStore::free(&mut db.file, pc).unwrap();
+        PropertyStore::free(&mut db.file, pc).unwrap(); // no-op, no StorageCorrupted
+
+        // The free-list is acyclic and usable: fresh writes read back correctly.
+        for i in 0..10 {
+            let r = PropertyStore::write(&mut db.file, &midsize_props(i)).unwrap();
+            let got: HashMap<String, Value> = PropertyStore::read(&mut db.file, r).unwrap();
+            assert_eq!(got, midsize_props(i));
+        }
+    }
+
+    /// Reading a property whose slot was freed (stale RID) yields PropertySlotFreed, distinct from
+    /// StorageCorrupted — freeing is an expected state, not corruption.
+    #[test]
+    fn read_freed_slot_is_property_slot_freed() {
+        use crate::storage::value::PropertyStore;
+        let (mut db, _) = make_db();
+        // A single small value on a slotted page, then free it directly and re-read the RID.
+        let mut props = HashMap::new();
+        props.insert("v".to_string(), json!("small"));
+        let pref = PropertyStore::write(&mut db.file, &props).unwrap();
+        PropertyStore::free(&mut db.file, pref).unwrap();
+        match PropertyStore::read(&mut db.file, pref) {
+            Err(GraphError::PropertySlotFreed) => {}
+            other => panic!("expected PropertySlotFreed, got {other:?}"),
+        }
+    }
+
+    /// Double-free of a property RID is an idempotent no-op (O-5), not an error or corruption.
+    #[test]
+    fn double_free_property_is_a_noop() {
+        use crate::storage::value::PropertyStore;
+        let (mut db, _) = make_db();
+        let mut a = HashMap::new();
+        a.insert("v".to_string(), json!("A"));
+        let mut b = HashMap::new();
+        b.insert("v".to_string(), json!("B"));
+        let pa = PropertyStore::write(&mut db.file, &a).unwrap();
+        let pb = PropertyStore::write(&mut db.file, &b).unwrap();
+        PropertyStore::free(&mut db.file, pa).unwrap();
+        // Second free of the same slot must not error, and must not touch the live neighbor `pb`.
+        PropertyStore::free(&mut db.file, pa).unwrap();
+        assert_eq!(PropertyStore::read(&mut db.file, pb).unwrap(), b);
+    }
+
+    /// Property reclaim rides the WAL: freeing inside a transaction reverts the free-list head (and
+    /// the freed bytes) on rollback, so the value is live again.
+    #[test]
+    fn free_reverts_on_rollback() {
+        use crate::storage::value::PropertyStore;
+        let (mut db, _) = make_db();
+        let mut props = HashMap::new();
+        props.insert("v".to_string(), json!("y".repeat(300)));
+        let pref = PropertyStore::write(&mut db.file, &props).unwrap();
+        db.flush().unwrap();
+        let head_before = db.file.header.property_free_list_head;
+
+        let snap = db.take_snapshot();
+        PropertyStore::free(&mut db.file, pref).unwrap();
+        assert_ne!(db.file.header.property_free_list_head, head_before);
+        db.restore_snapshot(snap);
+        // After rollback the free-list head is back and the value reads correctly again.
+        assert_eq!(db.file.header.property_free_list_head, head_before);
+        assert_eq!(PropertyStore::read(&mut db.file, pref).unwrap(), props);
+    }
+
+    /// Freed property space stays freed across flush+reopen: the free-list head persists in the
+    /// header, so a reopened DB reuses the page rather than appending.
+    #[test]
+    fn free_persists_across_reopen() {
+        let (mut db, path) = make_db();
+        let mut rids = Vec::new();
+        for i in 0..12 {
+            rids.push(db.insert_node(1, midsize_props(i)).unwrap());
+        }
+        for rid in &rids {
+            db.delete_node(*rid).unwrap();
+        }
+        let head = db.file.header.property_free_list_head;
+        let pages = db.file.header.property_dir_len;
+        assert_ne!(head, crate::storage::file::NO_FREE_PAGE);
+        db.flush().unwrap();
+        drop(db);
+
+        let mut db2 = Database::open(&path).unwrap();
+        assert_eq!(db2.file.header.property_free_list_head, head);
+        // A fresh insert reuses a freed page — property page count does not grow.
+        db2.insert_node(1, midsize_props(0)).unwrap();
+        assert!(db2.file.header.property_dir_len <= pages);
+    }
+
     #[test]
     fn insert_node_and_read_properties() {
         let (mut db, _) = make_db();
@@ -4027,6 +4342,68 @@ mod tests {
                 .unwrap();
                 prop_assert_eq!(by_scan, expected);
             }
+        }
+
+        /// A-2 invariant: under a random interleave of insert / delete / update, every live node's
+        /// properties always read back correctly, and the property page count stays bounded by the
+        /// *live* set — not the historical total. A space leak (freed property pages never reused)
+        /// would make the page count grow with total operations, unbounded by the live count.
+        #[test]
+        fn property_space_bounded_by_live_set_under_churn(
+            ops in proptest::collection::vec(0u8..3, 50..200usize),
+        ) {
+            let (mut db, _) = make_db();
+            // Model: live node rid -> the tag we last wrote (to verify reads).
+            let mut live: Vec<(NodeRid, usize)> = Vec::new();
+            let mut next_tag = 0usize;
+            let payload = |tag: usize| {
+                let mut m = HashMap::new();
+                m.insert("v".to_string(), json!("y".repeat(300)));
+                m.insert("tag".to_string(), json!(tag));
+                m
+            };
+            for op in ops {
+                match op {
+                    0 => {
+                        // insert
+                        let tag = next_tag;
+                        next_tag += 1;
+                        let rid = db.insert_node(1, payload(tag)).unwrap();
+                        live.push((rid, tag));
+                    }
+                    1 if !live.is_empty() => {
+                        // delete an arbitrary live node
+                        let idx = next_tag % live.len();
+                        let (rid, _) = live.remove(idx);
+                        db.delete_node(rid).unwrap();
+                    }
+                    2 if !live.is_empty() => {
+                        // update an arbitrary live node to a fresh value
+                        let idx = next_tag % live.len();
+                        let tag = next_tag;
+                        next_tag += 1;
+                        let (rid, _) = live[idx];
+                        db.update_node_properties(rid, payload(tag)).unwrap();
+                        live[idx] = (rid, tag);
+                    }
+                    _ => {}
+                }
+            }
+            // Every live node reads back the value last written to it.
+            for (rid, tag) in &live {
+                let got = db.get_node_properties(*rid).unwrap();
+                prop_assert_eq!(got.get("tag"), Some(&json!(*tag)));
+            }
+            // Property pages are bounded by the live set. Each ~330B value packs ~10/page, so the
+            // live set needs ~live/10 pages; allow generous slack for partial pages and the
+            // coarse (page-granular) reclaim, but far below the historical total (`next_tag`).
+            let prop_pages = db.file.header.property_dir_len as usize;
+            let bound = live.len() + 8; // pages can't exceed live values + slack; << total ops
+            prop_assert!(
+                prop_pages <= bound,
+                "property pages {} exceed live-set bound {} (live={}, total writes={})",
+                prop_pages, bound, live.len(), next_tag
+            );
         }
     }
 
