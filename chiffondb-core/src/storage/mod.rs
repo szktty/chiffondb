@@ -1,8 +1,11 @@
 pub mod buffer;
 pub mod file;
 pub mod index;
+pub mod label_index;
 pub mod page;
+pub mod page_directory;
 pub mod property;
+pub mod property_index;
 pub mod record;
 pub mod topology;
 pub mod value;

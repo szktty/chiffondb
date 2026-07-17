@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1147636775;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 382977258;
 
 // Section: executor
 
@@ -102,6 +102,61 @@ fn wire__chiffondb_core__api__Connection_add_edge_label_impl(
         },
     )
 }
+fn wire__chiffondb_core__api__Connection_add_edge_label_dynamic_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "Connection_add_edge_label_dynamic",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Connection>,
+            >>::sse_decode(&mut deserializer);
+            let api_rid = <chiffondb_core::api::RecordId>::sse_decode(&mut deserializer);
+            let api_type_name = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let mut api_that_guard = None;
+                    let decode_indices_ =
+                        flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                            flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                &api_that, 0, true,
+                            ),
+                        ]);
+                    for i in decode_indices_ {
+                        match i {
+                            0 => api_that_guard = Some(api_that.lockable_decode_sync_ref_mut()),
+                            _ => unreachable!(),
+                        }
+                    }
+                    let mut api_that_guard = api_that_guard.unwrap();
+                    let output_ok = chiffondb_core::api::Connection::add_edge_label_dynamic(
+                        &mut *api_that_guard,
+                        api_rid,
+                        api_type_name,
+                    )?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__chiffondb_core__api__Connection_add_node_label_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -147,6 +202,61 @@ fn wire__chiffondb_core__api__Connection_add_node_label_impl(
                     }
                     let mut api_that_guard = api_that_guard.unwrap();
                     let output_ok = chiffondb_core::api::Connection::add_node_label(
+                        &mut *api_that_guard,
+                        api_rid,
+                        api_type_name,
+                    )?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__chiffondb_core__api__Connection_add_node_label_dynamic_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "Connection_add_node_label_dynamic",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Connection>,
+            >>::sse_decode(&mut deserializer);
+            let api_rid = <chiffondb_core::api::RecordId>::sse_decode(&mut deserializer);
+            let api_type_name = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let mut api_that_guard = None;
+                    let decode_indices_ =
+                        flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                            flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                &api_that, 0, true,
+                            ),
+                        ]);
+                    for i in decode_indices_ {
+                        match i {
+                            0 => api_that_guard = Some(api_that.lockable_decode_sync_ref_mut()),
+                            _ => unreachable!(),
+                        }
+                    }
+                    let mut api_that_guard = api_that_guard.unwrap();
+                    let output_ok = chiffondb_core::api::Connection::add_node_label_dynamic(
                         &mut *api_that_guard,
                         api_rid,
                         api_type_name,
@@ -1496,6 +1606,64 @@ fn wire__chiffondb_core__api__Connection_insert_node_impl(
         },
     )
 }
+fn wire__chiffondb_core__api__Connection_insert_node_with_dynamic_labels_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "Connection_insert_node_with_dynamic_labels",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Connection>,
+            >>::sse_decode(&mut deserializer);
+            let api_primary_type = <String>::sse_decode(&mut deserializer);
+            let api_additional_labels = <Vec<String>>::sse_decode(&mut deserializer);
+            let api_props_json = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let mut api_that_guard = None;
+                    let decode_indices_ =
+                        flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                            flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                &api_that, 0, true,
+                            ),
+                        ]);
+                    for i in decode_indices_ {
+                        match i {
+                            0 => api_that_guard = Some(api_that.lockable_decode_sync_ref_mut()),
+                            _ => unreachable!(),
+                        }
+                    }
+                    let mut api_that_guard = api_that_guard.unwrap();
+                    let output_ok =
+                        chiffondb_core::api::Connection::insert_node_with_dynamic_labels(
+                            &mut *api_that_guard,
+                            api_primary_type,
+                            api_additional_labels,
+                            api_props_json,
+                        )?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__chiffondb_core__api__Connection_insert_node_with_labels_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -2494,9 +2662,16 @@ fn wire__chiffondb_core__api__Connection_verify_impl(
 
 #[allow(clippy::unnecessary_literal_unwrap)]
 const _: fn() = || {
-    let RecordId = None::<chiffondb_core::api::RecordId>.unwrap();
-    let _: u32 = RecordId.page;
-    let _: u16 = RecordId.slot;
+    {
+        let DynamicInsertResult = None::<chiffondb_core::api::DynamicInsertResult>.unwrap();
+        let _: chiffondb_core::api::RecordId = DynamicInsertResult.rid;
+        let _: String = DynamicInsertResult.assignments_json;
+    }
+    {
+        let RecordId = None::<chiffondb_core::api::RecordId>.unwrap();
+        let _: u32 = RecordId.page;
+        let _: u16 = RecordId.slot;
+    }
 };
 
 // Section: related_funcs
@@ -2539,6 +2714,18 @@ impl SseDecode for bool {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         deserializer.cursor.read_u8().unwrap() != 0
+    }
+}
+
+impl SseDecode for chiffondb_core::api::DynamicInsertResult {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_rid = <chiffondb_core::api::RecordId>::sse_decode(deserializer);
+        let mut var_assignmentsJson = <String>::sse_decode(deserializer);
+        return chiffondb_core::api::DynamicInsertResult {
+            rid: var_rid,
+            assignments_json: var_assignmentsJson,
+        };
     }
 }
 
@@ -2674,257 +2861,275 @@ fn pde_ffi_dispatcher_primary_impl(
             rust_vec_len,
             data_len,
         ),
-        2 => wire__chiffondb_core__api__Connection_add_node_label_impl(
+        2 => wire__chiffondb_core__api__Connection_add_edge_label_dynamic_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        3 => wire__chiffondb_core__api__Connection_apply_schema_impl(
+        3 => wire__chiffondb_core__api__Connection_add_node_label_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        4 => wire__chiffondb_core__api__Connection_begin_transaction_impl(
+        4 => wire__chiffondb_core__api__Connection_add_node_label_dynamic_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        5 => wire__chiffondb_core__api__Connection_close_impl(port, ptr, rust_vec_len, data_len),
-        6 => wire__chiffondb_core__api__Connection_commit_transaction_impl(
+        5 => wire__chiffondb_core__api__Connection_apply_schema_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        7 => wire__chiffondb_core__api__Connection_connecting_subgraph_impl(
+        6 => wire__chiffondb_core__api__Connection_begin_transaction_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        8 => wire__chiffondb_core__api__Connection_count_edges_impl(
+        7 => wire__chiffondb_core__api__Connection_close_impl(port, ptr, rust_vec_len, data_len),
+        8 => wire__chiffondb_core__api__Connection_commit_transaction_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        9 => wire__chiffondb_core__api__Connection_count_nodes_impl(
+        9 => wire__chiffondb_core__api__Connection_connecting_subgraph_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        10 => wire__chiffondb_core__api__Connection_create_impl(port, ptr, rust_vec_len, data_len),
-        11 => wire__chiffondb_core__api__Connection_create_with_max_memory_impl(
+        10 => wire__chiffondb_core__api__Connection_count_edges_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        12 => wire__chiffondb_core__api__Connection_delete_edge_impl(
+        11 => wire__chiffondb_core__api__Connection_count_nodes_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        13 => wire__chiffondb_core__api__Connection_delete_node_impl(
+        12 => wire__chiffondb_core__api__Connection_create_impl(port, ptr, rust_vec_len, data_len),
+        13 => wire__chiffondb_core__api__Connection_create_with_max_memory_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        14 => wire__chiffondb_core__api__Connection_edge_exists_impl(
+        14 => wire__chiffondb_core__api__Connection_delete_edge_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        15 => wire__chiffondb_core__api__Connection_edge_type_names_impl(
+        15 => wire__chiffondb_core__api__Connection_delete_node_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        16 => wire__chiffondb_core__api__Connection_edge_type_schema_impl(
+        16 => wire__chiffondb_core__api__Connection_edge_exists_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        17 => wire__chiffondb_core__api__Connection_execute_cypher_impl(
+        17 => wire__chiffondb_core__api__Connection_edge_type_names_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        18 => wire__chiffondb_core__api__Connection_execute_traversal_impl(
+        18 => wire__chiffondb_core__api__Connection_edge_type_schema_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        19 => wire__chiffondb_core__api__Connection_get_edge_endpoints_impl(
+        19 => wire__chiffondb_core__api__Connection_execute_cypher_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        20 => wire__chiffondb_core__api__Connection_get_edge_labels_impl(
+        20 => wire__chiffondb_core__api__Connection_execute_traversal_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        21 => wire__chiffondb_core__api__Connection_get_edge_properties_impl(
+        21 => wire__chiffondb_core__api__Connection_get_edge_endpoints_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        22 => wire__chiffondb_core__api__Connection_get_edge_type_name_impl(
+        22 => wire__chiffondb_core__api__Connection_get_edge_labels_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        23 => wire__chiffondb_core__api__Connection_get_node_labels_impl(
+        23 => wire__chiffondb_core__api__Connection_get_edge_properties_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        24 => wire__chiffondb_core__api__Connection_get_node_properties_impl(
+        24 => wire__chiffondb_core__api__Connection_get_edge_type_name_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        25 => wire__chiffondb_core__api__Connection_get_node_type_name_impl(
+        25 => wire__chiffondb_core__api__Connection_get_node_labels_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        26 => wire__chiffondb_core__api__Connection_get_schema_text_impl(
+        26 => wire__chiffondb_core__api__Connection_get_node_properties_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        27 => wire__chiffondb_core__api__Connection_insert_edge_impl(
+        27 => wire__chiffondb_core__api__Connection_get_node_type_name_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        28 => wire__chiffondb_core__api__Connection_insert_node_impl(
+        28 => wire__chiffondb_core__api__Connection_get_schema_text_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        29 => wire__chiffondb_core__api__Connection_insert_node_with_labels_impl(
+        29 => wire__chiffondb_core__api__Connection_insert_edge_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        30 => {
+        30 => wire__chiffondb_core__api__Connection_insert_node_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        31 => wire__chiffondb_core__api__Connection_insert_node_with_dynamic_labels_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        32 => wire__chiffondb_core__api__Connection_insert_node_with_labels_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        33 => {
             wire__chiffondb_core__api__Connection_list_edges_impl(port, ptr, rust_vec_len, data_len)
         }
-        31 => {
+        34 => {
             wire__chiffondb_core__api__Connection_list_nodes_impl(port, ptr, rust_vec_len, data_len)
         }
-        32 => wire__chiffondb_core__api__Connection_node_exists_impl(
+        35 => wire__chiffondb_core__api__Connection_node_exists_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        33 => wire__chiffondb_core__api__Connection_node_type_names_impl(
+        36 => wire__chiffondb_core__api__Connection_node_type_names_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        34 => wire__chiffondb_core__api__Connection_node_type_schema_impl(
+        37 => wire__chiffondb_core__api__Connection_node_type_schema_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        35 => wire__chiffondb_core__api__Connection_open_impl(port, ptr, rust_vec_len, data_len),
-        36 => wire__chiffondb_core__api__Connection_open_in_memory_impl(
+        38 => wire__chiffondb_core__api__Connection_open_impl(port, ptr, rust_vec_len, data_len),
+        39 => wire__chiffondb_core__api__Connection_open_in_memory_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        37 => wire__chiffondb_core__api__Connection_open_with_max_memory_impl(
+        40 => wire__chiffondb_core__api__Connection_open_with_max_memory_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        38 => wire__chiffondb_core__api__Connection_patch_edge_properties_impl(
+        41 => wire__chiffondb_core__api__Connection_patch_edge_properties_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        39 => wire__chiffondb_core__api__Connection_patch_node_properties_impl(
+        42 => wire__chiffondb_core__api__Connection_patch_node_properties_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        40 => wire__chiffondb_core__api__Connection_remove_edge_label_impl(
+        43 => wire__chiffondb_core__api__Connection_remove_edge_label_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        41 => wire__chiffondb_core__api__Connection_remove_node_label_impl(
+        44 => wire__chiffondb_core__api__Connection_remove_node_label_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        42 => wire__chiffondb_core__api__Connection_rollback_transaction_impl(
+        45 => wire__chiffondb_core__api__Connection_rollback_transaction_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        43 => wire__chiffondb_core__api__Connection_shortest_path_impl(
+        46 => wire__chiffondb_core__api__Connection_shortest_path_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        44 => wire__chiffondb_core__api__Connection_update_edge_properties_impl(
+        47 => wire__chiffondb_core__api__Connection_update_edge_properties_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        45 => wire__chiffondb_core__api__Connection_update_node_properties_impl(
+        48 => wire__chiffondb_core__api__Connection_update_node_properties_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        46 => wire__chiffondb_core__api__Connection_vacuum_impl(port, ptr, rust_vec_len, data_len),
-        47 => wire__chiffondb_core__api__Connection_vacuum_file_impl(
+        49 => wire__chiffondb_core__api__Connection_vacuum_impl(port, ptr, rust_vec_len, data_len),
+        50 => wire__chiffondb_core__api__Connection_vacuum_file_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        48 => wire__chiffondb_core__api__Connection_verify_impl(port, ptr, rust_vec_len, data_len),
+        51 => wire__chiffondb_core__api__Connection_verify_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2958,6 +3163,27 @@ impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<Connection>> for Connection {
     }
 }
 
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for FrbWrapper<chiffondb_core::api::DynamicInsertResult> {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.0.rid.into_into_dart().into_dart(),
+            self.0.assignments_json.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for FrbWrapper<chiffondb_core::api::DynamicInsertResult>
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<chiffondb_core::api::DynamicInsertResult>>
+    for chiffondb_core::api::DynamicInsertResult
+{
+    fn into_into_dart(self) -> FrbWrapper<chiffondb_core::api::DynamicInsertResult> {
+        self.into()
+    }
+}
 // Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for FrbWrapper<chiffondb_core::api::RecordId> {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
@@ -3009,6 +3235,14 @@ impl SseEncode for bool {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         serializer.cursor.write_u8(self as _).unwrap();
+    }
+}
+
+impl SseEncode for chiffondb_core::api::DynamicInsertResult {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <chiffondb_core::api::RecordId>::sse_encode(self.rid, serializer);
+        <String>::sse_encode(self.assignments_json, serializer);
     }
 }
 

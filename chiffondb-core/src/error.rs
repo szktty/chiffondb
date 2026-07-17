@@ -8,20 +8,18 @@ pub enum GraphError {
     SchemaError(String),
     #[error("Storage corrupted at page {0}")]
     StorageCorrupted(u32),
+    #[error("Property slot has been freed")]
+    PropertySlotFreed,
     #[error("Unsupported file format version: found {found}, supported {supported}")]
     UnsupportedVersion { found: u32, supported: u32 },
-    #[error("Topology segment capacity exceeded: {kind} needs {needed} pages but only {available} are available")]
-    CapacityExceeded {
-        kind: &'static str,
-        needed: usize,
-        available: usize,
-    },
     #[error("Invalid traversal command: {0}")]
     InvalidCommand(String),
     #[error("Type mismatch: expected {expected}, got {actual}")]
     TypeMismatch { expected: String, actual: String },
     #[error("Validation error: {0}")]
     ValidationError(String),
+    #[error("Unique constraint violation on '{field}': value {value} already exists")]
+    UniqueViolation { field: String, value: String },
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

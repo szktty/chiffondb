@@ -1,0 +1,56 @@
+# triad project allowlist (design §4.2). Commands here are auto-approved by the L2 gate;
+# anything not listed and not a built-in safe command escalates to the user. Built-in
+# deny rules (destructive git) and safe rules (read-only git, ls/cat) are fixed and not
+# configured here.
+#
+# ChiffonDB's Rust review toolchain, matching docs/review-process.md's verification step.
+
+[[allow]]
+command = "cargo"
+subcommands = ["test"]
+
+[[allow]]
+command = "cargo"
+subcommands = ["clippy"]
+
+[[allow]]
+command = "cargo"
+subcommands = ["fmt"]
+
+[[allow]]
+command = "cargo"
+subcommands = ["build"]
+
+# Non-destructive git subcommands a worker/reviewer needs.
+#
+# Deliberately NOT allowed (they bypass the fixed builtin denylist, which only catches specific
+# destructive *variants*, not the whole subcommand):
+#   - `git checkout`: the builtin denylist only matches the `--` form (`checkout -- <path>`), but
+#     `git checkout <ref> <path>` without `--` discards uncommitted changes just the same and would
+#     fall through to "allowed". Use `git switch` for branch changes (below), which does not have
+#     this bypass. (Review 2026-07-11a M-1.)
+#   - `git rm`: not in the builtin denylist at all, so allowlisting it would permit deleting
+#     working-tree files with no destructive guard. Removals go through explicit escalation.
+[[allow]]
+command = "git"
+subcommands = ["branch"]
+
+[[allow]]
+command = "git"
+subcommands = ["switch"]
+
+[[allow]]
+command = "git"
+subcommands = ["merge"]
+
+[[allow]]
+command = "git"
+subcommands = ["ls-files"]
+
+[[allow]]
+command = "git"
+subcommands = ["rev-list"]
+
+[[allow]]
+command = "git"
+subcommands = ["merge-base"]

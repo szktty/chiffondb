@@ -156,6 +156,10 @@ cargo clippy -- -D warnings
 
 - [Architecture](ARCHITECTURE.md) — storage layout, record format, durability/concurrency model
 
+## Author
+
+SUZUKI Tetsuya <tetsuya.suzuki@gmail.com>
+
 ## License
 
 [Apache License 2.0](LICENSE)

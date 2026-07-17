@@ -78,9 +78,67 @@ impl Default for TraversalStep {
     }
 }
 
+/// A property accessor: either a flat top-level key or a path into a nested `Json` value.
+///
+/// Serialized untagged so existing flat-string JSON keeps working: a bare string
+/// (`"name"`) deserializes to `Flat`, an object (`{"path":["props","name"]}`) to `Path`.
+/// `Path` resolution only reaches nested *scalar* values (it walks `Value::Object`
+/// levels); array indexing and JSON containment are out of scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PropertyPath {
+    /// Top-level property key (backward-compatible plain string).
+    Flat(String),
+    /// Path into a nested object value.
+    Path { path: Vec<String> },
+}
+
+impl PropertyPath {
+    /// Resolves the path against a property map, returning the referenced value if present.
+    /// Walks nested objects for `Path`; returns `None` if any segment is missing or a
+    /// non-object is reached before the final segment.
+    pub fn resolve<'a>(
+        &self,
+        props: &'a std::collections::HashMap<String, serde_json::Value>,
+    ) -> Option<&'a serde_json::Value> {
+        match self {
+            PropertyPath::Flat(key) => props.get(key),
+            PropertyPath::Path { path } => {
+                let (first, rest) = path.split_first()?;
+                let mut current = props.get(first)?;
+                for segment in rest {
+                    current = current.as_object()?.get(segment)?;
+                }
+                Some(current)
+            }
+        }
+    }
+
+    /// A human-readable name for this path, used as a default output key.
+    /// `Flat` is the key itself; `Path` joins segments with `.`.
+    pub fn display_name(&self) -> String {
+        match self {
+            PropertyPath::Flat(key) => key.clone(),
+            PropertyPath::Path { path } => path.join("."),
+        }
+    }
+}
+
+impl From<&str> for PropertyPath {
+    fn from(s: &str) -> Self {
+        PropertyPath::Flat(s.to_string())
+    }
+}
+
+impl From<String> for PropertyPath {
+    fn from(s: String) -> Self {
+        PropertyPath::Flat(s)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrderBySpec {
-    pub key: String,
+    pub key: PropertyPath,
     pub direction: SortDirection,
 }
 
@@ -120,9 +178,10 @@ pub enum FilterValue {
         bind: String,
     },
     /// Reference to another property on the same node/edge: `{ "type": "property", "key": "minAge" }` form.
+    /// `key` accepts the same path forms as `Filter.property`.
     PropertyRef {
         r#type: PropertyRefMarker,
-        key: String,
+        key: PropertyPath,
     },
     /// Fixed literal value (fallback when other variants do not match).
     Literal(serde_json::Value),
@@ -147,7 +206,9 @@ impl FilterValue {
     ) -> Option<std::borrow::Cow<'a, serde_json::Value>> {
         match self {
             FilterValue::Literal(v) => Some(std::borrow::Cow::Borrowed(v)),
-            FilterValue::PropertyRef { key, .. } => props?.get(key).map(std::borrow::Cow::Borrowed),
+            FilterValue::PropertyRef { key, .. } => {
+                key.resolve(props?).map(std::borrow::Cow::Borrowed)
+            }
             FilterValue::Binding { bind } => bindings.get(bind).map(std::borrow::Cow::Borrowed),
         }
     }
@@ -173,7 +234,7 @@ pub fn resolve_binding<'a>(
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Filter {
-    pub property: String,
+    pub property: PropertyPath,
     pub operator: FilterOperator,
     #[serde(default = "default_filter_value")]
     pub value: FilterValue,
@@ -297,7 +358,7 @@ pub struct AggregateFunction {
     pub func: AggregateFn,
     /// Property key to aggregate. Not required for `Count`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub property: Option<String>,
+    pub property: Option<PropertyPath>,
     /// Output key in the result map. Defaults to `func_property` (e.g. `sum_score`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
@@ -309,7 +370,7 @@ impl AggregateFunction {
             return alias.clone();
         }
         match &self.property {
-            Some(p) => format!("{}_{}", self.func.as_str(), p),
+            Some(p) => format!("{}_{}", self.func.as_str(), p.display_name()),
             None => self.func.as_str().to_string(),
         }
     }
@@ -342,9 +403,9 @@ impl AggregateFn {
 #[serde(tag = "source")]
 pub enum GroupByKey {
     /// Group by a node property.
-    Node { property: String },
+    Node { property: PropertyPath },
     /// Group by a property of the connecting edge.
-    Edge { property: String },
+    Edge { property: PropertyPath },
 }
 
 /// The kind of traversal result.
@@ -368,6 +429,7 @@ pub enum CollectResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn deserialize_nodes_collect() {
@@ -474,5 +536,88 @@ mod tests {
             alias: Some("avg".into()),
         };
         assert_eq!(f.output_key(), "avg");
+    }
+
+    #[test]
+    fn property_path_serde_roundtrip() {
+        // Bare string deserializes to Flat (backward compatible).
+        let flat: PropertyPath = serde_json::from_str(r#""name""#).unwrap();
+        assert_eq!(flat, PropertyPath::Flat("name".to_string()));
+        assert_eq!(serde_json::to_string(&flat).unwrap(), r#""name""#);
+
+        // Object with `path` deserializes to Path.
+        let path: PropertyPath = serde_json::from_str(r#"{"path":["props","name"]}"#).unwrap();
+        assert_eq!(
+            path,
+            PropertyPath::Path {
+                path: vec!["props".to_string(), "name".to_string()]
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&path).unwrap(),
+            r#"{"path":["props","name"]}"#
+        );
+    }
+
+    #[test]
+    fn property_path_resolve() {
+        use std::collections::HashMap;
+        let props: HashMap<String, serde_json::Value> = HashMap::from([
+            ("name".to_string(), json!("Alice")),
+            (
+                "props".to_string(),
+                json!({"year": 1867, "addr": {"city": "Kyoto"}}),
+            ),
+        ]);
+
+        // Flat resolves top-level.
+        assert_eq!(
+            PropertyPath::from("name").resolve(&props),
+            Some(&json!("Alice"))
+        );
+        // Path resolves nested scalar.
+        let p = PropertyPath::Path {
+            path: vec!["props".to_string(), "year".to_string()],
+        };
+        assert_eq!(p.resolve(&props), Some(&json!(1867)));
+        // Deeply nested.
+        let p = PropertyPath::Path {
+            path: vec!["props".to_string(), "addr".to_string(), "city".to_string()],
+        };
+        assert_eq!(p.resolve(&props), Some(&json!("Kyoto")));
+        // Missing segment returns None.
+        let p = PropertyPath::Path {
+            path: vec!["props".to_string(), "missing".to_string()],
+        };
+        assert_eq!(p.resolve(&props), None);
+        // Non-object before final segment returns None.
+        let p = PropertyPath::Path {
+            path: vec!["name".to_string(), "x".to_string()],
+        };
+        assert_eq!(p.resolve(&props), None);
+    }
+
+    #[test]
+    fn filter_deserializes_nested_path_property() {
+        let json = r#"{
+            "version": 1,
+            "start": { "type": "AllNodes", "label": "Entity", "key": "", "value": null },
+            "steps": [
+                { "action": "Filter", "label": "Entity", "filter": {
+                    "property": {"path": ["props", "year"]},
+                    "operator": "Equals",
+                    "value": 1867
+                }}
+            ],
+            "collect": { "type": "Count" }
+        }"#;
+        let cmd: TraversalCommand = serde_json::from_str(json).unwrap();
+        let f = cmd.steps[0].filter.as_ref().unwrap();
+        assert_eq!(
+            f.property,
+            PropertyPath::Path {
+                path: vec!["props".to_string(), "year".to_string()]
+            }
+        );
     }
 }

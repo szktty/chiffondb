@@ -8,16 +8,28 @@ use serde_json::Value;
 use crate::error::GraphError;
 use crate::pathfinding::{ConnectingSubgraph, PathOptions, PathResult, PathfindingEngine};
 use crate::schema::registry::SchemaRegistry;
-use crate::schema::store::load_schema;
+use crate::schema::store::{load_schema, register_dynamic_type, DynamicTypeKind};
 use crate::storage::file::{DatabaseFile, FileSnapshot, OpenOptions};
 use crate::storage::index;
+use crate::storage::label_index::LabelIndex;
 use crate::storage::page::{EdgeRid, NodeRid, RecordId};
+use crate::storage::property_index::{IndexKey, PropertyIndex};
 use crate::storage::topology::TopologyStore;
-use crate::storage::value::{decode_label_list, encode_label_list, PropertyStore};
+use crate::storage::value::{decode_label_list, encode_label_list, encode_value, PropertyStore};
+use crate::traversal::command::PropertyPath;
 use crate::traversal::executor::{EdgeId, GraphAccess, NodeId};
 
 pub type NodeList = Vec<(NodeRid, HashMap<String, Value>)>;
 pub type EdgeList = Vec<(EdgeRid, HashMap<String, Value>)>;
+
+/// The result of resolving a label name: its type id and whether the registration was
+/// newly created (`true`) or already existed (`false`).
+/// `Serialize` so the FFI layer can return it as a JSON object string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct LabelAssignment {
+    pub id: u16,
+    pub created: bool,
+}
 
 pub(crate) struct DbSnapshot {
     pub(crate) topo: TopologyStore,
@@ -42,34 +54,21 @@ impl Database {
     /// Creates a new database file with the given options (e.g. memory budget).
     pub fn create_with_options(path: &Path, opts: &OpenOptions) -> Result<Self, GraphError> {
         let mut file = DatabaseFile::create_with_options(path, opts)?;
-        // Pre-allocate the topology segment (pages 1..prop_start-1) with zero pages
-        // so that PropertyStore only writes at prop_start and beyond.
-        let prop_start = file.header.property_segment_start;
-        let current = file.page_count()?;
-        let empty = [0u8; crate::storage::page::PAGE_SIZE];
-        for _ in current..prop_start {
-            file.append_page(&empty)?;
-        }
-        let topo_start = file.header.topology_segment_start;
+        // Topology, property, and directory pages now grow on the append tail and resolve
+        // through page directories (no fixed segment), so there is nothing to pre-allocate.
         file.flush()?;
         Ok(Self {
             file,
-            topo: TopologyStore::new(topo_start, prop_start),
+            topo: TopologyStore::new(),
         })
     }
 
     /// Creates an in-memory database. Operates entirely in memory without any files.
     pub fn open_in_memory() -> Result<Self, GraphError> {
-        let mut file = DatabaseFile::create_in_memory()?;
-        let prop_start = file.header.property_segment_start;
-        let topo_start = file.header.topology_segment_start;
-        let empty = [0u8; crate::storage::page::PAGE_SIZE];
-        for _ in 1..prop_start {
-            file.append_page(&empty)?;
-        }
+        let file = DatabaseFile::create_in_memory()?;
         Ok(Self {
             file,
-            topo: TopologyStore::new(topo_start, prop_start),
+            topo: TopologyStore::new(),
         })
     }
 
@@ -79,21 +78,14 @@ impl Database {
     }
 
     /// Opens an existing database with the given options (e.g. memory budget).
-    /// Restores the topology segment metadata from the header.
+    /// Topology state (directory roots + logical page counts) lives entirely in the header,
+    /// so the stateless `TopologyStore` needs nothing to restore.
     pub fn open_with_options(path: &Path, opts: &OpenOptions) -> Result<Self, GraphError> {
         let file = DatabaseFile::open_with_options(path, opts)?;
-
-        let topo_start = file.header.topology_segment_start;
-        let prop_start = file.header.property_segment_start;
-
-        // Logical page counts come from the header (persisted at flush), not inferred from
-        // the pre-allocated segment width — otherwise reopen would always restore the
-        // segment-wide maximum and make scans walk the whole segment.
-        let node_pages = file.header.node_page_count as usize;
-        let edge_pages = file.header.edge_page_count as usize;
-        let topo = TopologyStore::with_counts(topo_start, prop_start, node_pages, edge_pages);
-
-        Ok(Self { file, topo })
+        Ok(Self {
+            file,
+            topo: TopologyStore::new(),
+        })
     }
 
     /// Returns `(resident_pages, capacity)` of the page cache for the file backend,
@@ -147,6 +139,9 @@ impl Database {
         type_id: u16,
         properties: HashMap<String, Value>,
     ) -> Result<NodeRid, GraphError> {
+        // Enforce @unique before writing anything, so a rejected insert leaves the DB unchanged.
+        self.check_unique(type_id, &properties, None)?;
+
         let prop_ref = if properties.is_empty() {
             None
         } else {
@@ -159,6 +154,10 @@ impl Database {
             node.property_ref = Some(pref);
             self.topo.write_node(&mut self.file, &node)?;
         }
+        // Register the node under its primary type in the tier-1 label index.
+        LabelIndex::new(&mut self.file).add(type_id, rid)?;
+        // Maintain tier-2 property indexes declared on this (primary) type.
+        self.maintain_property_index(type_id, rid, &properties, IndexOp::Add)?;
         Ok(NodeRid(rid))
     }
 
@@ -214,6 +213,19 @@ impl Database {
             Err(GraphError::SchemaError(_)) => {}
             Err(e) => return Err(e),
         }
+        // Read the node's *old* properties before overwriting, so the tier-2 index can drop the
+        // stale value entries and add the new ones.
+        let type_id = node.node_type_id;
+        let old_props = self.get_node_properties_raw(rid)?;
+
+        // Enforce @unique before writing, excluding this node (updating to its own value is fine).
+        self.check_unique(type_id, &properties, Some(rid))?;
+
+        // Capture the old property RID *before* the overwrite below drops it. `node` is mutated in
+        // place, so after line `node.property_ref = new_pref` the old RID is unrecoverable — and
+        // leaving it unfreed leaks the old value's pages on every update (O-4, A-2).
+        let old_pref = node.property_ref;
+
         let new_pref = if properties.is_empty() {
             None
         } else {
@@ -221,6 +233,16 @@ impl Database {
         };
         node.property_ref = new_pref;
         self.topo.write_node(&mut self.file, &node)?;
+
+        // Keep the property index consistent: remove old value entries, add new ones.
+        self.maintain_property_index(type_id, rid, &old_props, IndexOp::Remove)?;
+        self.maintain_property_index(type_id, rid, &properties, IndexOp::Add)?;
+
+        // Reclaim the old property's space now that the new value is written and the index no
+        // longer needs the old bytes (it used the decoded `old_props`, not the RID).
+        if let Some(old) = old_pref {
+            PropertyStore::free(&mut self.file, old)?;
+        }
         Ok(())
     }
 
@@ -243,8 +265,44 @@ impl Database {
             .iter()
             .map(|e| e.id)
             .collect();
+        // Deduplicate the cascade: a self-loop edge (from == to) appears in *both* out_edges and
+        // in_edges, so without this it would be visited twice — and since A-2, the second visit
+        // reads the now-freed edge's stale property_ref (topology read_slot doesn't consult the
+        // used-bitmap) and double-frees its property (chain → StorageCorrupted, slotted → a
+        // free-list cycle). Visit each edge exactly once (M-1, review-2026-07-12d).
+        let mut seen = std::collections::HashSet::new();
         for eid in out_edges.into_iter().chain(in_edges) {
+            if !seen.insert(eid) {
+                continue;
+            }
+            // Reclaim each cascaded edge's property before freeing the edge itself (A-2); the
+            // topology delete_edge only frees the edge's slot, not its property pages.
+            if let Ok(edge) = self.topo.read_edge(&mut self.file, eid) {
+                if let Some(pref) = edge.property_ref {
+                    PropertyStore::free(&mut self.file, pref)?;
+                }
+            }
             self.topo.delete_edge(&mut self.file, eid)?;
+        }
+        // Read the node record once: it yields both the primary type (for the index removal) and
+        // the property RID (for the space reclaim below) — no extra read path (O-1).
+        let node = self.topo.read_node(&mut self.file, rid)?;
+        let primary_type = node.node_type_id;
+        let node_pref = node.property_ref;
+        // Remove the node's tier-2 property index entries (primary type's indexed fields).
+        let props = self.get_node_properties_raw(rid)?;
+        self.maintain_property_index(primary_type, rid, &props, IndexOp::Remove)?;
+        // Remove the node from every label set it was registered under (primary + additional).
+        let type_ids = self.get_node_type_ids(NodeRid(rid))?;
+        {
+            let mut index = LabelIndex::new(&mut self.file);
+            for id in type_ids {
+                index.remove(id, rid)?;
+            }
+        }
+        // Reclaim the node's own property space after the index no longer needs the bytes (A-2).
+        if let Some(pref) = node_pref {
+            PropertyStore::free(&mut self.file, pref)?;
         }
         self.topo.free_node(&mut self.file, rid)
     }
@@ -261,6 +319,14 @@ impl Database {
     ) -> Result<EdgeRid, GraphError> {
         let from = from.0;
         let to = to.0;
+        // Validate endpoints before writing: an unchecked freed/invalid NodeRid would later have
+        // its adjacency list rewritten, silently corrupting an unrelated live node.
+        if !self.node_exists_raw(from) {
+            return Err(GraphError::NodeNotFound(format!("edge from {from:?}")));
+        }
+        if !self.node_exists_raw(to) {
+            return Err(GraphError::NodeNotFound(format!("edge to {to:?}")));
+        }
         let prop_ref = if properties.is_empty() {
             None
         } else {
@@ -336,8 +402,14 @@ impl Database {
             Some(PropertyStore::write(&mut self.file, &properties)?)
         };
         let mut edge = self.topo.read_edge(&mut self.file, rid)?;
+        // Capture the old RID before overwriting so its space can be reclaimed, not leaked (O-4).
+        let old_pref = edge.property_ref;
         edge.property_ref = new_pref;
-        self.topo.write_edge(&mut self.file, &edge)
+        self.topo.write_edge(&mut self.file, &edge)?;
+        if let Some(old) = old_pref {
+            PropertyStore::free(&mut self.file, old)?;
+        }
+        Ok(())
     }
 
     /// Deletes an edge.
@@ -345,6 +417,10 @@ impl Database {
         let rid = rid.0;
         if !self.edge_exists_raw(rid) {
             return Err(GraphError::EdgeNotFound(format!("{:?}", rid)));
+        }
+        // Reclaim the edge's property space before freeing the topology slot (A-2, O-1).
+        if let Some(pref) = self.topo.read_edge(&mut self.file, rid)?.property_ref {
+            PropertyStore::free(&mut self.file, pref)?;
         }
         self.topo.delete_edge(&mut self.file, rid)
     }
@@ -417,6 +493,151 @@ impl Database {
     pub fn load_schema_registry(&mut self) -> Result<SchemaRegistry, GraphError> {
         let (nodes, edges) = crate::schema::store::load_type_assignments(&mut self.file)?;
         Ok(SchemaRegistry::from_assignments(&nodes, &edges))
+    }
+
+    /// Returns the indexed paths of node type `type_id` as `(PropertyPath, unique)` pairs. A field
+    /// is index-maintained if it is `@index` **or** `@unique` (a unique field is also indexed, so
+    /// its value is queryable); `unique` marks the ones the constraint is enforced on. Empty when
+    /// there is no schema or no annotated field.
+    fn indexed_paths_for_type(&mut self, type_id: u16) -> Vec<(PropertyPath, bool)> {
+        let ast = match load_schema(&mut self.file) {
+            Ok(ast) => ast,
+            Err(_) => return Vec::new(),
+        };
+        let type_name = match self.load_schema_registry() {
+            Ok(reg) => match reg.node_type_name(type_id) {
+                Some(name) => name.to_string(),
+                None => return Vec::new(),
+            },
+            Err(_) => return Vec::new(),
+        };
+        ast.definitions
+            .iter()
+            .find_map(|d| match d {
+                crate::schema::ast::Definition::Node(n) if n.name == type_name => Some(n),
+                _ => None,
+            })
+            .map(|n| {
+                n.fields
+                    .iter()
+                    .filter(|f| f.indexed || f.unique)
+                    .map(|f| (PropertyPath::Flat(f.name.clone()), f.unique))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Applies `op` (add/remove) to the tier-2 property index for every indexed path of `type_id`
+    /// that resolves to a scalar in `props`. Non-scalar / missing values are skipped (partial
+    /// index). Shared by insert / update / delete so no write path bypasses the index.
+    fn maintain_property_index(
+        &mut self,
+        type_id: u16,
+        rid: RecordId,
+        props: &HashMap<String, Value>,
+        op: IndexOp,
+    ) -> Result<(), GraphError> {
+        let paths = self.indexed_paths_for_type(type_id);
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut index = PropertyIndex::new(&mut self.file);
+        for (path, _unique) in paths {
+            let value = match path.resolve(props) {
+                Some(v) if is_indexable_value(v) => v,
+                _ => continue, // missing or non-scalar → excluded (partial index)
+            };
+            let value_bytes = encode_value(value)?;
+            let key = IndexKey::new(type_id, &path.display_name(), &value_bytes);
+            match op {
+                IndexOp::Add => index.add(key, rid)?,
+                IndexOp::Remove => index.remove(key, rid)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforces `@unique` constraints for `type_id` against `props` **before** the value is
+    /// persisted. For each unique `(type, path)` whose value is a scalar, if a *different* live
+    /// node already holds that value, returns `UniqueViolation`. `exclude` is the node being
+    /// updated (its own current entry must not count as a conflict); `None` for a fresh insert.
+    /// Missing / non-scalar values are unconstrained (partial semantics, like the index).
+    fn check_unique(
+        &mut self,
+        type_id: u16,
+        props: &HashMap<String, Value>,
+        exclude: Option<RecordId>,
+    ) -> Result<(), GraphError> {
+        let unique_paths: Vec<PropertyPath> = self
+            .indexed_paths_for_type(type_id)
+            .into_iter()
+            .filter_map(|(p, unique)| unique.then_some(p))
+            .collect();
+        for path in unique_paths {
+            let value = match path.resolve(props) {
+                Some(v) if is_indexable_value(v) => v.clone(),
+                _ => continue,
+            };
+            // The index-backed find already confirms candidates against real values.
+            let existing = self.find_all_nodes(type_id, &path, &value)?;
+            if existing.iter().any(|&rid| Some(rid) != exclude) {
+                return Err(GraphError::UniqueViolation {
+                    field: path.display_name(),
+                    value: value.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether type `type_id` has a tier-2 index on `path`.
+    fn is_path_indexed(&mut self, type_id: u16, path: &PropertyPath) -> bool {
+        self.indexed_paths_for_type(type_id)
+            .iter()
+            .any(|(p, _)| p == path)
+    }
+
+    /// Finds all nodes of `type_id` whose `path` equals `value`, using the tier-2 index when the
+    /// path is indexed (confirming candidates against real values) and falling back to a scan
+    /// otherwise. This is the minimal planner (design §11.2 / implement-request Phase 5).
+    pub fn find_all_nodes(
+        &mut self,
+        type_id: u16,
+        path: &PropertyPath,
+        value: &Value,
+    ) -> Result<Vec<RecordId>, GraphError> {
+        if !self.is_path_indexed(type_id, path) {
+            return index::find_all(&self.topo, &mut self.file, type_id, path, value);
+        }
+        let value_bytes = encode_value(value)?;
+        let key = IndexKey::new(type_id, &path.display_name(), &value_bytes);
+        let candidates = PropertyIndex::new(&mut self.file).candidates(key)?;
+        let mut out = Vec::new();
+        for rid in candidates {
+            // Confirm each candidate: hash collisions can surface a few non-matching rids.
+            let props = self.get_node_properties_raw(rid)?;
+            if path.resolve(&props).is_some_and(|v| v == value) {
+                out.push(rid);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Finds the first node of `type_id` whose `path` equals `value` (index-routed like
+    /// `find_all_nodes`).
+    pub fn find_node(
+        &mut self,
+        type_id: u16,
+        path: &PropertyPath,
+        value: &Value,
+    ) -> Result<Option<RecordId>, GraphError> {
+        if !self.is_path_indexed(type_id, path) {
+            return index::find(&self.topo, &mut self.file, type_id, path, value);
+        }
+        Ok(self
+            .find_all_nodes(type_id, path, value)?
+            .into_iter()
+            .next())
     }
 
     /// Returns the schema stored in the database as DSL source text.
@@ -541,6 +762,25 @@ impl Database {
         self.add_edge_label(rid, type_id)
     }
 
+    /// Adds an additional label to an edge by type name, registering the name dynamically
+    /// if unknown. Lets an app attach user-defined edge kinds on top of a fixed edge type
+    /// (whose from/to constraints stay schema-defined) without growing the schema.
+    pub fn add_edge_label_dynamic(
+        &mut self,
+        rid: EdgeRid,
+        type_name: &str,
+    ) -> Result<LabelAssignment, GraphError> {
+        let a = if let Some(id) = self.load_schema_registry()?.edge_type_id(type_name) {
+            LabelAssignment { id, created: false }
+        } else {
+            let (id, created) =
+                register_dynamic_type(&mut self.file, DynamicTypeKind::Edge, type_name)?;
+            LabelAssignment { id, created }
+        };
+        self.add_edge_label(rid, a.id)?;
+        Ok(a)
+    }
+
     /// Removes a label from an edge by type name.
     pub fn remove_edge_label_by_name(
         &mut self,
@@ -554,16 +794,29 @@ impl Database {
         self.remove_edge_label(rid, type_id)
     }
 
+    /// Writes the additional label list to the property page and updates label_ref.
+    ///
+    /// Normalizes the list to a set before persisting: the primary edge_type_id is excluded
+    /// and duplicates are dropped (first occurrence wins, preserving input order). This is the
+    /// single write-through point for an edge's additional labels, so all callers share the
+    /// invariant that they never repeat or shadow the primary edge type. Mirrors the node-side
+    /// `set_additional_labels`.
     fn set_edge_additional_labels(
         &mut self,
         rid: RecordId,
         labels: &[u16],
     ) -> Result<(), GraphError> {
         let mut edge = self.topo.read_edge(&mut self.file, rid)?;
-        if labels.is_empty() {
+        let mut normalized = Vec::with_capacity(labels.len());
+        for &id in labels {
+            if id != edge.edge_type_id && !normalized.contains(&id) {
+                normalized.push(id);
+            }
+        }
+        if normalized.is_empty() {
             edge.label_ref = None;
         } else {
-            let bytes = encode_label_list(labels)?;
+            let bytes = encode_label_list(&normalized)?;
             let lref = PropertyStore::write_raw(&mut self.file, &bytes)?;
             edge.label_ref = Some(lref);
         }
@@ -750,6 +1003,8 @@ impl Database {
     }
 
     /// Inserts a node with multiple labels specified by type names.
+    /// Every label must already exist in the schema; an unknown name is an error.
+    /// For apps that grow labels dynamically, use `insert_node_with_dynamic_labels`.
     pub fn insert_node_with_label_names(
         &mut self,
         primary_type_name: &str,
@@ -771,13 +1026,89 @@ impl Database {
         self.insert_node_with_labels(primary_id, additional_ids, properties)
     }
 
+    /// Resolves a node type name to an id, registering it dynamically if unknown.
+    /// Returns the id and whether it was newly created.
+    fn resolve_or_register_node_type(&mut self, name: &str) -> Result<LabelAssignment, GraphError> {
+        if let Some(id) = self.load_schema_registry()?.node_type_id(name) {
+            return Ok(LabelAssignment { id, created: false });
+        }
+        let (id, created) = register_dynamic_type(&mut self.file, DynamicTypeKind::Node, name)?;
+        Ok(LabelAssignment { id, created })
+    }
+
+    /// Inserts a node, registering any unknown label names on the fly. Returns the new node id
+    /// and a map from each label name (primary + additional) to its assignment, so the caller
+    /// can learn which ids were minted without a separate registration call.
+    pub fn insert_node_with_dynamic_labels(
+        &mut self,
+        primary_type_name: &str,
+        additional_label_names: Vec<&str>,
+        properties: HashMap<String, Value>,
+    ) -> Result<(NodeRid, HashMap<String, LabelAssignment>), GraphError> {
+        let mut assignments = HashMap::new();
+
+        let primary = self.resolve_or_register_node_type(primary_type_name)?;
+        assignments.insert(primary_type_name.to_string(), primary);
+
+        let mut additional_ids = Vec::new();
+        for name in additional_label_names {
+            let a = self.resolve_or_register_node_type(name)?;
+            additional_ids.push(a.id);
+            assignments.insert(name.to_string(), a);
+        }
+
+        let rid = self.insert_node_with_labels(primary.id, additional_ids, properties)?;
+        Ok((rid, assignments))
+    }
+
+    /// Adds a label to a node by type name, registering the name dynamically if unknown.
+    /// Returns the label's assignment (id and whether it was newly created).
+    pub fn add_node_label_dynamic(
+        &mut self,
+        rid: NodeRid,
+        type_name: &str,
+    ) -> Result<LabelAssignment, GraphError> {
+        let a = self.resolve_or_register_node_type(type_name)?;
+        self.add_node_label(rid, a.id)?;
+        Ok(a)
+    }
+
     /// Writes the additional label list to the property page and updates label_ref.
+    ///
+    /// Normalizes the list to a set before persisting: the primary type_id is excluded and
+    /// duplicates are dropped (first occurrence wins, preserving input order). This is the
+    /// single write-through point for additional labels, so all callers share the invariant
+    /// that a node's stored additional labels never repeat or shadow its primary type.
     fn set_additional_labels(&mut self, rid: RecordId, labels: &[u16]) -> Result<(), GraphError> {
         let mut node = self.topo.read_node(&mut self.file, rid)?;
-        if labels.is_empty() {
+        let mut normalized = Vec::with_capacity(labels.len());
+        for &id in labels {
+            if id != node.node_type_id && !normalized.contains(&id) {
+                normalized.push(id);
+            }
+        }
+
+        // Update the tier-1 label index by the delta between the node's old and new additional
+        // labels (the primary type is never in this set and stays indexed via insert_node).
+        let old = self.get_additional_labels(NodeRid(rid))?;
+        {
+            let mut index = LabelIndex::new(&mut self.file);
+            for &id in &old {
+                if !normalized.contains(&id) {
+                    index.remove(id, rid)?;
+                }
+            }
+            for &id in &normalized {
+                if !old.contains(&id) {
+                    index.add(id, rid)?;
+                }
+            }
+        }
+
+        if normalized.is_empty() {
             node.label_ref = None;
         } else {
-            let bytes = encode_label_list(labels)?;
+            let bytes = encode_label_list(&normalized)?;
             let lref = PropertyStore::write_raw(&mut self.file, &bytes)?;
             node.label_ref = Some(lref);
         }
@@ -897,7 +1228,10 @@ impl<'a> DatabaseGraphView<'a> {
             .or_else(|| label.parse::<u16>().ok())?;
         let mut db = self.db.borrow_mut();
         let db = &mut **db;
-        let rid = index::find(&db.topo, &mut db.file, type_id, key, value).ok()??;
+        // Route through the planner: an indexed (type, key) uses the tier-2 index, else a scan.
+        // `key` is a flat property name; `PropertyPath::from` keeps the &str call site working.
+        let path = PropertyPath::from(key);
+        let rid = db.find_node(type_id, &path, value).ok()??;
         Some(rid_to_id(rid))
     }
 
@@ -944,6 +1278,19 @@ impl<'a> DatabaseGraphView<'a> {
 
 fn rid_to_id(rid: RecordId) -> u64 {
     ((rid.page_id.0 as u64) << 16) | rid.slot_id.0 as u64
+}
+
+/// Whether to add or remove an index entry when maintaining the tier-2 property index.
+#[derive(Clone, Copy)]
+enum IndexOp {
+    Add,
+    Remove,
+}
+
+/// A value is indexable only if it is a scalar (the partial-index semantics of `PropertyPath`):
+/// arrays and objects have no equality key here and are excluded. `Null` is also excluded.
+fn is_indexable_value(v: &Value) -> bool {
+    matches!(v, Value::Bool(_) | Value::Number(_) | Value::String(_))
 }
 
 fn id_to_rid(id: u64) -> RecordId {
@@ -1532,6 +1879,7 @@ impl PropertyDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::page::PAGE_SIZE;
     use serde_json::json;
     use tempfile::NamedTempFile;
 
@@ -1643,7 +1991,7 @@ mod tests {
                 &db.topo,
                 &mut db.file,
                 1,
-                "id",
+                &PropertyPath::from("id"),
                 &json!(format!("u{i}")),
             )
             .unwrap();
@@ -1651,7 +1999,14 @@ mod tests {
         }
         // A missing value yields None.
         assert_eq!(
-            crate::storage::index::find(&db.topo, &mut db.file, 1, "id", &json!("absent")).unwrap(),
+            crate::storage::index::find(
+                &db.topo,
+                &mut db.file,
+                1,
+                &PropertyPath::from("id"),
+                &json!("absent")
+            )
+            .unwrap(),
             None
         );
         // list/count by type are scan-backed and correct under the tiny cache.
@@ -1921,6 +2276,1328 @@ mod tests {
     }
 
     #[test]
+    fn rollback_unwinds_node_edge_and_property_growth_together() {
+        // One transaction that grows node, edge, AND property pages (all three directories),
+        // then rolls back. Every directory's root/len lives in the header, which the snapshot
+        // reverts wholesale, so the three must unwind together (Phase 2b DoD).
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.into_temp_path().to_path_buf();
+        std::fs::remove_file(&path).ok();
+        let mut db = Database::create(&path).unwrap();
+
+        let hub = db.insert_node(1, HashMap::new()).unwrap();
+        let spoke = db.insert_node(1, HashMap::new()).unwrap();
+        db.flush().unwrap();
+        let base_nodes = db.count_nodes(None).unwrap();
+        let base_edges = db.count_edges(None).unwrap();
+
+        let snap = db.take_snapshot();
+        // Grow all three page kinds in one transaction.
+        for i in 0..80 {
+            let props = HashMap::from([("v".to_string(), json!(format!("node-{i}")))]);
+            let n = db.insert_node(1, props).unwrap();
+            db.insert_edge(1, hub, n, HashMap::new()).unwrap();
+        }
+        // Also grow edges off the hub to spill onto a 2nd edge page.
+        for _ in 0..80 {
+            db.insert_edge(1, hub, spoke, HashMap::new()).unwrap();
+        }
+        assert!(db.count_nodes(None).unwrap() > base_nodes + 63);
+        assert!(db.count_edges(None).unwrap() > base_edges + 63);
+
+        db.restore_snapshot(snap);
+
+        // All three revert to the pre-transaction state.
+        assert_eq!(db.count_nodes(None).unwrap(), base_nodes);
+        assert_eq!(db.count_edges(None).unwrap(), base_edges);
+        // The pre-transaction graph is intact and further growth still works.
+        let n = db.insert_node(1, HashMap::new()).unwrap();
+        assert!(db.node_exists(n));
+        db.flush().unwrap();
+
+        drop(db);
+        let mut db2 = Database::open(&path).unwrap();
+        assert_eq!(db2.count_nodes(None).unwrap(), base_nodes + 1);
+        assert_eq!(db2.count_edges(None).unwrap(), base_edges);
+    }
+
+    #[test]
+    fn topology_and_properties_interleave_on_the_append_tail() {
+        // Directory pages, topology pages, and property pages all share the single append_page
+        // counter. Growing topology and writing properties in alternation must not collide:
+        // each kind resolves through its own directory regardless of physical interleaving
+        // (Phase 2b DoD / review E-3).
+        let (mut db, _) = make_db();
+        let mut nodes = Vec::new();
+        for i in 0..200 {
+            let props = HashMap::from([("k".to_string(), json!(format!("val-{i}")))]);
+            let n = db.insert_node(1, props).unwrap();
+            if i > 0 {
+                db.insert_edge(1, nodes[i - 1], n, HashMap::new()).unwrap();
+            }
+            nodes.push(n);
+        }
+        // Every node's property reads back correctly despite interleaved topology/property
+        // page allocation.
+        for (i, &n) in nodes.iter().enumerate() {
+            let props = db.get_node_properties(n).unwrap();
+            assert_eq!(props.get("k"), Some(&json!(format!("val-{i}"))));
+        }
+        assert_eq!(db.count_nodes(None).unwrap(), 200);
+        assert_eq!(db.count_edges(None).unwrap(), 199);
+    }
+
+    /// Reviewer-added (review-2026-06-30f): topology must survive a reopen after growing past
+    /// many logical node/edge pages with interleaved property writes. The directory roots and
+    /// reused counts persist in the header, so after reopen every node/edge record and property
+    /// must still resolve through the rebuilt directories — the persistence counterpart to the
+    /// interleave test above (which never closes the file).
+    #[test]
+    fn topology_and_properties_survive_reopen_after_multipage_growth() {
+        let (mut db, path) = make_db();
+        let mut nodes = Vec::new();
+        // >63 nodes forces several logical node pages; edges force several edge pages.
+        for i in 0..300 {
+            let props = HashMap::from([("k".to_string(), json!(format!("v-{i}")))]);
+            let n = db.insert_node(1, props).unwrap();
+            if i > 0 {
+                db.insert_edge(1, nodes[i - 1], n, HashMap::new()).unwrap();
+            }
+            nodes.push(n);
+        }
+        let node_count = db.count_nodes(None).unwrap();
+        let edge_count = db.count_edges(None).unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        // Reopen: the stateless TopologyStore rebuilds directories purely from the header.
+        let mut db2 = Database::open(&path).unwrap();
+        assert_eq!(db2.count_nodes(None).unwrap(), node_count);
+        assert_eq!(db2.count_edges(None).unwrap(), edge_count);
+        // Every property reads back, including ones on high logical pages.
+        for (i, &n) in nodes.iter().enumerate() {
+            let props = db2.get_node_properties(n).unwrap();
+            assert_eq!(props.get("k"), Some(&json!(format!("v-{i}"))));
+        }
+        // Growth still works after reopen (counts/roots were restored, not reset).
+        let extra = db2.insert_node(1, HashMap::new()).unwrap();
+        assert!(db2.node_exists(extra));
+        assert_eq!(db2.count_nodes(None).unwrap(), node_count + 1);
+    }
+
+    // ---- Phase 4: tier-1 label index ----
+
+    /// A node with an additional label L must be returned by `list_nodes(L)` and counted by
+    /// `count_nodes(L)` — the (b) all-labels semantics. Primary-type queries still work too.
+    #[test]
+    fn label_index_indexes_all_labels_not_just_primary() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { id: String } node Admin { id: String }")
+            .unwrap();
+        // One plain User, one User that also carries the Admin label.
+        let _plain = db
+            .insert_node_by_name("User", HashMap::from([("id".to_string(), json!("u1"))]))
+            .unwrap();
+        let dual = db
+            .insert_node_with_label_names(
+                "User",
+                vec!["Admin"],
+                HashMap::from([("id".to_string(), json!("u2"))]),
+            )
+            .unwrap();
+
+        // Primary-type query returns both Users.
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 2);
+        // Additional-label query returns only the dual-labelled node (the (b) semantics change).
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 1);
+        let admins: Vec<_> = db
+            .list_nodes(Some("Admin"))
+            .unwrap()
+            .into_iter()
+            .map(|(rid, _)| rid)
+            .collect();
+        assert_eq!(admins, vec![dual]);
+    }
+
+    /// Adding/removing a label moves the node in/out of that label's query result.
+    #[test]
+    fn label_index_tracks_add_and_remove_label() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { id: String } node Admin { id: String }")
+            .unwrap();
+        let n = db
+            .insert_node_by_name("User", HashMap::from([("id".to_string(), json!("u1"))]))
+            .unwrap();
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 0);
+
+        db.add_node_label_by_name(n, "Admin").unwrap();
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 1);
+        // Still a User (primary unchanged).
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+
+        db.remove_node_label_by_name(n, "Admin").unwrap();
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 0);
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+    }
+
+    /// Deleting a node removes it from every label set it was in.
+    #[test]
+    fn label_index_delete_removes_from_all_labels() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { id: String } node Admin { id: String }")
+            .unwrap();
+        let n = db
+            .insert_node_with_label_names(
+                "User",
+                vec!["Admin"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 1);
+
+        db.delete_node(n).unwrap();
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 0);
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 0);
+    }
+
+    /// Dynamic-label insert registers the node under every label, including labels minted on the
+    /// fly. Verified via the returned assignments' type_ids.
+    #[test]
+    fn label_index_dynamic_insert_registers_all_labels() {
+        let (mut db, _) = make_db_with_schema();
+        // "User" is in the schema; "Employee" is minted dynamically.
+        let (rid, assignments) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Employee"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+        let user_id = assignments.get("User").unwrap().id;
+        let employee_id = assignments.get("Employee").unwrap().id;
+        assert!(assignments["Employee"].created);
+        // The node is registered under both its primary (User) and dynamic (Employee) label.
+        assert_eq!(
+            index::rids_of_type(&db.topo, &mut db.file, user_id).unwrap(),
+            vec![rid.0]
+        );
+        assert_eq!(
+            index::rids_of_type(&db.topo, &mut db.file, employee_id).unwrap(),
+            vec![rid.0]
+        );
+    }
+
+    /// The label index must roll back with the data: a transaction that inserts nodes and mutates
+    /// labels, then rolls back, leaves every label query as it was before.
+    #[test]
+    fn label_index_rolls_back_with_the_transaction() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { id: String } node Admin { id: String }")
+            .unwrap();
+        let base = db
+            .insert_node_by_name("User", HashMap::from([("id".to_string(), json!("u1"))]))
+            .unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 0);
+
+        let snap = db.take_snapshot();
+        // Insert more Users and give the baseline node an Admin label — all within the tx.
+        for i in 0..80 {
+            db.insert_node_by_name(
+                "User",
+                HashMap::from([("id".to_string(), json!(format!("u{i}")))]),
+            )
+            .unwrap();
+        }
+        db.add_node_label_by_name(base, "Admin").unwrap();
+        assert!(db.count_nodes(Some("User")).unwrap() > 1);
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 1);
+
+        db.restore_snapshot(snap);
+
+        // Everything reverts, including the label index.
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 0);
+        assert_eq!(
+            db.list_nodes(Some("User"))
+                .unwrap()
+                .into_iter()
+                .map(|(r, _)| r)
+                .collect::<Vec<_>>(),
+            vec![base]
+        );
+    }
+
+    /// Reopen rebuilds the label index from the header root; queries return the same sets.
+    #[test]
+    fn label_index_persists_across_reopen() {
+        let (mut db, path) = make_db();
+        db.apply_schema("node User { id: String } node Admin { id: String }")
+            .unwrap();
+        db.insert_node_by_name("User", HashMap::from([("id".to_string(), json!("u1"))]))
+            .unwrap();
+        db.insert_node_with_label_names(
+            "User",
+            vec!["Admin"],
+            HashMap::from([("id".to_string(), json!("u2"))]),
+        )
+        .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let mut db2 = Database::open(&path).unwrap();
+        assert_eq!(db2.count_nodes(Some("User")).unwrap(), 2);
+        assert_eq!(db2.count_nodes(Some("Admin")).unwrap(), 1);
+    }
+
+    /// Reviewer-added (review-2026-07-04a): a stronger, db-level version of the module proptest.
+    /// After a deterministic-but-varied sequence of insert / add-label / remove-label / delete,
+    /// the label index for every type must equal a brute-force `live_node_rids` filtered by
+    /// `get_node_type_ids` — i.e. `rids_of_type` (which now reads the index) can never drift from
+    /// the ground truth held in the node records themselves.
+    #[test]
+    fn label_index_matches_bruteforce_over_all_types_invariant() {
+        let (mut db, _) = make_db();
+        db.apply_schema(
+            "node User { id: String } node Admin { id: String } node Guest { id: String }",
+        )
+        .unwrap();
+
+        // Mutate labels in a varied pattern: some nodes gain/lose Admin/Guest, some get deleted.
+        let mut live: Vec<NodeRid> = Vec::new();
+        for i in 0..60 {
+            let n = db
+                .insert_node_by_name(
+                    "User",
+                    HashMap::from([("id".to_string(), json!(format!("u{i}")))]),
+                )
+                .unwrap();
+            live.push(n);
+            if i % 3 == 0 {
+                db.add_node_label_by_name(n, "Admin").unwrap();
+            }
+            if i % 5 == 0 {
+                db.add_node_label_by_name(n, "Guest").unwrap();
+            }
+            // Periodically remove a label from the most recent node and delete the oldest one,
+            // exercising the remove-label and delete paths. Index into `live` after the push, and
+            // guard the delete so the two removals never underflow.
+            if i % 7 == 0 {
+                let last = *live.last().unwrap();
+                db.remove_node_label_by_name(last, "Admin").ok();
+            }
+            if i % 11 == 0 && live.len() > 1 {
+                let victim = live.remove(0);
+                db.delete_node(victim).unwrap();
+            }
+        }
+        // Flip one surviving node's Admin off then on to stress the delta path.
+        let survivor = *live.last().unwrap();
+        db.add_node_label_by_name(survivor, "Admin").unwrap();
+        db.remove_node_label_by_name(survivor, "Admin").unwrap();
+
+        // Ground truth: for each type_id, brute-force scan every live node's full label set and
+        // compare with what the index-backed `rids_of_type` returns.
+        let registry = db.load_schema_registry().unwrap();
+        let type_ids = [
+            registry.node_type_id("User").unwrap(),
+            registry.node_type_id("Admin").unwrap(),
+            registry.node_type_id("Guest").unwrap(),
+        ];
+        let all_rids = db.topo.live_node_rids(&mut db.file).unwrap();
+        for type_id in type_ids {
+            let mut expected: Vec<RecordId> = Vec::new();
+            for &rid in &all_rids {
+                if db
+                    .get_node_type_ids(NodeRid(rid))
+                    .unwrap()
+                    .contains(&type_id)
+                {
+                    expected.push(rid);
+                }
+            }
+            let mut got = index::rids_of_type(&db.topo, &mut db.file, type_id).unwrap();
+            got.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+            expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+            assert_eq!(
+                got, expected,
+                "label index drifted from brute-force for type {type_id}"
+            );
+        }
+    }
+
+    // ---- Phase 5: tier-2 property index ----
+
+    /// Builds a DB whose `User` type has an `@index` on `email`, plus a plain `name` field.
+    fn make_db_with_indexed_schema() -> (Database, u16) {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { email: String @index  name: String }")
+            .unwrap();
+        let type_id = db
+            .load_schema_registry()
+            .unwrap()
+            .node_type_id("User")
+            .unwrap();
+        (db, type_id)
+    }
+
+    /// `find_all_nodes` / `find_node` on an `@index` field return the same results a full scan
+    /// would, over a dataset large enough that a scan would be wasteful.
+    #[test]
+    fn property_index_find_agrees_with_scan() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        let mut target = Vec::new();
+        for i in 0..300 {
+            let email = if i % 50 == 0 { "dup@x" } else { "u" };
+            let props = HashMap::from([
+                ("email".to_string(), json!(format!("{email}{i}"))),
+                ("name".to_string(), json!("n")),
+            ]);
+            // Make a few nodes share an exact email to test multi-result find.
+            let props = if i % 50 == 0 {
+                HashMap::from([
+                    ("email".to_string(), json!("dup@x")),
+                    ("name".to_string(), json!("n")),
+                ])
+            } else {
+                props
+            };
+            let rid = db.insert_node_by_name("User", props).unwrap();
+            if i % 50 == 0 {
+                target.push(rid.0);
+            }
+        }
+        // Indexed lookup of the shared value returns exactly the nodes that have it.
+        let path = PropertyPath::from("email");
+        let mut got = db.find_all_nodes(type_id, &path, &json!("dup@x")).unwrap();
+        let mut scan =
+            index::find_all(&db.topo, &mut db.file, type_id, &path, &json!("dup@x")).unwrap();
+        got.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        scan.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(got, scan);
+        assert_eq!(got.len(), 6); // i = 0,50,100,150,200,250
+                                  // A unique value returns a single node; an absent value returns none.
+        assert!(db
+            .find_node(type_id, &path, &json!("u1"))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .find_node(type_id, &path, &json!("nope"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// The planner accepts nested `PropertyPath::Path` keys; non-scalar / None resolve to no
+    /// match (partial-index semantics). Here the path is unindexed, exercising the nested scan
+    /// fallback (nested `@index` declaration is out of scope; the API handles nested keys).
+    #[test]
+    fn property_index_nested_path_via_scan() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node Person { profile: Json }").unwrap();
+        let type_id = db
+            .load_schema_registry()
+            .unwrap()
+            .node_type_id("Person")
+            .unwrap();
+        db.insert_node_by_name(
+            "Person",
+            HashMap::from([("profile".to_string(), json!({"city": "Tokyo"}))]),
+        )
+        .unwrap();
+        db.insert_node_by_name(
+            "Person",
+            HashMap::from([("profile".to_string(), json!({"city": "Osaka"}))]),
+        )
+        .unwrap();
+        // Array-valued / missing terminal → excluded.
+        db.insert_node_by_name(
+            "Person",
+            HashMap::from([("profile".to_string(), json!({"city": ["A", "B"]}))]),
+        )
+        .unwrap();
+
+        let path = PropertyPath::Path {
+            path: vec!["profile".to_string(), "city".to_string()],
+        };
+        // Nested scalar lookup resolves the path and matches only the exact scalar.
+        let tokyo = db.find_all_nodes(type_id, &path, &json!("Tokyo")).unwrap();
+        assert_eq!(tokyo.len(), 1);
+        let osaka = db.find_all_nodes(type_id, &path, &json!("Osaka")).unwrap();
+        assert_eq!(osaka.len(), 1);
+        // A scalar query never matches the node whose `city` resolved to an array.
+        let miss = db.find_all_nodes(type_id, &path, &json!("A")).unwrap();
+        assert!(miss.is_empty());
+    }
+
+    /// Updating an indexed property moves the node from the old value to the new one.
+    #[test]
+    fn property_index_tracks_updates() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        let n = db
+            .insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("email".to_string(), json!("old@x")),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+        let path = PropertyPath::from("email");
+        assert_eq!(
+            db.find_node(type_id, &path, &json!("old@x")).unwrap(),
+            Some(n.0)
+        );
+
+        db.update_node_properties(
+            n,
+            HashMap::from([
+                ("email".to_string(), json!("new@x")),
+                ("name".to_string(), json!("n")),
+            ]),
+        )
+        .unwrap();
+        assert!(db
+            .find_node(type_id, &path, &json!("old@x"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.find_node(type_id, &path, &json!("new@x")).unwrap(),
+            Some(n.0)
+        );
+    }
+
+    /// Deleting a node removes it from the property index.
+    #[test]
+    fn property_index_delete_removes_entry() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        let n = db
+            .insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("email".to_string(), json!("a@x")),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+        let path = PropertyPath::from("email");
+        assert!(db
+            .find_node(type_id, &path, &json!("a@x"))
+            .unwrap()
+            .is_some());
+        db.delete_node(n).unwrap();
+        assert!(db
+            .find_node(type_id, &path, &json!("a@x"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// The property index rolls back with the transaction: inserts/updates within a tx vanish on
+    /// `restore_snapshot`, and the header root reverts.
+    #[test]
+    fn property_index_rolls_back_with_the_transaction() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        let base = db
+            .insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("email".to_string(), json!("base@x")),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+        db.flush().unwrap();
+        let path = PropertyPath::from("email");
+
+        let snap = db.take_snapshot();
+        for i in 0..50 {
+            db.insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("email".to_string(), json!(format!("e{i}@x"))),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+        }
+        db.update_node_properties(
+            base,
+            HashMap::from([
+                ("email".to_string(), json!("changed@x")),
+                ("name".to_string(), json!("n")),
+            ]),
+        )
+        .unwrap();
+        assert!(db
+            .find_node(type_id, &path, &json!("e0@x"))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .find_node(type_id, &path, &json!("changed@x"))
+            .unwrap()
+            .is_some());
+
+        db.restore_snapshot(snap);
+
+        // Everything reverts: the tx inserts are gone and base keeps its original email.
+        assert!(db
+            .find_node(type_id, &path, &json!("e0@x"))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .find_node(type_id, &path, &json!("changed@x"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.find_node(type_id, &path, &json!("base@x")).unwrap(),
+            Some(base.0)
+        );
+    }
+
+    /// Reopen restores the index and the schema's `indexed` flags; queries still hit the index.
+    #[test]
+    fn property_index_persists_across_reopen() {
+        let (mut db, path_db) = make_db();
+        db.apply_schema("node User { email: String @index  name: String }")
+            .unwrap();
+        let n = db
+            .insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("email".to_string(), json!("keep@x")),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let mut db2 = Database::open(&path_db).unwrap();
+        let type_id = db2
+            .load_schema_registry()
+            .unwrap()
+            .node_type_id("User")
+            .unwrap();
+        let path = PropertyPath::from("email");
+        assert_eq!(
+            db2.find_node(type_id, &path, &json!("keep@x")).unwrap(),
+            Some(n.0)
+        );
+        // The `indexed` flag survives: the schema text round-trips with @index.
+        assert!(db2.get_schema_text().unwrap().contains("@index"));
+    }
+
+    /// `find_node_by` on an *unindexed* field still works via the scan fallback.
+    #[test]
+    fn property_index_unindexed_falls_back_to_scan() {
+        let (mut db, _type_id) = make_db_with_indexed_schema();
+        db.insert_node_by_name(
+            "User",
+            HashMap::from([
+                ("email".to_string(), json!("e@x")),
+                ("name".to_string(), json!("Alice")),
+            ]),
+        )
+        .unwrap();
+        // `name` is not indexed; the planner must fall back to a scan and still find it.
+        let view = DatabaseGraphView::load(&mut db).unwrap();
+        assert!(view.find_node_by("User", "name", &json!("Alice")).is_some());
+    }
+
+    /// Reviewer-added (review-2026-07-05a): `is_indexable_value`'s partial-index exclusion must
+    /// hold even when a non-scalar reaches the indexed field's *value* through the low-level
+    /// `insert_node` API, which bypasses `validate_properties`'s schema type check. An array
+    /// value must be silently excluded from the index (not indexed, not a crash), and the node
+    /// must still be reachable via the scan path since `find_all_nodes` falls back whenever the
+    /// index has no entry.
+    #[test]
+    fn property_index_excludes_non_scalar_value_reaching_indexed_field_via_low_level_api() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        // Bypass validate_properties (which insert_node_by_name would run) by calling the
+        // low-level insert_node directly with an array value in the indexed `email` field.
+        let n = db
+            .insert_node(
+                type_id,
+                HashMap::from([
+                    ("email".to_string(), json!(["not", "a", "scalar"])),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+
+        let path = PropertyPath::from("email");
+        // The array value must not appear in the index for any array-shaped query...
+        let hits = db
+            .find_all_nodes(type_id, &path, &json!(["not", "a", "scalar"]))
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "a non-scalar value must never be added to the tier-2 index"
+        );
+        // ...and the node's email must not spuriously match any scalar value either.
+        assert!(db
+            .find_node(type_id, &path, &json!("not"))
+            .unwrap()
+            .is_none());
+        // The node itself is still reachable via the ordinary property read (index exclusion
+        // does not corrupt the node's actual stored properties).
+        assert_eq!(
+            db.get_node_properties(n).unwrap().get("email"),
+            Some(&json!(["not", "a", "scalar"]))
+        );
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(50))]
+        /// For a random sequence of insert / update-property / delete over an `@index` field, the
+        /// index-backed `find_all_nodes` must agree with a brute-force `resolve`-filter over every
+        /// live node — for every value queried.
+        #[test]
+        fn property_index_matches_bruteforce_invariant(
+            ops in proptest::collection::vec(
+                // (op: 0=insert,1=update,2=delete, node slot 0..8, value 0..4)
+                (0u8..3, 0usize..8, 0u8..4),
+                1..120,
+            )
+        ) {
+            let (mut db, type_id) = make_db_with_indexed_schema();
+            let path = PropertyPath::from("email");
+            // Track live nodes by a stable test index → NodeRid.
+            let mut nodes: std::collections::HashMap<usize, NodeRid> = std::collections::HashMap::new();
+            let val = |v: u8| json!(format!("v{v}"));
+
+            for (op, slot, v) in ops {
+                match op {
+                    0 => {
+                        // Insert (replace any existing node at this slot to keep it simple).
+                        if let Some(old) = nodes.remove(&slot) {
+                            db.delete_node(old).unwrap();
+                        }
+                        let n = db.insert_node_by_name(
+                            "User",
+                            HashMap::from([
+                                ("email".to_string(), val(v)),
+                                ("name".to_string(), json!("n")),
+                            ]),
+                        ).unwrap();
+                        nodes.insert(slot, n);
+                    }
+                    1 => {
+                        if let Some(&n) = nodes.get(&slot) {
+                            db.update_node_properties(
+                                n,
+                                HashMap::from([
+                                    ("email".to_string(), val(v)),
+                                    ("name".to_string(), json!("n")),
+                                ]),
+                            ).unwrap();
+                        }
+                    }
+                    _ => {
+                        if let Some(n) = nodes.remove(&slot) {
+                            db.delete_node(n).unwrap();
+                        }
+                    }
+                }
+            }
+
+            // For each possible value, index result == brute-force scan result.
+            let all_rids = db.topo.live_node_rids(&mut db.file).unwrap();
+            for v in 0u8..4 {
+                let value = val(v);
+                let mut expected = Vec::new();
+                for &rid in &all_rids {
+                    let props = db.get_node_properties_raw(rid).unwrap();
+                    if path.resolve(&props).is_some_and(|x| *x == value) {
+                        expected.push(rid);
+                    }
+                }
+                let mut got = db.find_all_nodes(type_id, &path, &value).unwrap();
+                got.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+                expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+                prop_assert_eq!(got, expected, "property index drifted for value {}", v);
+            }
+        }
+    }
+
+    // ---- Phase 6: tier-3 unique constraint ----
+
+    /// Builds a DB whose `User.email` is `@unique` (plus a plain `name`).
+    fn make_db_with_unique_schema() -> (Database, u16) {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { email: String @unique  name: String }")
+            .unwrap();
+        let type_id = db
+            .load_schema_registry()
+            .unwrap()
+            .node_type_id("User")
+            .unwrap();
+        (db, type_id)
+    }
+
+    fn user(email: &str) -> HashMap<String, Value> {
+        HashMap::from([
+            ("email".to_string(), json!(email)),
+            ("name".to_string(), json!("n")),
+        ])
+    }
+
+    /// A second node with a duplicate `@unique` value is rejected, and the DB is unchanged.
+    #[test]
+    fn unique_rejects_duplicate_insert() {
+        let (mut db, type_id) = make_db_with_unique_schema();
+        let first = db.insert_node_by_name("User", user("a@x")).unwrap();
+        let err = db.insert_node_by_name("User", user("a@x"));
+        assert!(matches!(err, Err(GraphError::UniqueViolation { .. })));
+        // The DB is unchanged: still exactly one User with a@x, and it is `first`.
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 1);
+        let path = PropertyPath::from("email");
+        assert_eq!(
+            db.find_node(type_id, &path, &json!("a@x")).unwrap(),
+            Some(first.0)
+        );
+    }
+
+    /// A `@unique` field is also queryable via the index (it is indexed too).
+    #[test]
+    fn unique_field_is_indexed() {
+        let (mut db, type_id) = make_db_with_unique_schema();
+        let n = db.insert_node_by_name("User", user("q@x")).unwrap();
+        let path = PropertyPath::from("email");
+        assert!(db.is_path_indexed(type_id, &path));
+        assert_eq!(
+            db.find_node(type_id, &path, &json!("q@x")).unwrap(),
+            Some(n.0)
+        );
+    }
+
+    /// Updating to a value another node has fails; to a fresh value succeeds; to the node's own
+    /// current value is a no-op success (self-exclusion).
+    #[test]
+    fn unique_update_enforces_and_self_excludes() {
+        let (mut db, _type_id) = make_db_with_unique_schema();
+        let a = db.insert_node_by_name("User", user("a@x")).unwrap();
+        let b = db.insert_node_by_name("User", user("b@x")).unwrap();
+
+        // b → a@x collides with a.
+        assert!(matches!(
+            db.update_node_properties(b, user("a@x")),
+            Err(GraphError::UniqueViolation { .. })
+        ));
+        // b → its own current value b@x is fine (self-exclusion).
+        db.update_node_properties(b, user("b@x")).unwrap();
+        // b → a fresh value is fine.
+        db.update_node_properties(b, user("c@x")).unwrap();
+        // a is untouched by all of the above.
+        assert_eq!(
+            db.get_node_properties(a).unwrap().get("email"),
+            Some(&json!("a@x"))
+        );
+    }
+
+    /// Deleting a node frees its unique value for reuse.
+    #[test]
+    fn unique_delete_frees_value() {
+        let (mut db, _type_id) = make_db_with_unique_schema();
+        let a = db.insert_node_by_name("User", user("a@x")).unwrap();
+        // Duplicate insert fails while `a` holds a@x.
+        assert!(db.insert_node_by_name("User", user("a@x")).is_err());
+        db.delete_node(a).unwrap();
+        // After delete the value is free: insert now succeeds.
+        assert!(db.insert_node_by_name("User", user("a@x")).is_ok());
+    }
+
+    /// Missing / non-scalar `@unique` values are unconstrained (partial semantics): two nodes
+    /// that both omit the unique field insert fine.
+    #[test]
+    fn unique_absent_value_is_unconstrained() {
+        let (mut db, _) = make_db();
+        // No schema validation here; use the low-level insert with the unique field absent.
+        db.apply_schema("node User { email: String @unique  name: String }")
+            .unwrap();
+        let type_id = db
+            .load_schema_registry()
+            .unwrap()
+            .node_type_id("User")
+            .unwrap();
+        // Insert two nodes of `User` with no `email` property at all (low-level, bypassing
+        // name-based validation), so the unique field resolves to None for both.
+        db.insert_node(type_id, HashMap::from([("name".to_string(), json!("x"))]))
+            .unwrap();
+        db.insert_node(type_id, HashMap::from([("name".to_string(), json!("y"))]))
+            .unwrap();
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 2);
+    }
+
+    /// Reviewer-added (review-2026-07-09a): the same absent-value scenario, but reached through
+    /// the realistic high-level `insert_node_by_name` path (schema-validated) rather than the
+    /// low-level `insert_node`. Confirms `validate_properties` does not itself require a declared
+    /// field to be present, so the low-level exercise in `unique_absent_value_is_unconstrained`
+    /// was not testing an unreachable/unfair state — the same partial semantics are reachable via
+    /// the API applications actually call.
+    #[test]
+    fn unique_absent_value_is_unconstrained_via_high_level_api() {
+        let (mut db, _type_id) = make_db_with_unique_schema();
+        // Two nodes inserted via the schema-validated path, both omitting the `@unique` `email`
+        // field entirely.
+        db.insert_node_by_name("User", HashMap::from([("name".to_string(), json!("x"))]))
+            .unwrap();
+        db.insert_node_by_name("User", HashMap::from([("name".to_string(), json!("y"))]))
+            .unwrap();
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 2);
+    }
+
+    /// A rejected insert (or a whole transaction) rolls back cleanly: the unique value is released.
+    #[test]
+    fn unique_releases_value_on_rollback() {
+        let (mut db, _type_id) = make_db_with_unique_schema();
+        db.insert_node_by_name("User", user("base@x")).unwrap();
+        db.flush().unwrap();
+
+        let snap = db.take_snapshot();
+        let n = db.insert_node_by_name("User", user("tx@x")).unwrap();
+        assert!(db.node_exists(n));
+        // While tx@x is held, a duplicate fails.
+        assert!(db.insert_node_by_name("User", user("tx@x")).is_err());
+
+        db.restore_snapshot(snap);
+
+        // After rollback the value is free: insert with tx@x now succeeds.
+        assert!(db.insert_node_by_name("User", user("tx@x")).is_ok());
+    }
+
+    // ---- A-1: free-slot hint (insertion O(1)) ----
+
+    /// After a long run of inserts, the node free-slot hint tracks the last (nearly full) page,
+    /// which is the observable proof that alloc starts its scan near the end instead of from page
+    /// 0 every time (the O(n²) → O(n) fix). If the hint didn't advance it would sit at 0 and each
+    /// insert would re-scan all prior full pages.
+    #[test]
+    fn insert_advances_free_page_hint_instead_of_rescanning() {
+        let (mut db, _) = make_db();
+        // ~63 node slots per page; 700 nodes spans ~12 pages.
+        for _ in 0..700 {
+            db.insert_node(1, HashMap::new()).unwrap();
+        }
+        let count = db.file.header.node_page_count;
+        let hint = db.file.header.node_first_free_page;
+        assert!(count >= 11, "expected several node pages, got {count}");
+        // The hint sits on the last page (the only one with free space), not back at 0.
+        assert_eq!(hint, count - 1, "hint should track the last page");
+    }
+
+    /// Reviewer-added (review-2026-07-11a): design §6 DoD asks for a deterministic scan-count
+    /// proof of O(1) amortized insertion, not just the hint's final resting place. This pins the
+    /// stronger invariant directly: under back-to-back inserts (no interleaved deletes), the hint
+    /// is monotonically non-decreasing after every single insert, and it strictly advances at
+    /// least once per page filled (~63 slots). A hint that ever regressed, or that stayed frozen
+    /// while many pages filled, would mean the allocator silently fell back to rescanning from an
+    /// earlier point — the exact O(n^2) behavior this feature exists to remove.
+    #[test]
+    fn insert_hint_is_monotonic_and_advances_at_page_granularity() {
+        let (mut db, _) = make_db();
+        let mut last_hint = 0u32;
+        let mut advances = 0u32;
+        for _ in 0..700 {
+            db.insert_node(1, HashMap::new()).unwrap();
+            let hint = db.file.header.node_first_free_page;
+            assert!(
+                hint >= last_hint,
+                "hint regressed from {last_hint} to {hint} during a pure-insert run"
+            );
+            if hint > last_hint {
+                advances += 1;
+            }
+            last_hint = hint;
+        }
+        // 700 nodes at ~63/page fills ~11 pages; the hint must have advanced close to once per
+        // page (not once total, which would mean it froze after the very first page).
+        let pages = db.file.header.node_page_count;
+        assert!(
+            advances + 2 >= pages,
+            "hint advanced only {advances} times across {pages} pages filled — looks frozen"
+        );
+    }
+
+    /// Freeing a slot backs the hint down so the freed space is reused before appending new pages.
+    #[test]
+    fn free_backs_off_hint_and_reuses_slot() {
+        let (mut db, _) = make_db();
+        let mut rids = Vec::new();
+        for _ in 0..200 {
+            rids.push(db.insert_node(1, HashMap::new()).unwrap());
+        }
+        let pages_before = db.file.header.node_page_count;
+        // Delete a node on an early (full) page; the hint must back down to it.
+        let victim = rids[10];
+        let victim_page = victim.0.page_id.0;
+        db.delete_node(victim).unwrap();
+        assert!(db.file.header.node_first_free_page <= victim_page);
+        // The next insert reuses the freed slot on that early page — no new page appended.
+        let reused = db.insert_node(1, HashMap::new()).unwrap();
+        assert_eq!(
+            reused.0.page_id.0, victim_page,
+            "freed slot should be reused"
+        );
+        assert_eq!(db.file.header.node_page_count, pages_before, "no new page");
+    }
+
+    /// The hint rides the WAL: a transaction that grows pages (advancing the hint) reverts the
+    /// hint on rollback along with the data.
+    #[test]
+    fn free_page_hint_reverts_on_rollback() {
+        let (mut db, _) = make_db();
+        for _ in 0..80 {
+            db.insert_node(1, HashMap::new()).unwrap();
+        }
+        db.flush().unwrap();
+        let hint_before = db.file.header.node_first_free_page;
+        let count_before = db.file.header.node_page_count;
+
+        let snap = db.take_snapshot();
+        for _ in 0..200 {
+            db.insert_node(1, HashMap::new()).unwrap();
+        }
+        assert!(db.file.header.node_first_free_page > hint_before);
+        db.restore_snapshot(snap);
+        assert_eq!(db.file.header.node_first_free_page, hint_before);
+        assert_eq!(db.file.header.node_page_count, count_before);
+    }
+
+    /// Reopen restores the hint from the header, so inserts continue from the right page.
+    #[test]
+    fn free_page_hint_persists_across_reopen() {
+        let (mut db, path) = make_db();
+        for _ in 0..300 {
+            db.insert_node(1, HashMap::new()).unwrap();
+        }
+        let hint = db.file.header.node_first_free_page;
+        db.flush().unwrap();
+        drop(db);
+
+        let mut db2 = Database::open(&path).unwrap();
+        assert_eq!(db2.file.header.node_first_free_page, hint);
+        // Insert still works and lands on the last page (hint honored, not a fresh page each time).
+        let count_before = db2.file.header.node_page_count;
+        db2.insert_node(1, HashMap::new()).unwrap();
+        assert_eq!(db2.file.header.node_page_count, count_before);
+    }
+
+    /// A corrupt hint (past the page count) must not crash: the clamp makes alloc fall back to
+    /// appending a page rather than reading out of range.
+    #[test]
+    fn corrupt_free_page_hint_does_not_crash() {
+        let (mut db, _) = make_db();
+        for _ in 0..80 {
+            db.insert_node(1, HashMap::new()).unwrap();
+        }
+        // Corrupt the hint far past the page count.
+        db.file.header.node_first_free_page = 9_999_999;
+        db.file.write_header().unwrap();
+        // Insert must still succeed (clamp → scan empty range → append), no panic.
+        let r = db.insert_node(1, HashMap::new()).unwrap();
+        assert!(db.node_exists(r));
+    }
+
+    /// Property free-slot hint: mixed small/large values keep waste bounded — a page the hint
+    /// stopped at (because it still had >= threshold free) is reused by a later small value.
+    #[test]
+    fn property_hint_bounds_waste_on_mixed_sizes() {
+        let (mut db, _) = make_db();
+        // A big value (~half a page) then a small one, repeatedly. The small values should pack
+        // into the tails the hint left open rather than each taking a fresh page.
+        let big = "x".repeat(PAGE_SIZE / 2);
+        for i in 0..40 {
+            let mut props = HashMap::new();
+            props.insert("v".to_string(), json!(format!("{big}{i}")));
+            db.insert_node(1, props).unwrap();
+            let mut small = HashMap::new();
+            small.insert("v".to_string(), json!(i));
+            db.insert_node(1, small).unwrap();
+        }
+        // If every value took its own page we'd have ~80 property pages; packing keeps it well
+        // under that. (Two ~half-page values don't share, but small values fill tails.)
+        let prop_pages = db.file.header.property_dir_len;
+        assert!(
+            prop_pages < 80,
+            "waste not bounded: {prop_pages} property pages for 80 values"
+        );
+        // All values read back correctly (no corruption from the hint logic).
+        assert_eq!(db.count_nodes(None).unwrap(), 80);
+    }
+
+    // ---- A-2: property-store space reclaim (design docs/review-request-2026-07-12a) ----
+
+    /// Helper: a property map whose serialized form is a few hundred bytes, so ~10 fit per slotted
+    /// page — big enough that reclaiming pages is observable, small enough to stay slotted.
+    fn midsize_props(tag: usize) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("v".to_string(), json!("y".repeat(300)));
+        m.insert("tag".to_string(), json!(tag));
+        m
+    }
+
+    /// Deleting nodes reclaims their property space: after deleting everything and re-inserting the
+    /// same volume, the property page count does not grow (freed pages are reused, not leaked).
+    #[test]
+    fn delete_reclaims_property_space() {
+        let (mut db, _) = make_db();
+        let mut rids = Vec::new();
+        for i in 0..200 {
+            rids.push(db.insert_node(1, midsize_props(i)).unwrap());
+        }
+        let pages_after_insert = db.file.header.property_dir_len;
+        for rid in &rids {
+            db.delete_node(*rid).unwrap();
+        }
+        // Re-insert the same volume; the reclaimed pages must be reused, not appended.
+        for i in 0..200 {
+            db.insert_node(1, midsize_props(i)).unwrap();
+        }
+        assert_eq!(
+            db.file.header.property_dir_len, pages_after_insert,
+            "re-insert after delete grew property pages — space was leaked, not reclaimed"
+        );
+    }
+
+    /// A large-blob property (multi-page chain) is reclaimed on delete: its logical pages return to
+    /// the free-list and are reused by the next large blob, keeping the page count stable.
+    #[test]
+    fn blob_chain_pages_return_to_free_list() {
+        let (mut db, _) = make_db();
+        let big = "z".repeat(PAGE_SIZE * 3);
+        let mut props = HashMap::new();
+        props.insert("blob".to_string(), json!(big.clone()));
+        let rid = db.insert_node(1, props.clone()).unwrap();
+        let pages_after = db.file.header.property_dir_len;
+        assert!(pages_after >= 3, "expected a multi-page chain");
+        db.delete_node(rid).unwrap();
+        // The next equally-large blob must reuse the freed chain pages, not append fresh ones.
+        db.insert_node(1, props).unwrap();
+        assert_eq!(
+            db.file.header.property_dir_len, pages_after,
+            "chain pages were not returned to the free-list"
+        );
+    }
+
+    /// Updating a node's properties frees the old value's space (O-4): repeated updates on the same
+    /// node do not grow the property page count without bound.
+    #[test]
+    fn update_frees_old_property() {
+        let (mut db, _) = make_db();
+        let rid = db.insert_node(1, midsize_props(0)).unwrap();
+        let pages_after_first = db.file.header.property_dir_len;
+        // Many updates; each writes a new value and must free the previous one.
+        for i in 1..100 {
+            db.update_node_properties(rid, midsize_props(i)).unwrap();
+        }
+        // Without O-4's fix this would grow ~1 page per few updates; with it the freed pages cycle.
+        assert!(
+            db.file.header.property_dir_len <= pages_after_first + 1,
+            "update leaked old property pages: {} started at {}",
+            db.file.header.property_dir_len,
+            pages_after_first
+        );
+        // The latest value is intact.
+        assert_eq!(db.get_node_properties(rid).unwrap(), midsize_props(99));
+    }
+
+    /// A freed logical page sits on the free-list carrying the FREE_PAGE_MARKER; the ordinary
+    /// allocator scan must skip it (it's not a live SlottedPage) — a normal insert while the page
+    /// is free must not land on it and clobber the free-list link. Then a pop claims it cleanly.
+    /// (Regression for the review-2026-07-12b Should-fix.)
+    #[test]
+    fn free_listed_page_is_skipped_then_reused_cleanly() {
+        let (mut db, _) = make_db();
+        // Fill one page's worth of midsize values, then delete them all so the page fully empties
+        // and is pushed onto the free-list.
+        let mut rids = Vec::new();
+        for i in 0..12 {
+            rids.push(db.insert_node(1, midsize_props(i)).unwrap());
+        }
+        let target_page = rids[0].0.page_id.0; // first property page
+        for rid in &rids {
+            db.delete_node(*rid).unwrap();
+        }
+        // The emptied page should now be the free-list head.
+        assert_eq!(
+            db.file.header.property_free_list_head, target_page,
+            "fully-emptied page should be on the free-list"
+        );
+        // The next property insert pops that page and reuses it — page count unchanged, and the
+        // value reads back correctly (no free-list-link corruption).
+        let pages_before = db.file.header.property_dir_len;
+        let reused = db.insert_node(1, midsize_props(999)).unwrap();
+        assert_eq!(
+            db.file.header.property_dir_len, pages_before,
+            "reused a free-listed page, so no new page"
+        );
+        assert_eq!(db.get_node_properties(reused).unwrap(), midsize_props(999));
+        // Free-list is now empty again (single freed page consumed).
+        assert_eq!(
+            db.file.header.property_free_list_head,
+            crate::storage::file::NO_FREE_PAGE
+        );
+    }
+
+    /// M-1 regression (review-2026-07-12d): deleting a node with a self-loop edge carrying a
+    /// **chain** (>4 KB) property must succeed. The self-loop appears in both out_edges and
+    /// in_edges; before the cascade dedup + free idempotence this double-freed the chain and failed
+    /// with StorageCorrupted(65535), leaving the node half-deleted.
+    #[test]
+    fn delete_node_with_self_loop_chain_property_reclaims() {
+        let (mut db, _) = make_db();
+        let n = db.insert_node(1, HashMap::new()).unwrap();
+        let mut props = HashMap::new();
+        props.insert("blob".to_string(), json!("z".repeat(PAGE_SIZE * 3)));
+        db.insert_edge(1, n, n, props).unwrap(); // self-loop with a chain property
+        let pages_with = db.file.header.property_dir_len;
+        assert!(pages_with >= 3, "expected a multi-page chain property");
+        // Must not error (was StorageCorrupted(65535) before the fix).
+        db.delete_node(n).unwrap();
+        assert!(!db.node_exists(n));
+        // The chain pages were reclaimed exactly once: a fresh equally-large blob reuses them.
+        let m = db.insert_node(1, HashMap::new()).unwrap();
+        let mut props2 = HashMap::new();
+        props2.insert("blob".to_string(), json!("w".repeat(PAGE_SIZE * 3)));
+        db.insert_edge(1, m, m, props2).unwrap();
+        assert!(
+            db.file.header.property_dir_len <= pages_with,
+            "self-loop chain pages were not reclaimed cleanly"
+        );
+    }
+
+    /// M-1 regression: same for a self-loop edge with a **slotted** (small) property. Before the
+    /// fix the second cascade visit pushed the emptied page onto the free-list twice (a cycle);
+    /// after the fix the free-list stays acyclic and later inserts read back correctly.
+    #[test]
+    fn delete_node_with_self_loop_slotted_property_keeps_free_list_acyclic() {
+        let (mut db, _) = make_db();
+        let n = db.insert_node(1, HashMap::new()).unwrap();
+        let mut props = HashMap::new();
+        props.insert("role".to_string(), json!("self"));
+        db.insert_edge(1, n, n, props).unwrap(); // self-loop with a slotted property
+        db.delete_node(n).unwrap();
+        assert!(!db.node_exists(n));
+        // Insert several fresh nodes with properties; if the free-list had a cycle, allocation would
+        // loop or reuse a page twice and corrupt reads. All must read back correctly.
+        for i in 0..20 {
+            let r = db.insert_node(1, midsize_props(i)).unwrap();
+            assert_eq!(db.get_node_properties(r).unwrap(), midsize_props(i));
+        }
+    }
+
+    /// T-2 (review-2026-07-12d): double-free where the page fully empties (so it's free-listed),
+    /// then free the same RID again — must be a no-op for both slotted and chain RIDs, not a second
+    /// free-list push.
+    #[test]
+    fn double_free_page_empty_is_a_noop() {
+        use crate::storage::value::PropertyStore;
+        let (mut db, _) = make_db();
+        // Slotted, sole value on its page → page empties and free-lists on first free.
+        let mut small = HashMap::new();
+        small.insert("v".to_string(), json!("only"));
+        let ps = PropertyStore::write(&mut db.file, &small).unwrap();
+        // Chain (>4 KB) → its own pages.
+        let mut big = HashMap::new();
+        big.insert("v".to_string(), json!("z".repeat(PAGE_SIZE * 2)));
+        let pc = PropertyStore::write(&mut db.file, &big).unwrap();
+
+        PropertyStore::free(&mut db.file, ps).unwrap();
+        PropertyStore::free(&mut db.file, ps).unwrap(); // no-op, no second push
+        PropertyStore::free(&mut db.file, pc).unwrap();
+        PropertyStore::free(&mut db.file, pc).unwrap(); // no-op, no StorageCorrupted
+
+        // The free-list is acyclic and usable: fresh writes read back correctly.
+        for i in 0..10 {
+            let r = PropertyStore::write(&mut db.file, &midsize_props(i)).unwrap();
+            let got: HashMap<String, Value> = PropertyStore::read(&mut db.file, r).unwrap();
+            assert_eq!(got, midsize_props(i));
+        }
+    }
+
+    /// Reading a property whose slot was freed (stale RID) yields PropertySlotFreed, distinct from
+    /// StorageCorrupted — freeing is an expected state, not corruption.
+    #[test]
+    fn read_freed_slot_is_property_slot_freed() {
+        use crate::storage::value::PropertyStore;
+        let (mut db, _) = make_db();
+        // A single small value on a slotted page, then free it directly and re-read the RID.
+        let mut props = HashMap::new();
+        props.insert("v".to_string(), json!("small"));
+        let pref = PropertyStore::write(&mut db.file, &props).unwrap();
+        PropertyStore::free(&mut db.file, pref).unwrap();
+        match PropertyStore::read(&mut db.file, pref) {
+            Err(GraphError::PropertySlotFreed) => {}
+            other => panic!("expected PropertySlotFreed, got {other:?}"),
+        }
+    }
+
+    /// Double-free of a property RID is an idempotent no-op (O-5), not an error or corruption.
+    #[test]
+    fn double_free_property_is_a_noop() {
+        use crate::storage::value::PropertyStore;
+        let (mut db, _) = make_db();
+        let mut a = HashMap::new();
+        a.insert("v".to_string(), json!("A"));
+        let mut b = HashMap::new();
+        b.insert("v".to_string(), json!("B"));
+        let pa = PropertyStore::write(&mut db.file, &a).unwrap();
+        let pb = PropertyStore::write(&mut db.file, &b).unwrap();
+        PropertyStore::free(&mut db.file, pa).unwrap();
+        // Second free of the same slot must not error, and must not touch the live neighbor `pb`.
+        PropertyStore::free(&mut db.file, pa).unwrap();
+        assert_eq!(PropertyStore::read(&mut db.file, pb).unwrap(), b);
+    }
+
+    /// Property reclaim rides the WAL: freeing inside a transaction reverts the free-list head (and
+    /// the freed bytes) on rollback, so the value is live again.
+    #[test]
+    fn free_reverts_on_rollback() {
+        use crate::storage::value::PropertyStore;
+        let (mut db, _) = make_db();
+        let mut props = HashMap::new();
+        props.insert("v".to_string(), json!("y".repeat(300)));
+        let pref = PropertyStore::write(&mut db.file, &props).unwrap();
+        db.flush().unwrap();
+        let head_before = db.file.header.property_free_list_head;
+
+        let snap = db.take_snapshot();
+        PropertyStore::free(&mut db.file, pref).unwrap();
+        assert_ne!(db.file.header.property_free_list_head, head_before);
+        db.restore_snapshot(snap);
+        // After rollback the free-list head is back and the value reads correctly again.
+        assert_eq!(db.file.header.property_free_list_head, head_before);
+        assert_eq!(PropertyStore::read(&mut db.file, pref).unwrap(), props);
+    }
+
+    /// Freed property space stays freed across flush+reopen: the free-list head persists in the
+    /// header, so a reopened DB reuses the page rather than appending.
+    #[test]
+    fn free_persists_across_reopen() {
+        let (mut db, path) = make_db();
+        let mut rids = Vec::new();
+        for i in 0..12 {
+            rids.push(db.insert_node(1, midsize_props(i)).unwrap());
+        }
+        for rid in &rids {
+            db.delete_node(*rid).unwrap();
+        }
+        let head = db.file.header.property_free_list_head;
+        let pages = db.file.header.property_dir_len;
+        assert_ne!(head, crate::storage::file::NO_FREE_PAGE);
+        db.flush().unwrap();
+        drop(db);
+
+        let mut db2 = Database::open(&path).unwrap();
+        assert_eq!(db2.file.header.property_free_list_head, head);
+        // A fresh insert reuses a freed page — property page count does not grow.
+        db2.insert_node(1, midsize_props(0)).unwrap();
+        assert!(db2.file.header.property_dir_len <= pages);
+    }
+
+    #[test]
     fn insert_node_and_read_properties() {
         let (mut db, _) = make_db();
         let props = HashMap::from([
@@ -2017,6 +3694,149 @@ mod tests {
         assert!(labels.contains(&"User".to_string()));
         assert!(labels.contains(&"Admin".to_string()));
         assert_eq!(labels.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_label_insert_registers_unknown_and_returns_assignments() {
+        let (mut db, _) = make_db_with_schema();
+        // "Person" and "VIP" are not in the schema; they must be registered on the fly.
+        let (rid, assignments) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person", "VIP"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+
+        // "User" already exists in the schema.
+        assert!(!assignments["User"].created);
+        // "Person"/"VIP" are newly minted.
+        assert!(assignments["Person"].created);
+        assert!(assignments["VIP"].created);
+        assert_ne!(assignments["Person"].id, assignments["VIP"].id);
+
+        // The dynamically registered labels resolve back to their names.
+        let labels = db.get_node_label_names(rid).unwrap();
+        assert!(labels.contains(&"Person".to_string()));
+        assert!(labels.contains(&"VIP".to_string()));
+
+        // Re-inserting with the same label reuses the id and reports created=false.
+        let (_, assignments2) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person"],
+                HashMap::from([("id".to_string(), json!("u2"))]),
+            )
+            .unwrap();
+        assert!(!assignments2["Person"].created);
+        assert_eq!(assignments2["Person"].id, assignments["Person"].id);
+    }
+
+    #[test]
+    fn dynamic_label_filtering_via_has_label() {
+        let (mut db, _) = make_db_with_schema();
+        db.insert_node_with_dynamic_labels(
+            "User",
+            vec!["Person"],
+            HashMap::from([("id".to_string(), json!("u1"))]),
+        )
+        .unwrap();
+        db.insert_node_with_dynamic_labels(
+            "User",
+            vec![],
+            HashMap::from([("id".to_string(), json!("u2"))]),
+        )
+        .unwrap();
+        db.flush().unwrap();
+
+        // HasLabel filtering reaches dynamically registered labels with no property scan.
+        let view = DatabaseGraphView::load(&mut db).unwrap();
+        let person_nodes = view.all_nodes_of_label("Person");
+        assert_eq!(person_nodes.len(), 1);
+    }
+
+    #[test]
+    fn dynamic_label_id_persists_across_reopen() {
+        let (mut db, path) = make_db_with_schema();
+        let (_, assignments) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+        let person_id = assignments["Person"].id;
+        db.flush().unwrap();
+        drop(db);
+
+        let mut db2 = Database::open(&path).unwrap();
+        // The id is stable: registering the same name again returns the persisted id.
+        let (_, assignments2) = db2
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person"],
+                HashMap::from([("id".to_string(), json!("u2"))]),
+            )
+            .unwrap();
+        assert!(!assignments2["Person"].created);
+        assert_eq!(assignments2["Person"].id, person_id);
+    }
+
+    #[test]
+    fn dynamic_label_survives_later_apply_schema() {
+        // A schema migration must not drop dynamically registered labels.
+        let (mut db, _) = make_db_with_schema();
+        let (_, assignments) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+        let person_id = assignments["Person"].id;
+
+        // Apply a compatible schema migration (add a field).
+        db.apply_schema(
+            "node User { id: String  name: String  email: String } \
+             node Admin { role: String } \
+             node Project { id: String  title: String } \
+             edge OWNS { from: User  to: Project  props: { role: String } }",
+        )
+        .unwrap();
+
+        // The dynamic label and its id are preserved.
+        let (_, assignments2) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["Person"],
+                HashMap::from([("id".to_string(), json!("u2"))]),
+            )
+            .unwrap();
+        assert!(!assignments2["Person"].created);
+        assert_eq!(assignments2["Person"].id, person_id);
+    }
+
+    #[test]
+    fn additional_labels_normalized_to_a_set() {
+        // Multi-label semantics are set-like: passing the primary again or repeating an
+        // additional label must not pollute the persisted additional-label list.
+        let (mut db, _) = make_db_with_schema();
+        let (rid, assignments) = db
+            .insert_node_with_dynamic_labels(
+                "User",
+                vec!["User", "X", "X"],
+                HashMap::from([("id".to_string(), json!("u1"))]),
+            )
+            .unwrap();
+        let x_id = assignments["X"].id;
+
+        // Names: primary "User" appears once, "X" once, no duplicates.
+        let mut names = db.get_node_label_names(rid).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["User".to_string(), "X".to_string()]);
+
+        // Additional ids: deduplicated and the primary id excluded.
+        assert_eq!(db.get_additional_labels(rid).unwrap(), vec![x_id]);
     }
 
     #[test]
@@ -2247,8 +4067,14 @@ mod tests {
         let registry = db.load_schema_registry().unwrap();
         let type_id = registry.node_type_id("User").unwrap();
         assert_eq!(
-            crate::storage::index::find(&db.topo, &mut db.file, type_id, "id", &json!("u1"))
-                .unwrap(),
+            crate::storage::index::find(
+                &db.topo,
+                &mut db.file,
+                type_id,
+                &PropertyPath::from("id"),
+                &json!("u1")
+            )
+            .unwrap(),
             Some(rid.0)
         );
     }
@@ -2269,8 +4095,14 @@ mod tests {
         let type_id = registry.node_type_id("User").unwrap();
         db.delete_node(rid).unwrap();
         assert_eq!(
-            crate::storage::index::find(&db.topo, &mut db.file, type_id, "id", &json!("u1"))
-                .unwrap(),
+            crate::storage::index::find(
+                &db.topo,
+                &mut db.file,
+                type_id,
+                &PropertyPath::from("id"),
+                &json!("u1")
+            )
+            .unwrap(),
             None
         );
     }
@@ -2298,13 +4130,25 @@ mod tests {
         let registry = db.load_schema_registry().unwrap();
         let type_id = registry.node_type_id("User").unwrap();
         assert_eq!(
-            crate::storage::index::find(&db.topo, &mut db.file, type_id, "name", &json!("Alice"))
-                .unwrap(),
+            crate::storage::index::find(
+                &db.topo,
+                &mut db.file,
+                type_id,
+                &PropertyPath::from("name"),
+                &json!("Alice")
+            )
+            .unwrap(),
             None
         );
         assert_eq!(
-            crate::storage::index::find(&db.topo, &mut db.file, type_id, "name", &json!("Alicia"))
-                .unwrap(),
+            crate::storage::index::find(
+                &db.topo,
+                &mut db.file,
+                type_id,
+                &PropertyPath::from("name"),
+                &json!("Alicia")
+            )
+            .unwrap(),
             Some(rid.0)
         );
     }
@@ -2328,8 +4172,14 @@ mod tests {
         let registry = db2.load_schema_registry().unwrap();
         let type_id = registry.node_type_id("User").unwrap();
         assert_eq!(
-            crate::storage::index::find(&db2.topo, &mut db2.file, type_id, "id", &json!("u1"))
-                .unwrap(),
+            crate::storage::index::find(
+                &db2.topo,
+                &mut db2.file,
+                type_id,
+                &PropertyPath::from("id"),
+                &json!("u1")
+            )
+            .unwrap(),
             Some(rid.0)
         );
     }
@@ -2374,6 +4224,45 @@ mod tests {
         let labels = db.get_edge_label_names(eid).unwrap();
         assert!(labels.contains(&"OWNS".to_string()));
         assert!(labels.contains(&"MANAGES".to_string()));
+    }
+
+    #[test]
+    fn edge_additional_labels_normalized_to_a_set() {
+        // Edge multi-labels are set-like, mirroring the node-side invariant: the primary
+        // edge type must not appear in the additional list, and ids must not repeat.
+        let (mut db, _) = make_db_with_schema2();
+        let u = db
+            .insert_node_by_name("User", HashMap::from([("id".to_string(), json!("u1"))]))
+            .unwrap();
+        let p = db
+            .insert_node_by_name("Project", HashMap::from([("id".to_string(), json!("p1"))]))
+            .unwrap();
+
+        let registry = db.load_schema_registry().unwrap();
+        let owns_id = registry.edge_type_id("OWNS").unwrap();
+        let manages_id = registry.edge_type_id("MANAGES").unwrap();
+
+        // Pass the primary type ("OWNS") and a duplicated additional ("MANAGES") in the set.
+        let eid = db
+            .insert_edge_with_labels(
+                owns_id,
+                u,
+                p,
+                vec![owns_id, manages_id, manages_id],
+                HashMap::from([("role".to_string(), json!("owner"))]),
+            )
+            .unwrap();
+
+        // Additional ids: deduplicated and the primary id excluded.
+        assert_eq!(
+            db.get_edge_additional_labels(eid).unwrap(),
+            vec![manages_id]
+        );
+
+        // Names: primary "OWNS" once, "MANAGES" once, no duplicates.
+        let mut names = db.get_edge_label_names(eid).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["MANAGES".to_string(), "OWNS".to_string()]);
     }
 
     #[test]
@@ -2447,12 +4336,74 @@ mod tests {
                     &db.topo,
                     &mut db.file,
                     type_id,
-                    "id",
+                    &PropertyPath::from("id"),
                     &json!(name.clone()),
                 )
                 .unwrap();
                 prop_assert_eq!(by_scan, expected);
             }
+        }
+
+        /// A-2 invariant: under a random interleave of insert / delete / update, every live node's
+        /// properties always read back correctly, and the property page count stays bounded by the
+        /// *live* set — not the historical total. A space leak (freed property pages never reused)
+        /// would make the page count grow with total operations, unbounded by the live count.
+        #[test]
+        fn property_space_bounded_by_live_set_under_churn(
+            ops in proptest::collection::vec(0u8..3, 50..200usize),
+        ) {
+            let (mut db, _) = make_db();
+            // Model: live node rid -> the tag we last wrote (to verify reads).
+            let mut live: Vec<(NodeRid, usize)> = Vec::new();
+            let mut next_tag = 0usize;
+            let payload = |tag: usize| {
+                let mut m = HashMap::new();
+                m.insert("v".to_string(), json!("y".repeat(300)));
+                m.insert("tag".to_string(), json!(tag));
+                m
+            };
+            for op in ops {
+                match op {
+                    0 => {
+                        // insert
+                        let tag = next_tag;
+                        next_tag += 1;
+                        let rid = db.insert_node(1, payload(tag)).unwrap();
+                        live.push((rid, tag));
+                    }
+                    1 if !live.is_empty() => {
+                        // delete an arbitrary live node
+                        let idx = next_tag % live.len();
+                        let (rid, _) = live.remove(idx);
+                        db.delete_node(rid).unwrap();
+                    }
+                    2 if !live.is_empty() => {
+                        // update an arbitrary live node to a fresh value
+                        let idx = next_tag % live.len();
+                        let tag = next_tag;
+                        next_tag += 1;
+                        let (rid, _) = live[idx];
+                        db.update_node_properties(rid, payload(tag)).unwrap();
+                        live[idx] = (rid, tag);
+                    }
+                    _ => {}
+                }
+            }
+            // Every live node reads back the value last written to it.
+            for (rid, tag) in &live {
+                let got = db.get_node_properties(*rid).unwrap();
+                prop_assert_eq!(got.get("tag"), Some(&json!(*tag)));
+            }
+            // Property pages are bounded by the live set. Each ~330B value packs ~10/page, so the
+            // live set needs ~live/10 pages; allow generous slack for partial pages and the
+            // coarse (page-granular) reclaim, but far below the historical total (`next_tag`).
+            let prop_pages = db.file.header.property_dir_len as usize;
+            let bound = live.len() + 8; // pages can't exceed live values + slack; << total ops
+            prop_assert!(
+                prop_pages <= bound,
+                "property pages {} exceed live-set bound {} (live={}, total writes={})",
+                prop_pages, bound, live.len(), next_tag
+            );
         }
     }
 
@@ -2577,28 +4528,25 @@ mod tests {
     }
 
     #[test]
-    fn insert_node_returns_error_when_node_capacity_exceeded() {
+    fn insert_grows_past_the_old_fixed_node_cap() {
+        // The old fixed topology segment capped a database at ~2000 nodes. With variable
+        // topology (node pages mapped through a directory), inserting well past that count must
+        // now succeed, and every node must still read back.
         let (mut db, _) = make_db();
-        // The topology segment holds a fixed number of pages. Exceeding it must surface
-        // as a CapacityExceeded error from insert_node (enforced at allocation time).
-        let node_capacity = (db.file.header.property_segment_start
-            - db.file.header.topology_segment_start)
-            .div_ceil(2) as usize;
-        // Keep allocating nodes until we hit capacity.
-        let mut result = Ok(NodeRid::new(0, 0));
-        while db.topo.node_page_count() <= node_capacity {
-            result = db.insert_node(1, HashMap::new());
-            if result.is_err() {
-                break;
-            }
+        // The old cap was 32 node pages * ~63 slots ≈ 2016; exceed it comfortably.
+        let n = 2500;
+        let mut rids = Vec::with_capacity(n);
+        for _ in 0..n {
+            rids.push(
+                db.insert_node(1, HashMap::new())
+                    .expect("insert past the old cap must succeed"),
+            );
         }
-        assert!(
-            matches!(
-                result,
-                Err(GraphError::CapacityExceeded { kind: "node", .. })
-            ),
-            "expected CapacityExceeded, got {result:?}"
-        );
+        assert_eq!(db.count_nodes(None).unwrap(), n as u64);
+        // Spot-check that records spanning many logical node pages are all readable.
+        for rid in [rids[0], rids[n / 2], rids[n - 1]] {
+            assert!(db.topo.node_slot_used(&mut db.file, rid.0));
+        }
     }
 
     #[test]

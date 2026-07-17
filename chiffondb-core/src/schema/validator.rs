@@ -26,6 +26,17 @@ pub fn validate(ast: &SchemaAst) -> Result<(), GraphError> {
                         )));
                     }
                 }
+                // A tier-2 index (`@index`/`@unique`) keys on a scalar value, so it may only
+                // annotate a scalar field — reject it on List/Map/Vector/Json/Blob/refs.
+                for field in &node.fields {
+                    if (field.indexed || field.unique) && !is_indexable_scalar(&field.type_expr) {
+                        return Err(GraphError::SchemaError(format!(
+                            "node '{}' field '{}': @index/@unique requires a scalar type \
+                             (Int/Float/Boolean/DateTime/String)",
+                            node.name, field.name
+                        )));
+                    }
+                }
             }
             Definition::Edge(edge) => {
                 // Check that the generic upper-bound type exists
@@ -85,6 +96,15 @@ fn validate_edge_endpoint(
         }
         _ => Ok(()),
     }
+}
+
+/// Whether a field type may carry a tier-2 index. Only scalar values have a well-defined
+/// equality key; `List`/`Map`/`Vector`/`Json`/`Blob`/refs do not.
+fn is_indexable_scalar(t: &TypeExpr) -> bool {
+    matches!(
+        t,
+        TypeExpr::Int | TypeExpr::Float | TypeExpr::Boolean | TypeExpr::DateTime | TypeExpr::String
+    )
 }
 
 #[cfg(test)]
@@ -167,5 +187,28 @@ mod tests {
         "#;
         let ast = parse(src).unwrap();
         assert!(validate(&ast).is_ok());
+    }
+
+    #[test]
+    fn index_on_scalar_is_allowed() {
+        let ast = parse("node User { email: String @index  age: Int @index }").unwrap();
+        assert!(validate(&ast).is_ok());
+    }
+
+    #[test]
+    fn index_on_non_scalar_is_rejected() {
+        // @index requires a scalar; List/Map/Json/Vector must be rejected.
+        for src in [
+            "node U { tags: List<String> @index }",
+            "node U { meta: Json @index }",
+            "node U { embedding: Vector<8> @index }",
+            "node U { m: Map<String, Int> @index }",
+        ] {
+            let ast = parse(src).unwrap();
+            assert!(
+                validate(&ast).is_err(),
+                "@index on non-scalar should be rejected: {src}"
+            );
+        }
     }
 }
