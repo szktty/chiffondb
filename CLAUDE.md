@@ -54,7 +54,9 @@ space is still not reclaimed; crash atomicity is not guaranteed per API call).
   worker or reviewer and follows its instructions — see `.claude/skills/triad/SKILL.md`.
 - The actual review/implement steps (verify/result/fix/request/close) are defined in
   `.claude/skills/triad-plan/SKILL.md`. Read it only when running one of those steps.
-- Record in-progress work from AI sessions in `../chiffondb-private/docs/working.md`.
+- **At the start of every session, and again before ending one (or after any meaningful
+  chunk of work), use the `working-log` skill** (`.claude/skills/working-log/SKILL.md`)
+  to resume from / append to `../chiffondb-private/docs/working.md`.
 
 ### Code style
 - `unwrap()` / `expect()` are banned. Propagate errors with the `?` operator.
