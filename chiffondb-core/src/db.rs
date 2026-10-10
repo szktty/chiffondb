@@ -20,7 +20,9 @@ use crate::traversal::command::PropertyPath;
 use crate::traversal::executor::{EdgeId, GraphAccess, NodeId};
 
 pub type NodeList = Vec<(NodeRid, HashMap<String, Value>)>;
-pub type EdgeList = Vec<(EdgeRid, HashMap<String, Value>)>;
+/// エッジの一覧。型 ID を含むのは、呼び出し側が型名を引けるようにするためである。
+/// ノードは `get_node_labels` で型を取れるが、エッジには相当するものが無い。
+pub type EdgeList = Vec<(EdgeRid, u16, HashMap<String, Value>)>;
 
 /// The result of resolving a label name: its type id and whether the registration was
 /// newly created (`true`) or already existed (`false`).
@@ -473,7 +475,7 @@ impl Database {
                 }
             }
             let props = self.get_edge_properties_raw(rid)?;
-            result.push((EdgeRid(rid), props));
+            result.push((EdgeRid(rid), edge.edge_type_id, props));
         }
         Ok(result)
     }

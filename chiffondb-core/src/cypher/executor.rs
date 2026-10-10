@@ -1443,7 +1443,7 @@ impl DatabaseExt for Database {
     ) -> Result<NeighborList, GraphError> {
         let all_edges = self.list_edges(edge_label)?;
         let mut result = Vec::new();
-        for (edge_rid, edge_props) in all_edges {
+        for (edge_rid, _edge_type_id, edge_props) in all_edges {
             let (from, to) = self.get_edge_endpoints(edge_rid)?;
             if from == node_rid {
                 result.push((edge_rid, edge_props, to));
@@ -1459,7 +1459,7 @@ impl DatabaseExt for Database {
     ) -> Result<NeighborList, GraphError> {
         let all_edges = self.list_edges(edge_label)?;
         let mut result = Vec::new();
-        for (edge_rid, edge_props) in all_edges {
+        for (edge_rid, _edge_type_id, edge_props) in all_edges {
             let (from, to) = self.get_edge_endpoints(edge_rid)?;
             if to == node_rid {
                 result.push((edge_rid, edge_props, from));

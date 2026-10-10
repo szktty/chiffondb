@@ -1,0 +1,116 @@
+//! End-to-end check of the UniFFI surface, exercised as the Kotlin client will:
+//! open a database, write a node, read it back.
+
+use chiffondb_uniffi::Connection;
+
+const SCHEMA: &str = r#"
+node Memo {
+  title: String
+}
+"#;
+
+#[test]
+fn insert_then_read_back() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::open_in_memory()?;
+    conn.apply_schema(SCHEMA.to_string())?;
+
+    let rid = conn.insert_node("Memo".to_string(), r#"{"title":"hello"}"#.to_string())?;
+
+    let props = conn.get_node_properties(rid)?;
+    assert!(props.contains("hello"), "unexpected properties: {props}");
+    assert_eq!(conn.count_nodes(None)?, 1);
+
+    let listed = conn.list_nodes(None)?;
+    assert!(listed.contains("hello"), "unexpected listing: {listed}");
+
+    conn.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn errors_cross_the_boundary_as_results() {
+    // A missing file must surface as an error rather than a panic; the Kotlin
+    // side sees this as a thrown exception.
+    let err = Connection::open("/nonexistent/path/to.chiffon".to_string());
+    assert!(err.is_err());
+}
+
+const GRAPH_SCHEMA: &str = r#"
+node Memo {
+  title: String
+}
+
+edge REFERS {
+  from: Memo
+  to: Memo
+  props: {
+    note: String
+  }
+}
+"#;
+
+#[test]
+fn edges_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::open_in_memory()?;
+    conn.apply_schema(GRAPH_SCHEMA.to_string())?;
+
+    let a = conn.insert_node("Memo".to_string(), r#"{"title":"a"}"#.to_string())?;
+    let b = conn.insert_node("Memo".to_string(), r#"{"title":"b"}"#.to_string())?;
+
+    let edge = conn.insert_edge(
+        "REFERS".to_string(),
+        a,
+        b,
+        r#"{"note":"see also"}"#.to_string(),
+    )?;
+
+    let listed = conn.list_edges(None)?;
+    assert!(listed.contains("see also"), "unexpected listing: {listed}");
+
+    // Endpoints must survive the round trip; the client rebuilds the graph from them.
+    // The keys are "from"/"to", unlike list_edges which uses "src_rid"/"dst_rid".
+    let endpoints = conn.get_edge_endpoints(edge)?;
+    assert!(
+        endpoints.contains("from"),
+        "unexpected endpoints: {endpoints}"
+    );
+    assert!(
+        endpoints.contains("to"),
+        "unexpected endpoints: {endpoints}"
+    );
+
+    assert!(conn.edge_exists(edge)?);
+    conn.delete_edge(edge)?;
+    assert!(!conn.edge_exists(edge)?);
+
+    Ok(())
+}
+
+#[test]
+fn nodes_can_be_updated_and_deleted() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::open_in_memory()?;
+    conn.apply_schema(GRAPH_SCHEMA.to_string())?;
+
+    let rid = conn.insert_node("Memo".to_string(), r#"{"title":"before"}"#.to_string())?;
+    conn.update_node_properties(rid, r#"{"title":"after"}"#.to_string())?;
+    assert!(conn.get_node_properties(rid)?.contains("after"));
+
+    assert!(conn.node_exists(rid)?);
+    conn.delete_node(rid)?;
+    assert!(!conn.node_exists(rid)?);
+
+    Ok(())
+}
+
+#[test]
+fn transactions_roll_back() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::open_in_memory()?;
+    conn.apply_schema(GRAPH_SCHEMA.to_string())?;
+
+    conn.begin_transaction()?;
+    conn.insert_node("Memo".to_string(), r#"{"title":"discarded"}"#.to_string())?;
+    conn.rollback_transaction()?;
+
+    assert_eq!(conn.count_nodes(None)?, 0);
+    Ok(())
+}

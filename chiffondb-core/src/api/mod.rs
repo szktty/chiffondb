@@ -212,16 +212,23 @@ impl Connection {
             .db_mut()?
             .list_edges(type_name.as_deref())
             .map_err(|e| e.to_string())?;
+        // 型 ID から名前を引く。読めなければ型名を出さない
+        let registry = self.db_mut()?.load_schema_registry().ok();
         let mut items = Vec::with_capacity(edges.len());
-        for (rid, props) in edges {
+        for (rid, type_id, props) in edges {
             let (src_rid, dst_rid) = self
                 .db_mut()?
                 .get_edge_endpoints(rid)
                 .map_err(|e| e.to_string())?;
+            let type_name = registry
+                .as_ref()
+                .and_then(|r| r.edge_type_name(type_id))
+                .map(|s| s.to_string());
             items.push(serde_json::json!({
                 "rid": { "page": rid.page_id().0, "slot": rid.slot_id().0 },
                 "src_rid": { "page": src_rid.page_id().0, "slot": src_rid.slot_id().0 },
                 "dst_rid": { "page": dst_rid.page_id().0, "slot": dst_rid.slot_id().0 },
+                "type": type_name,
                 "props": props,
             }));
         }
@@ -929,6 +936,73 @@ edge FOLLOWS {
         assert_eq!(item["src_rid"]["slot"], serde_json::json!(alice.slot));
         assert_eq!(item["dst_rid"]["page"], serde_json::json!(bob.page));
         assert_eq!(item["dst_rid"]["slot"], serde_json::json!(bob.slot));
+        // 型名も返す。ノードは get_node_labels で取れるが、
+        // エッジには相当するものが無かった
+        assert_eq!(item["type"], serde_json::json!("FOLLOWS"));
+    }
+
+    #[test]
+    fn list_edges_returns_type_name_for_each_edge() {
+        // 共有の SCHEMA はエッジ型が 1 つしか無い。
+        // 型ごとに名前が付くことを見るため、ここだけ専用の型を持つ
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.into_temp_path().to_path_buf();
+        std::fs::remove_file(&path).ok();
+        let mut conn =
+            Connection::create(path.to_string_lossy().into_owned()).expect("create connection");
+        conn.apply_schema(
+            "
+node Person {
+  id: String
+}
+
+edge FOLLOWS {
+  from: Person
+  to: Person
+}
+
+edge KNOWS {
+  from: Person
+  to: Person
+}
+"
+            .to_string(),
+        )
+        .expect("apply schema");
+        let alice = conn
+            .insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
+            .expect("insert alice");
+        let bob = conn
+            .insert_node("Person".to_string(), r#"{"id": "u2"}"#.to_string())
+            .expect("insert bob");
+        let rid = |n: &RecordId| RecordId {
+            page: n.page,
+            slot: n.slot,
+        };
+        conn.insert_edge(
+            "FOLLOWS".to_string(),
+            rid(&alice),
+            rid(&bob),
+            "{}".to_string(),
+        )
+        .expect("insert follows");
+        conn.insert_edge(
+            "KNOWS".to_string(),
+            rid(&bob),
+            rid(&alice),
+            "{}".to_string(),
+        )
+        .expect("insert knows");
+
+        // 型で絞らずに読んでも、1 件ずつ型名が付く
+        let json = conn.list_edges(None).expect("list edges");
+        let items: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parse json");
+        let mut types: Vec<String> = items
+            .iter()
+            .map(|i| i["type"].as_str().unwrap_or_default().to_string())
+            .collect();
+        types.sort();
+        assert_eq!(types, vec!["FOLLOWS".to_string(), "KNOWS".to_string()]);
     }
 
     #[test]

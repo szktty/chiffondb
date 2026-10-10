@@ -1,0 +1,27 @@
+[package]
+name = "chiffondb-uniffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "UniFFI layer for ChiffonDB — consumed by the Kotlin Multiplatform client."
+
+[lib]
+name = "chiffondb_uniffi"
+# `lib` is required in addition to the native artifacts: the uniffi-bindgen
+# binary links this crate to read the exported metadata.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+chiffondb-core = { path = "../chiffondb-core" }
+uniffi = { version = "=0.32.0", features = ["cli"] }
+thiserror = "2"
+
+[build-dependencies]
+uniffi = { version = "=0.32.0", features = ["build"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"

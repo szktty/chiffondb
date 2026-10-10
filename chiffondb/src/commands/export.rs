@@ -100,14 +100,14 @@ fn export_csv(db: &mut Database, type_name: &str) -> Result<String> {
             wtr.write_record([":TYPE", ":FROM", ":TO"])
                 .with_context(|| "failed to write CSV")?;
         } else {
-            let mut keys: Vec<String> = edges[0].1.keys().cloned().collect();
+            let mut keys: Vec<String> = edges[0].2.keys().cloned().collect();
             keys.sort();
             let mut header = vec![":TYPE".to_string(), ":FROM".to_string(), ":TO".to_string()];
             header.extend(keys.clone());
             wtr.write_record(&header)
                 .with_context(|| "failed to write CSV header")?;
 
-            for (eid, props) in &edges {
+            for (eid, _type_id, props) in &edges {
                 let (from_node, to_node) = db
                     .get_edge_endpoints(*eid)
                     .with_context(|| format!("failed to read edge {:?}", eid))?;
@@ -171,7 +171,7 @@ fn export_json(db: &mut Database, type_name: Option<&str>) -> Result<String> {
     let edges = db
         .list_edges(type_name)
         .with_context(|| "failed to list edges")?;
-    for (eid, props) in edges {
+    for (eid, _type_id, props) in edges {
         let type_label = db.get_edge_type_name(eid).unwrap_or_default();
         let (from_node, to_node) = db
             .get_edge_endpoints(eid)
