@@ -212,7 +212,7 @@ impl Connection {
             .db_mut()?
             .list_edges(type_name.as_deref())
             .map_err(|e| e.to_string())?;
-        // 型 ID から名前を引く。読めなければ型名を出さない
+        // Best effort: if the schema cannot be loaded, `type` is null rather than an error.
         let registry = self.db_mut()?.load_schema_registry().ok();
         let mut items = Vec::with_capacity(edges.len());
         for (rid, type_id, props) in edges {
@@ -936,15 +936,13 @@ edge FOLLOWS {
         assert_eq!(item["src_rid"]["slot"], serde_json::json!(alice.slot));
         assert_eq!(item["dst_rid"]["page"], serde_json::json!(bob.page));
         assert_eq!(item["dst_rid"]["slot"], serde_json::json!(bob.slot));
-        // 型名も返す。ノードは get_node_labels で取れるが、
-        // エッジには相当するものが無かった
         assert_eq!(item["type"], serde_json::json!("FOLLOWS"));
     }
 
     #[test]
     fn list_edges_returns_type_name_for_each_edge() {
-        // 共有の SCHEMA はエッジ型が 1 つしか無い。
-        // 型ごとに名前が付くことを見るため、ここだけ専用の型を持つ
+        // The shared SCHEMA has a single edge type, so this test defines its own to tell
+        // per-edge type names apart.
         let tmp = NamedTempFile::new().expect("create temp file");
         let path = tmp.into_temp_path().to_path_buf();
         std::fs::remove_file(&path).ok();
@@ -994,7 +992,6 @@ edge KNOWS {
         )
         .expect("insert knows");
 
-        // 型で絞らずに読んでも、1 件ずつ型名が付く
         let json = conn.list_edges(None).expect("list edges");
         let items: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parse json");
         let mut types: Vec<String> = items
