@@ -352,4 +352,21 @@ mod tests {
         let p = Path::new("/tmp/mydb.chiffon");
         assert_eq!(wal_path(p), PathBuf::from("/tmp/mydb.chiffon-wal"));
     }
+
+    #[test]
+    fn wal_path_is_extension_agnostic() {
+        // The suffix is appended to the whole file name, so embedders can pick their own extension.
+        assert_eq!(
+            wal_path(Path::new("/tmp/mydb.rinne")),
+            PathBuf::from("/tmp/mydb.rinne-wal")
+        );
+        assert_eq!(
+            wal_path(Path::new("/tmp/my.db.v2")),
+            PathBuf::from("/tmp/my.db.v2-wal")
+        );
+        assert_eq!(
+            wal_path(Path::new("/tmp/mydb")),
+            PathBuf::from("/tmp/mydb-wal")
+        );
+    }
 }

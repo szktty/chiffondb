@@ -972,6 +972,40 @@ mod tests {
     }
 
     #[test]
+    fn lock_path_is_extension_agnostic() {
+        assert_eq!(
+            lock_path(Path::new("/tmp/mydb.rinne")),
+            PathBuf::from("/tmp/mydb.rinne-lock")
+        );
+        assert_eq!(
+            lock_path(Path::new("/tmp/mydb")),
+            PathBuf::from("/tmp/mydb-lock")
+        );
+    }
+
+    // Embedders ship databases under their own extension; nothing may assume `.chiffon`.
+    #[test]
+    fn non_chiffon_extension_works_end_to_end() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.rinne");
+
+        {
+            let db = DatabaseFile::create(&path).unwrap();
+            assert_eq!(db.wal_path(), Some(dir.path().join("test.rinne-wal")));
+            assert!(dir.path().join("test.rinne-wal").exists());
+            assert!(dir.path().join("test.rinne-lock").exists());
+            assert!(!dir.path().join("test.chiffon-wal").exists());
+            assert!(!dir.path().join("test.chiffon-lock").exists());
+
+            // The lock derived from the custom name still excludes a second opener.
+            assert!(DatabaseFile::open(&path).is_err());
+        }
+
+        let db = DatabaseFile::open(&path).unwrap();
+        assert_eq!(db.header.version, VERSION);
+    }
+
+    #[test]
     fn create_and_reopen_reads_correct_header() {
         let dir = TempDir::new().unwrap();
         let path = make_db_path(&dir);
