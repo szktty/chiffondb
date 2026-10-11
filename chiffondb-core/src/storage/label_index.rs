@@ -293,10 +293,15 @@ impl<'a> LabelIndex<'a> {
             }
         };
 
+        // Repoint the root at `d` as soon as `d` links back to `head`, before `rest` is hung
+        // behind the empty pages. If a later write fails, the chain is then a cycle that the
+        // walks report as `StorageCorrupted`; rooting last would instead leave `d` and its
+        // entries unreachable with no error.
         let mut d_page = self.file.read_page(d)?;
         let rest = read_next(&d_page);
         write_next(&mut d_page, head);
         self.file.write_page(d, &d_page)?;
+        self.set_head(type_id, d)?;
         if last_empty != head {
             let mut last_page = self.file.read_page(last_empty)?;
             write_next(&mut last_page, rest);
@@ -309,7 +314,6 @@ impl<'a> LabelIndex<'a> {
         }
         write_spare_tail(&mut head_page, last_empty);
         self.file.write_page(head, &head_page)?;
-        self.set_head(type_id, d)?;
         Ok(d)
     }
 
@@ -799,6 +803,45 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(got.len(), n);
+    }
+
+    #[test]
+    fn chain_left_mid_promotion_is_reported_as_corrupt() {
+        // Reproduces by hand the state `promote_first_non_empty` is in after its first two
+        // writes (`d.next = head`, root → `d`), as if the rest of the relink had failed. The
+        // chain is then a cycle, and every walk must report it rather than return a short set.
+        let mut f = file();
+        for i in 0..=ENTRIES_PER_PAGE * 2 {
+            LabelIndex::new(&mut f)
+                .add_new(1, rid(i as u32, 0))
+                .unwrap();
+        }
+        LabelIndex::new(&mut f)
+            .remove(1, rid(ENTRIES_PER_PAGE as u32 * 2, 0))
+            .unwrap();
+        assert_eq!(
+            chain_counts(&mut f, 1),
+            vec![0, ENTRIES_PER_PAGE, ENTRIES_PER_PAGE]
+        );
+
+        let head = LabelIndex::new(&mut f).head_of(1).unwrap().unwrap();
+        let d = read_next(&f.read_page(head).unwrap());
+        let mut d_page = f.read_page(d).unwrap();
+        write_next(&mut d_page, head);
+        f.write_page(d, &d_page).unwrap();
+        LabelIndex::new(&mut f).set_head(1, d).unwrap();
+
+        let mut idx = LabelIndex::new(&mut f);
+        assert!(matches!(idx.get(1), Err(GraphError::StorageCorrupted(_))));
+        assert!(matches!(idx.count(1), Err(GraphError::StorageCorrupted(_))));
+        assert!(matches!(
+            idx.remove(1, rid(u32::MAX - 1, 0)),
+            Err(GraphError::StorageCorrupted(_))
+        ));
+        assert!(matches!(
+            idx.add(1, rid(u32::MAX - 1, 0)),
+            Err(GraphError::StorageCorrupted(_))
+        ));
     }
 
     #[test]
