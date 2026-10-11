@@ -256,6 +256,17 @@ fn write_schema_dto(db: &mut DatabaseFile, dto: &SchemaDto) -> Result<(), GraphE
     db.flush()
 }
 
+/// Copies the stored schema from `src` to `dst` verbatim: definitions, name→type_id assignments
+/// (including dynamically registered names, which have no definition) and the id counters.
+///
+/// For rebuilding a database into a fresh file. `save_schema` on the loaded AST is not enough
+/// there: with no previous schema in `dst` it reassigns ids from definition order, while the
+/// copied nodes and edges still carry the ids `src` assigned.
+pub fn copy_schema(src: &mut DatabaseFile, dst: &mut DatabaseFile) -> Result<(), GraphError> {
+    let dto = load_schema_dto(src)?;
+    write_schema_dto(dst, &dto)
+}
+
 /// The kind of type being registered dynamically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynamicTypeKind {
