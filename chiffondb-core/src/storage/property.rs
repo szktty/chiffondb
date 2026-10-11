@@ -220,8 +220,11 @@ const NO_NEXT_PAGE: u32 = 0xFFFF_FFFF;
 pub const CHAIN_DATA_PER_PAGE: usize = PAGE_SIZE - CHAIN_HEADER_SIZE;
 
 /// Calculates the number of pages required to write a page chain.
+///
+/// Never 0: an empty blob still occupies one page (chunk_length 0, no next page), because a
+/// chain is addressed by its head page and a reader needs the end sentinel to stop there.
 pub fn pages_needed(data_len: usize) -> usize {
-    data_len.div_ceil(CHAIN_DATA_PER_PAGE)
+    data_len.div_ceil(CHAIN_DATA_PER_PAGE).max(1)
 }
 
 /// Writes data into a page chain.
@@ -426,6 +429,22 @@ mod tests {
     }
 
     #[test]
+    fn empty_blob_roundtrip() {
+        let needed = pages_needed(0);
+        assert_eq!(needed, 1);
+        let mut pages = vec![[0u8; PAGE_SIZE]; needed];
+        write_blob_chain(&mut pages, &[]).unwrap();
+        let result = read_blob_chain(&pages).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn empty_blob_without_a_page_is_rejected() {
+        let mut pages: Vec<[u8; PAGE_SIZE]> = Vec::new();
+        assert!(write_blob_chain(&mut pages, &[]).is_err());
+    }
+
+    #[test]
     fn large_blob_multi_page() {
         let data: Vec<u8> = (0..u8::MAX).cycle().take(PAGE_SIZE * 3).collect();
         let needed = pages_needed(data.len());
@@ -442,7 +461,7 @@ mod tests {
         fn random_blob_roundtrip(
             data in proptest::collection::vec(any::<u8>(), 0..PAGE_SIZE * 4)
         ) {
-            let needed = pages_needed(data.len()).max(1);
+            let needed = pages_needed(data.len());
             let mut pages = vec![[0u8; PAGE_SIZE]; needed];
             write_blob_chain(&mut pages, &data).unwrap();
             let result = read_blob_chain(&pages).unwrap();

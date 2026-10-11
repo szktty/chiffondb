@@ -241,7 +241,7 @@ pub fn save_schema(db: &mut DatabaseFile, ast: &SchemaAst) -> Result<(), GraphEr
 fn write_schema_dto(db: &mut DatabaseFile, dto: &SchemaDto) -> Result<(), GraphError> {
     let bytes = serde_json::to_vec(dto).map_err(|e| GraphError::SchemaError(e.to_string()))?;
 
-    let needed = pages_needed(bytes.len()).max(1);
+    let needed = pages_needed(bytes.len());
     let mut pages = vec![[0u8; PAGE_SIZE]; needed];
     write_blob_chain(&mut pages, &bytes)?;
 
