@@ -18,7 +18,6 @@ use chiffondb_core::traversal::command::{
 use chiffondb_core::traversal::executor::execute;
 use serde_json::json;
 
-// Bounded by the fixed-size topology segment (~32 node pages × ~63 records).
 const NODES: usize = 1_800;
 
 /// A chunky property payload so each node spills into the (unbounded) property

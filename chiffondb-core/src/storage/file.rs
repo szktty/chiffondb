@@ -266,7 +266,7 @@ enum StorageBackend {
         wal: WalFile,
         /// Bounded in-memory page cache. Reads are served from here when hot,
         /// keeping the resident footprint independent of database size.
-        cache: PageCache,
+        cache: Box<PageCache>,
         /// Exclusive advisory lock held for the lifetime of this DatabaseFile.
         /// Prevents two processes from opening the same .chiffon simultaneously.
         _lock: File,
@@ -460,7 +460,7 @@ impl DatabaseFile {
                 file,
                 db_path: path.to_path_buf(),
                 wal,
-                cache: PageCache::new(opts.cache_capacity()),
+                cache: Box::new(PageCache::new(opts.cache_capacity())),
                 _lock: lock,
             },
             header,
@@ -515,7 +515,7 @@ impl DatabaseFile {
         Ok(Self {
             backend: StorageBackend::File {
                 file,
-                cache: PageCache::new(opts.cache_capacity()),
+                cache: Box::new(PageCache::new(opts.cache_capacity())),
                 db_path: path.to_path_buf(),
                 wal,
                 _lock: lock,

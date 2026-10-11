@@ -1320,10 +1320,10 @@ chiffon import --db restored.chiffon --format json backup.json
 
 | Item | Status |
 |------|--------|
-| Variable-length topology segment | Not supported. The segment is fixed (`[topology_segment_start, property_segment_start)`, default Pages 1–63), so a single DB holds at most ~2000 nodes before `CapacityExceeded`. Variable-length is future work |
+| Node / edge count | No fixed cap. Node, edge, and property pages grow on the file's append tail through per-kind page directories; the ceiling is the u32 logical page space, bounded in practice by disk |
 | CoW / MVCC | **Not implemented.** Durability is via the WAL (write-through). `page_directory_root` is reserved for a future MVCC (always 0). Transactions (begin/commit/rollback) are WAL-truncate based, but there is no multi-version concurrency control or non-blocking reads |
 | Concurrent access | Single process, single writer/reader. An exclusive advisory lock + in-process open tracking make a second open of the same file fail |
-| Cost of `find` / `list_nodes` / `count_nodes` | O(all nodes) topology scan (through the bounded page cache) since the in-memory index was removed. A bounded cache layer, etc., is future work if performance becomes an issue |
+| Cost of `find` / `list_nodes` / `count_nodes` | O(matches) when filtered by type (label index) or by an `@index` field (property index); otherwise an O(all nodes) topology scan through the bounded page cache |
 | `chiffon vacuum` / `chiffon verify` CLI commands | Not added (`Database::vacuum()` / `vacuum_file()` / `verify()` are implemented) |
 | Actual Vector storage/search (HNSW) | Reserved space only (post-MVP) |
 | Full-text search index | Not implemented (`Contains`, `Matches` are linear scans) |

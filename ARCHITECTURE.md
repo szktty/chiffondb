@@ -39,7 +39,7 @@ misreading an older layout (there is no backward compatibility — see the versi
 | Offset | Field | Size | Contents |
 |--------|-------|------|----------|
 | 0 | magic | 8 | `CHIFFON\0` |
-| 8 | version | 4 | Format version (u32), currently 9 |
+| 8 | version | 4 | Format version (u32), currently 10 |
 | 12 | page_size | 4 | Page size (fixed at 4096) |
 | 16 | label_index_root | 4 | Root page of the tier-1 label index (`0xFFFFFFFF` = none) |
 | 20 | property_index_root | 4 | Root page of the tier-2/3 property index (`0xFFFFFFFF` = none) |
@@ -206,6 +206,16 @@ Maps `type_id → {node RecordId}` so `list_nodes(type)` / `count_nodes(type)` a
 instead of a full scan. A node is registered under **every** label it carries (primary
 `node_type_id` plus each additional/dynamic label), so `MATCH (n:Label)` hits under any of a node's
 labels. Structure: a per-type `RecordId` page chain, with a small `type_id → chain head` root map.
+A chain is ordered `head (partly filled) → empty spare pages → full pages`. Registering a new node
+writes to the head page; a full head is replaced by the first spare, or by a fresh page when there
+is none, so it costs O(1) regardless of how many nodes share the type. Removal walks the chain to
+find the entry (O(set size)) and fills the hole with the head's last entry, so every page that
+holds entries behind the head stays full. A head emptied by removals is refilled by later adds;
+when a further removal has to reach past it, the first page with entries moves to the front and the
+empty page stays behind it as a spare. The first spare records the last spare of the run in its
+otherwise unused entry area (a 6-byte `0xFF` marker, then a pid), which keeps both replacements
+O(1) for any number of spares; it is a checked hint, and chains written before spares existed are
+walked instead. A type therefore reuses every index page it has ever held (see Known limitations).
 Root at header offset 16. Source: `chiffondb-core/src/storage/label_index.rs`.
 
 ### Tier 2: property index — declared with `@index`
@@ -296,6 +306,10 @@ The file backend routes its page I/O through a single bounded LRU page cache (`s
 > **Known limitations (not addressed on this branch).**
 > - **Property reclaim is page-granular, not compacting** (A-2b): a page with one immortal live slot
 >   holds its other freed slots' bytes until that slot is freed too.
+> - **Label-index pages are never returned to the file.** When a type's node set shrinks, its
+>   emptied index pages stay in that type's chain as spares. They are reused when the same type
+>   grows again, but not by other types or other page kinds, so a type's index stays as large as
+>   the largest set it has held until a full rebuild (vacuum).
 > - **Schema-chain space is still not reclaimed in place.** Schema-chain rewrites reclaim only by a
 >   full rebuild (vacuum).
 > - **`live_node_rids` materializes every RecordId into a `Vec`**, which is O(nodes) memory at call

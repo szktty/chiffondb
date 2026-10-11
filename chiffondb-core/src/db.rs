@@ -156,8 +156,9 @@ impl Database {
             node.property_ref = Some(pref);
             self.topo.write_node(&mut self.file, &node)?;
         }
-        // Register the node under its primary type in the tier-1 label index.
-        LabelIndex::new(&mut self.file).add(type_id, rid)?;
+        // Register the node under its primary type in the tier-1 label index. `rid` was just
+        // allocated and delete_node unregisters a slot before freeing it, so it cannot be present.
+        LabelIndex::new(&mut self.file).add_new(type_id, rid)?;
         // Maintain tier-2 property indexes declared on this (primary) type.
         self.maintain_property_index(type_id, rid, &properties, IndexOp::Add)?;
         Ok(NodeRid(rid))
@@ -1121,7 +1122,7 @@ impl Database {
             }
             for &id in &normalized {
                 if !old.contains(&id) {
-                    index.add(id, rid)?;
+                    index.add_new(id, rid)?;
                 }
             }
         }
@@ -2643,6 +2644,143 @@ mod tests {
                 "label index drifted from brute-force for type {type_id}"
             );
         }
+    }
+
+    /// Compares the label index for each type with a brute-force scan of the node records.
+    /// Both sides are sorted Vecs, so a duplicate index entry fails just like a missing one.
+    fn assert_label_index_matches_bruteforce(db: &mut Database, type_ids: &[u16]) {
+        let all_rids = db.topo.live_node_rids(&mut db.file).unwrap();
+        for &type_id in type_ids {
+            let mut expected: Vec<RecordId> = Vec::new();
+            for &rid in &all_rids {
+                if db
+                    .get_node_type_ids(NodeRid(rid))
+                    .unwrap()
+                    .contains(&type_id)
+                {
+                    expected.push(rid);
+                }
+            }
+            let mut got = index::rids_of_type(&db.topo, &mut db.file, type_id).unwrap();
+            got.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+            expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+            assert_eq!(
+                got, expected,
+                "label index drifted from brute-force for type {type_id}"
+            );
+        }
+    }
+
+    /// Reviewer-added (review-2026-10-11a): the brute-force invariant on sets large enough to
+    /// span several label-index pages (681 entries each). Deleted node slots are reused by later
+    /// inserts, so `add_new` is called for RecordIds that were registered before — its "not yet
+    /// registered" precondition must hold through delete → slot reuse, or the index would hold
+    /// duplicates.
+    #[test]
+    fn label_index_matches_bruteforce_across_chain_pages_with_slot_reuse() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { id: String } node Admin { id: String }")
+            .unwrap();
+        let registry = db.load_schema_registry().unwrap();
+        let user = registry.node_type_id("User").unwrap();
+        let admin = registry.node_type_id("Admin").unwrap();
+
+        let mut live: Vec<NodeRid> = Vec::new();
+        for i in 0..1500 {
+            let labels = if i % 2 == 0 { vec![admin] } else { vec![] };
+            live.push(
+                db.insert_node_with_labels(user, labels, HashMap::new())
+                    .unwrap(),
+            );
+        }
+        assert_label_index_matches_bruteforce(&mut db, &[user, admin]);
+
+        // Delete 900 nodes spread over every index page, shrinking both sets across page
+        // boundaries.
+        let mut kept = Vec::new();
+        let mut freed = std::collections::HashSet::new();
+        for (i, rid) in live.into_iter().enumerate() {
+            if i % 5 < 3 {
+                db.delete_node(rid).unwrap();
+                freed.insert(rid.0);
+            } else {
+                kept.push(rid);
+            }
+        }
+        assert_label_index_matches_bruteforce(&mut db, &[user, admin]);
+
+        // Grow again; these inserts land on the freed slots.
+        let mut reused = 0;
+        for i in 0..400 {
+            let labels = if i % 3 == 0 { vec![admin] } else { vec![] };
+            let rid = db
+                .insert_node_with_labels(user, labels, HashMap::new())
+                .unwrap();
+            if freed.contains(&rid.0) {
+                reused += 1;
+            }
+            kept.push(rid);
+        }
+        assert!(reused > 0, "the test must exercise slot reuse");
+        // Flip the additional label on a spread of nodes (delta path of set_additional_labels).
+        for (i, &rid) in kept.iter().enumerate() {
+            if i % 4 == 0 {
+                db.add_node_label(rid, admin).unwrap();
+            } else if i % 4 == 1 {
+                db.remove_node_label(rid, admin).unwrap();
+            }
+        }
+        assert_label_index_matches_bruteforce(&mut db, &[user, admin]);
+    }
+
+    /// Reviewer-added (review-2026-10-11a): since head insertion, growing a set past a page
+    /// boundary rewrites the type's root slot, and a removal can move an entry between two index
+    /// pages. A rollback must undo both.
+    #[test]
+    fn label_index_rolls_back_across_a_head_page_switch() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { id: String }").unwrap();
+        let user = db
+            .load_schema_registry()
+            .unwrap()
+            .node_type_id("User")
+            .unwrap();
+        let mut base: Vec<NodeRid> = Vec::new();
+        for _ in 0..600 {
+            base.push(db.insert_node(user, HashMap::new()).unwrap());
+        }
+        db.flush().unwrap();
+
+        let snap = db.take_snapshot();
+        // 600 + 200 crosses the 681-entry page boundary, so the chain gets a new head page.
+        for _ in 0..200 {
+            db.insert_node(user, HashMap::new()).unwrap();
+        }
+        // Holes on the old page are filled from the new head.
+        for &rid in base.iter().take(50) {
+            db.delete_node(rid).unwrap();
+        }
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 750);
+        db.restore_snapshot(snap);
+
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 600);
+        assert_label_index_matches_bruteforce(&mut db, &[user]);
+        let mut got: Vec<NodeRid> = db
+            .list_nodes(Some("User"))
+            .unwrap()
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        got.sort_by_key(|r| (r.0.page_id.0, r.0.slot_id.0));
+        base.sort_by_key(|r| (r.0.page_id.0, r.0.slot_id.0));
+        assert_eq!(got, base);
+
+        // The index keeps working after the rollback, across the same boundary.
+        for _ in 0..200 {
+            db.insert_node(user, HashMap::new()).unwrap();
+        }
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 800);
+        assert_label_index_matches_bruteforce(&mut db, &[user]);
     }
 
     // ---- Phase 5: tier-2 property index ----

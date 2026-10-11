@@ -13,7 +13,7 @@ ChiffonDB is a lightweight embedded property graph database engine designed to b
 - Low memory footprint (bounded) — all on-disk data (property/blob pages, topology node/edge records) is read and written through a single fixed-size LRU page cache (SQLite-pcache style), and there is no in-memory index that grows with the data. Resident memory therefore stays capped by the cache budget regardless of database size. The cap is configurable (default 4 MiB) via `open_with_max_memory` / `create_with_max_memory`. Measured: with a 64 KiB budget the resident set stays at 16 pages whether the database holds 500 or 1800 nodes — occupancy does not track node count (`cargo run --example cache_memory_bench --release`).
 - CLI tool — the `chiffon` command performs database operations, schema management, and query execution.
 
-> **Current limit:** the topology segment is fixed-size, so a single database holds at most ~2000 nodes (a variable-length segment is future work). Copy-on-write/MVCC are planned but not yet implemented; durability is provided by a write-ahead log.
+> **Current limits:** there is no fixed node/edge count cap — record pages grow on the file's append tail, bounded by the u32 page space and by disk. Copy-on-write/MVCC are planned but not yet implemented; durability is provided by a write-ahead log.
 
 ## Quick Start
 
