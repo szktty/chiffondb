@@ -55,21 +55,16 @@ impl<'a> LabelIndex<'a> {
     }
 
     /// Adds `rid` to `type_id`'s set (idempotent).
+    ///
+    /// Walks the whole chain to rule out a duplicate, so it costs O(set size). Callers that
+    /// already know `rid` is absent should use [`add_new`](Self::add_new).
     pub fn add(&mut self, type_id: u16, rid: RecordId) -> Result<(), GraphError> {
-        let head = match self.head_of(type_id)? {
+        let mut pid = match self.head_of(type_id)? {
             Some(pid) => pid,
-            None => {
-                let pid = self.append_empty_page()?;
-                self.set_head(type_id, pid)?;
-                pid
-            }
+            None => return self.add_new(type_id, rid),
         };
-
-        // Walk the chain: dedup, remember the first page with free space.
         let limit = self.file.page_count()?;
         let mut steps = 0u32;
-        let mut pid = head;
-        let mut first_free: Option<u32> = None;
         loop {
             let page = self.file.read_page(pid)?;
             let count = read_count(&page);
@@ -77,9 +72,6 @@ impl<'a> LabelIndex<'a> {
                 if read_entry(&page, i) == rid {
                     return Ok(());
                 }
-            }
-            if count < ENTRIES_PER_PAGE && first_free.is_none() {
-                first_free = Some(pid);
             }
             let next = read_next(&page);
             if next == NO_ROOT {
@@ -91,46 +83,58 @@ impl<'a> LabelIndex<'a> {
             }
             pid = next;
         }
+        self.add_new(type_id, rid)
+    }
 
-        match first_free {
-            Some(free_pid) => {
-                let mut page = self.file.read_page(free_pid)?;
-                let count = read_count(&page);
+    /// Adds `rid` to `type_id`'s set without checking for a duplicate.
+    ///
+    /// The caller must guarantee `rid` is not already registered under `type_id`; a violation
+    /// leaves a duplicate entry. In exchange the cost is O(1) in the set size: the entry goes
+    /// on the head page, and a full head gets a fresh page linked in front of it. Walking to a
+    /// free slot instead made every insert O(set size), i.e. bulk loads quadratic.
+    pub fn add_new(&mut self, type_id: u16, rid: RecordId) -> Result<(), GraphError> {
+        if let Some(head) = self.head_of(type_id)? {
+            let mut page = self.file.read_page(head)?;
+            let count = read_count(&page);
+            if count < ENTRIES_PER_PAGE {
                 write_entry(&mut page, count, rid);
                 write_count(&mut page, count + 1);
-                self.file.write_page(free_pid, &page)?;
+                return self.file.write_page(head, &page);
             }
-            None => {
-                let new_pid = self.append_empty_page()?;
-                let mut new_page = self.file.read_page(new_pid)?;
-                write_entry(&mut new_page, 0, rid);
-                write_count(&mut new_page, 1);
-                self.file.write_page(new_pid, &new_page)?;
-                self.link_tail(head, new_pid)?;
-            }
+            let mut new_page = [0u8; PAGE_SIZE];
+            write_next(&mut new_page, head);
+            write_entry(&mut new_page, 0, rid);
+            write_count(&mut new_page, 1);
+            let new_pid = self.file.append_page(&new_page)?;
+            return self.set_head(type_id, new_pid);
         }
-        Ok(())
+        let mut new_page = [0u8; PAGE_SIZE];
+        write_next(&mut new_page, NO_ROOT);
+        write_entry(&mut new_page, 0, rid);
+        write_count(&mut new_page, 1);
+        let new_pid = self.file.append_page(&new_page)?;
+        self.set_head(type_id, new_pid)
     }
 
     /// Removes `rid` from `type_id`'s set (no-op if absent).
+    ///
+    /// The hole is filled with the head page's last entry rather than the last entry of the
+    /// page it was found on. `add_new` only ever fills the head, so this keeps every page
+    /// behind the head full; otherwise holes left by deletes would never be reused.
     pub fn remove(&mut self, type_id: u16, rid: RecordId) -> Result<(), GraphError> {
-        let mut pid = match self.head_of(type_id)? {
+        let head = match self.head_of(type_id)? {
             Some(pid) => pid,
             None => return Ok(()),
         };
         let limit = self.file.page_count()?;
         let mut steps = 0u32;
+        let mut pid = head;
         loop {
-            let mut page = self.file.read_page(pid)?;
+            let page = self.file.read_page(pid)?;
             let count = read_count(&page);
             for i in 0..count {
                 if read_entry(&page, i) == rid {
-                    // Swap-remove: last entry into slot i, shrink count.
-                    let last = read_entry(&page, count - 1);
-                    write_entry(&mut page, i, last);
-                    write_count(&mut page, count - 1);
-                    self.file.write_page(pid, &page)?;
-                    return Ok(());
+                    return self.fill_hole_from_head(type_id, head, pid, i);
                 }
             }
             let next = read_next(&page);
@@ -143,6 +147,47 @@ impl<'a> LabelIndex<'a> {
             }
             pid = next;
         }
+    }
+
+    /// Overwrites entry `idx` of page `pid` with the head page's last entry and shrinks the head.
+    fn fill_hole_from_head(
+        &mut self,
+        type_id: u16,
+        head: u32,
+        pid: u32,
+        idx: usize,
+    ) -> Result<(), GraphError> {
+        let mut donor_pid = head;
+        let mut donor = self.file.read_page(donor_pid)?;
+        // An empty head has nothing to donate. It is kept while it is merely empty (so adds and
+        // removes alternating across a page boundary reuse it) and unlinked only now, when a
+        // further removal has to reach past it. The unlinked page is not reclaimed. This loops
+        // because files written before head insertion can hold empty pages mid-chain; it ends at
+        // `pid` at the latest, which holds the entry being removed.
+        let limit = self.file.page_count()?;
+        let mut steps = 0u32;
+        while read_count(&donor) == 0 {
+            let next = read_next(&donor);
+            steps += 1;
+            if next == NO_ROOT || steps > limit {
+                return Err(GraphError::StorageCorrupted(donor_pid));
+            }
+            self.set_head(type_id, next)?;
+            donor_pid = next;
+            donor = self.file.read_page(donor_pid)?;
+        }
+        let donor_count = read_count(&donor);
+        let last = read_entry(&donor, donor_count - 1);
+        write_count(&mut donor, donor_count - 1);
+        if pid == donor_pid {
+            // `idx == donor_count - 1` rewrites a slot past the new count, which is harmless.
+            write_entry(&mut donor, idx, last);
+            return self.file.write_page(donor_pid, &donor);
+        }
+        self.file.write_page(donor_pid, &donor)?;
+        let mut page = self.file.read_page(pid)?;
+        write_entry(&mut page, idx, last);
+        self.file.write_page(pid, &page)
     }
 
     /// Every RecordId registered under `type_id`.
@@ -286,26 +331,6 @@ impl<'a> LabelIndex<'a> {
         write_count(&mut page, 0);
         self.file.append_page(&page)
     }
-
-    fn link_tail(&mut self, head: u32, new_pid: u32) -> Result<(), GraphError> {
-        let limit = self.file.page_count()?;
-        let mut steps = 0u32;
-        let mut pid = head;
-        loop {
-            let mut page = self.file.read_page(pid)?;
-            let next = read_next(&page);
-            if next == NO_ROOT {
-                write_next(&mut page, new_pid);
-                self.file.write_page(pid, &page)?;
-                return Ok(());
-            }
-            steps += 1;
-            if steps > limit {
-                return Err(GraphError::StorageCorrupted(pid));
-            }
-            pid = next;
-        }
-    }
 }
 
 // ---- Byte helpers (shared header layout: [0..4] next, [4..8] count) ----
@@ -443,6 +468,138 @@ mod tests {
         }
         let mut idx2 = LabelIndex::new(&mut f);
         assert_eq!(idx2.count(3).unwrap(), 2);
+    }
+
+    /// Per-page entry counts of `type_id`'s chain, head first.
+    fn chain_counts(f: &mut DatabaseFile, type_id: u16) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut pid = match LabelIndex::new(f).head_of(type_id).unwrap() {
+            Some(pid) => pid,
+            None => return out,
+        };
+        loop {
+            let page = f.read_page(pid).unwrap();
+            out.push(read_count(&page));
+            pid = read_next(&page);
+            if pid == NO_ROOT {
+                return out;
+            }
+        }
+    }
+
+    #[test]
+    fn add_new_fills_the_head_and_links_new_pages_in_front() {
+        let mut f = file();
+        let n = ENTRIES_PER_PAGE * 2 + 3;
+        for i in 0..n {
+            LabelIndex::new(&mut f)
+                .add_new(1, rid(i as u32, 0))
+                .unwrap();
+        }
+        assert_eq!(
+            chain_counts(&mut f, 1),
+            vec![3, ENTRIES_PER_PAGE, ENTRIES_PER_PAGE]
+        );
+        let got: HashSet<_> = LabelIndex::new(&mut f)
+            .get(1)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(got.len(), n);
+    }
+
+    #[test]
+    fn remove_keeps_pages_behind_the_head_full() {
+        let mut f = file();
+        let n = ENTRIES_PER_PAGE * 2 + 3;
+        for i in 0..n {
+            LabelIndex::new(&mut f)
+                .add_new(1, rid(i as u32, 0))
+                .unwrap();
+        }
+        // rid 0 sits on the last (oldest) page; its hole is filled from the head.
+        LabelIndex::new(&mut f).remove(1, rid(0, 0)).unwrap();
+        assert_eq!(
+            chain_counts(&mut f, 1),
+            vec![2, ENTRIES_PER_PAGE, ENTRIES_PER_PAGE]
+        );
+        let got: HashSet<_> = LabelIndex::new(&mut f)
+            .get(1)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(got.len(), n - 1);
+        assert!(!got.contains(&rid(0, 0)));
+    }
+
+    #[test]
+    fn empty_head_is_reused_then_unlinked_only_when_reached_past() {
+        let mut f = file();
+        for i in 0..=ENTRIES_PER_PAGE {
+            LabelIndex::new(&mut f)
+                .add_new(1, rid(i as u32, 0))
+                .unwrap();
+        }
+        assert_eq!(chain_counts(&mut f, 1), vec![1, ENTRIES_PER_PAGE]);
+
+        // Alternating across the page boundary must not grow the file.
+        let pages = f.page_count().unwrap();
+        for _ in 0..5 {
+            LabelIndex::new(&mut f)
+                .remove(1, rid(ENTRIES_PER_PAGE as u32, 0))
+                .unwrap();
+            assert_eq!(chain_counts(&mut f, 1), vec![0, ENTRIES_PER_PAGE]);
+            LabelIndex::new(&mut f)
+                .add_new(1, rid(ENTRIES_PER_PAGE as u32, 0))
+                .unwrap();
+        }
+        assert_eq!(f.page_count().unwrap(), pages);
+
+        // With the head empty, one more removal reaches past it and drops it from the chain.
+        LabelIndex::new(&mut f)
+            .remove(1, rid(ENTRIES_PER_PAGE as u32, 0))
+            .unwrap();
+        LabelIndex::new(&mut f).remove(1, rid(0, 0)).unwrap();
+        assert_eq!(chain_counts(&mut f, 1), vec![ENTRIES_PER_PAGE - 1]);
+        assert_eq!(
+            LabelIndex::new(&mut f).count(1).unwrap(),
+            (ENTRIES_PER_PAGE - 1) as u64
+        );
+    }
+
+    #[test]
+    fn remove_last_entry_leaves_an_empty_set() {
+        let mut f = file();
+        let mut idx = LabelIndex::new(&mut f);
+        idx.add_new(1, rid(0, 0)).unwrap();
+        idx.remove(1, rid(0, 0)).unwrap();
+        assert_eq!(idx.count(1).unwrap(), 0);
+        idx.remove(1, rid(0, 0)).unwrap();
+        idx.add_new(1, rid(1, 0)).unwrap();
+        assert_eq!(idx.get(1).unwrap(), vec![rid(1, 0)]);
+    }
+
+    #[test]
+    fn remove_skips_empty_pages_left_by_the_old_tail_append_layout() {
+        // Files written before head insertion appended at the tail and swap-removed within a
+        // page, so an empty page can sit anywhere. Build: empty head -> empty -> one entry.
+        let mut f = file();
+        let mut last = [0u8; PAGE_SIZE];
+        write_next(&mut last, NO_ROOT);
+        write_entry(&mut last, 0, rid(7, 0));
+        write_count(&mut last, 1);
+        let last_pid = f.append_page(&last).unwrap();
+        let mut mid = [0u8; PAGE_SIZE];
+        write_next(&mut mid, last_pid);
+        let mid_pid = f.append_page(&mid).unwrap();
+        let mut head = [0u8; PAGE_SIZE];
+        write_next(&mut head, mid_pid);
+        let head_pid = f.append_page(&head).unwrap();
+        LabelIndex::new(&mut f).set_head(1, head_pid).unwrap();
+
+        LabelIndex::new(&mut f).remove(1, rid(7, 0)).unwrap();
+        assert_eq!(LabelIndex::new(&mut f).count(1).unwrap(), 0);
+        assert_eq!(chain_counts(&mut f, 1), vec![0]);
     }
 
     proptest! {

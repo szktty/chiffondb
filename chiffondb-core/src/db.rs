@@ -156,8 +156,9 @@ impl Database {
             node.property_ref = Some(pref);
             self.topo.write_node(&mut self.file, &node)?;
         }
-        // Register the node under its primary type in the tier-1 label index.
-        LabelIndex::new(&mut self.file).add(type_id, rid)?;
+        // Register the node under its primary type in the tier-1 label index. `rid` was just
+        // allocated and delete_node unregisters a slot before freeing it, so it cannot be present.
+        LabelIndex::new(&mut self.file).add_new(type_id, rid)?;
         // Maintain tier-2 property indexes declared on this (primary) type.
         self.maintain_property_index(type_id, rid, &properties, IndexOp::Add)?;
         Ok(NodeRid(rid))
@@ -1102,7 +1103,7 @@ impl Database {
             }
             for &id in &normalized {
                 if !old.contains(&id) {
-                    index.add(id, rid)?;
+                    index.add_new(id, rid)?;
                 }
             }
         }

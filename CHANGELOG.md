@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Inserting a node no longer slows down as the number of nodes of the same type grows: the label
+  index registers a new node on its chain's head page instead of walking the whole chain.
+- The page cache tracks recency in O(1) per access; previously each access scanned the cache, so
+  a larger `max_memory_bytes` made every page read slower.
+
+### Fixed
+
+- `README.md` and `llms-full.txt` still described the ~2000-node cap removed in 0.2.0.
+
 ## [0.2.0] - 2026-07-13
 
 ### Added

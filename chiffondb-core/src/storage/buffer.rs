@@ -1,11 +1,18 @@
 use crate::storage::page::PAGE_SIZE;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 
-/// A single cached page frame.
+/// Sentinel for "no neighbour" in the intrusive LRU list.
+const NIL: usize = usize::MAX;
+
+/// A single cached page frame, linked into the LRU list by slab index.
 struct Frame {
+    page_id: u32,
     data: [u8; PAGE_SIZE],
     dirty: bool,
+    /// Neighbour towards the least-recently-used end (`NIL` at the LRU end).
+    prev: usize,
+    /// Neighbour towards the most-recently-used end (`NIL` at the MRU end).
+    next: usize,
 }
 
 /// A dirty page evicted from the cache that the caller must persist before dropping.
@@ -33,9 +40,16 @@ pub struct DirtyVictim {
 /// are routed through this cache — see `docs/plan-page-cache.md` Phase 2).
 pub struct PageCache {
     capacity: usize,
-    frames: HashMap<u32, Frame>,
-    /// LRU order; front = least-recently-used, back = most-recently-used.
-    lru: VecDeque<u32>,
+    /// Frame storage; a slot is reused after eviction/removal via `free`.
+    slab: Vec<Frame>,
+    /// Slab indices of vacated frames.
+    free: Vec<usize>,
+    /// page id → slab index of its frame.
+    index: HashMap<u32, usize>,
+    /// Least-recently-used frame (`NIL` when empty).
+    lru_head: usize,
+    /// Most-recently-used frame (`NIL` when empty).
+    mru_tail: usize,
 }
 
 impl PageCache {
@@ -44,8 +58,11 @@ impl PageCache {
         let capacity = capacity.max(1);
         Self {
             capacity,
-            frames: HashMap::new(),
-            lru: VecDeque::new(),
+            slab: Vec::new(),
+            free: Vec::new(),
+            index: HashMap::new(),
+            lru_head: NIL,
+            mru_tail: NIL,
         }
     }
 
@@ -54,22 +71,18 @@ impl PageCache {
     }
 
     pub fn len(&self) -> usize {
-        self.frames.len()
+        self.index.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.index.is_empty()
     }
 
     /// Returns a copy of the cached page if present, marking it most-recently-used.
     pub fn get(&mut self, page_id: u32) -> Option<[u8; PAGE_SIZE]> {
-        if let Some(frame) = self.frames.get(&page_id) {
-            let data = frame.data;
-            self.touch(page_id);
-            Some(data)
-        } else {
-            None
-        }
+        let slot = *self.index.get(&page_id)?;
+        self.touch(slot);
+        Some(self.slab[slot].data)
     }
 
     /// Inserts or updates a page. `dirty` marks whether the page differs from the
@@ -80,63 +93,115 @@ impl PageCache {
     /// to the WAL before the data is discarded. A clean eviction returns `None`.
     #[must_use = "a returned DirtyVictim must be written to the WAL to avoid data loss"]
     pub fn put(&mut self, page_id: u32, data: [u8; PAGE_SIZE], dirty: bool) -> Option<DirtyVictim> {
-        if let Some(frame) = self.frames.get_mut(&page_id) {
+        if let Some(&slot) = self.index.get(&page_id) {
+            let frame = &mut self.slab[slot];
             frame.data = data;
             // Once dirty, a page stays dirty until checkpoint/eviction clears it.
             frame.dirty = frame.dirty || dirty;
-            self.touch(page_id);
+            self.touch(slot);
             return None;
         }
 
-        let victim = if self.frames.len() >= self.capacity {
+        let victim = if self.index.len() >= self.capacity {
             self.evict_lru()
         } else {
             None
         };
 
-        self.frames.insert(page_id, Frame { data, dirty });
-        self.lru.push_back(page_id);
+        let frame = Frame {
+            page_id,
+            data,
+            dirty,
+            prev: NIL,
+            next: NIL,
+        };
+        let slot = match self.free.pop() {
+            Some(slot) => {
+                self.slab[slot] = frame;
+                slot
+            }
+            None => {
+                self.slab.push(frame);
+                self.slab.len() - 1
+            }
+        };
+        self.index.insert(page_id, slot);
+        self.push_mru(slot);
         victim
     }
 
     /// Drops the cached frame for a page (e.g. after checkpoint persisted it).
     /// Does not return a victim; the caller asserts the page is already durable.
     pub fn remove(&mut self, page_id: u32) {
-        if self.frames.remove(&page_id).is_some() {
-            self.lru.retain(|&id| id != page_id);
+        if let Some(slot) = self.index.remove(&page_id) {
+            self.unlink(slot);
+            self.free.push(slot);
         }
     }
 
     /// Clears all cached frames (e.g. after checkpoint or rollback).
     pub fn clear(&mut self) {
-        self.frames.clear();
-        self.lru.clear();
+        self.slab.clear();
+        self.free.clear();
+        self.index.clear();
+        self.lru_head = NIL;
+        self.mru_tail = NIL;
     }
 
     /// Evicts the least-recently-used page. Returns it as a [`DirtyVictim`] when dirty.
     fn evict_lru(&mut self) -> Option<DirtyVictim> {
-        while let Some(victim_id) = self.lru.pop_front() {
-            if let Some(frame) = self.frames.remove(&victim_id) {
-                return if frame.dirty {
-                    Some(DirtyVictim {
-                        page_id: victim_id,
-                        data: frame.data,
-                    })
-                } else {
-                    None
-                };
-            }
-            // Stale LRU entry (frame already removed); keep scanning.
+        let slot = self.lru_head;
+        if slot == NIL {
+            return None;
         }
-        None
+        self.unlink(slot);
+        self.free.push(slot);
+        let frame = &self.slab[slot];
+        self.index.remove(&frame.page_id);
+        if frame.dirty {
+            Some(DirtyVictim {
+                page_id: frame.page_id,
+                data: frame.data,
+            })
+        } else {
+            None
+        }
     }
 
-    /// Moves the accessed page to the most-recently-used position.
-    fn touch(&mut self, page_id: u32) {
-        if let Some(pos) = self.lru.iter().position(|&id| id == page_id) {
-            self.lru.remove(pos);
+    /// Moves the accessed frame to the most-recently-used position.
+    fn touch(&mut self, slot: usize) {
+        if self.mru_tail != slot {
+            self.unlink(slot);
+            self.push_mru(slot);
         }
-        self.lru.push_back(page_id);
+    }
+
+    fn unlink(&mut self, slot: usize) {
+        let (prev, next) = (self.slab[slot].prev, self.slab[slot].next);
+        if prev == NIL {
+            self.lru_head = next;
+        } else {
+            self.slab[prev].next = next;
+        }
+        if next == NIL {
+            self.mru_tail = prev;
+        } else {
+            self.slab[next].prev = prev;
+        }
+        self.slab[slot].prev = NIL;
+        self.slab[slot].next = NIL;
+    }
+
+    fn push_mru(&mut self, slot: usize) {
+        self.slab[slot].prev = self.mru_tail;
+        self.slab[slot].next = NIL;
+        if self.mru_tail == NIL {
+            self.lru_head = slot;
+        } else {
+            let tail = self.mru_tail;
+            self.slab[tail].next = slot;
+        }
+        self.mru_tail = slot;
     }
 }
 
@@ -209,6 +274,90 @@ mod tests {
         let victim = cache.put(2, page(4), false).expect("page 0 still dirty");
         assert_eq!(victim.page_id, 0);
         assert_eq!(victim.data[0], 3);
+    }
+
+    #[test]
+    fn remove_frees_a_slot_and_keeps_lru_order() {
+        let mut cache = PageCache::new(3);
+        let _ = cache.put(0, page(0), false);
+        let _ = cache.put(1, page(1), false);
+        let _ = cache.put(2, page(2), false);
+        cache.remove(1);
+        cache.remove(1);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(1).is_none());
+        // Room for one more without eviction; then page 0 is the LRU.
+        let _ = cache.put(3, page(3), false);
+        assert_eq!(cache.len(), 3);
+        let _ = cache.put(4, page(4), false);
+        assert!(cache.get(0).is_none());
+        assert_eq!(cache.get(2).unwrap()[0], 2);
+        assert_eq!(cache.get(3).unwrap()[0], 3);
+        assert_eq!(cache.get(4).unwrap()[0], 4);
+    }
+
+    #[test]
+    fn clear_empties_the_cache_and_it_stays_usable() {
+        let mut cache = PageCache::new(2);
+        let _ = cache.put(0, page(0), false);
+        let _ = cache.put(1, page(1), false);
+        cache.clear();
+        assert!(cache.is_empty());
+        assert!(cache.get(0).is_none());
+        let _ = cache.put(5, page(5), false);
+        let _ = cache.put(6, page(6), false);
+        let _ = cache.put(7, page(7), false);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(5).is_none());
+        assert_eq!(cache.get(7).unwrap()[0], 7);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(50))]
+        /// Random get/put/remove ops evict exactly what a naive recency list would.
+        #[test]
+        fn matches_naive_lru_model(
+            capacity in 1usize..6,
+            ops in proptest::collection::vec((0u8..3, 0u32..10), 1..300),
+        ) {
+            let mut cache = PageCache::new(capacity);
+            // Front = least-recently-used.
+            let mut model: Vec<u32> = Vec::new();
+            for (op, id) in ops {
+                match op {
+                    0 => {
+                        let hit = cache.get(id).is_some();
+                        proptest::prop_assert_eq!(hit, model.contains(&id));
+                        if hit {
+                            model.retain(|&m| m != id);
+                            model.push(id);
+                        }
+                    }
+                    1 => {
+                        let _ = cache.put(id, page(id as u8), false);
+                        if model.contains(&id) {
+                            model.retain(|&m| m != id);
+                        } else if model.len() >= capacity {
+                            model.remove(0);
+                        }
+                        model.push(id);
+                    }
+                    _ => {
+                        cache.remove(id);
+                        model.retain(|&m| m != id);
+                    }
+                }
+                proptest::prop_assert_eq!(cache.len(), model.len());
+            }
+            // Drain by eviction order: filling with fresh ids must push out the model's order.
+            for (i, expected) in model.clone().into_iter().enumerate() {
+                if model.len() < capacity {
+                    break;
+                }
+                let _ = cache.put(1000 + i as u32, page(0), false);
+                proptest::prop_assert!(cache.get(expected).is_none());
+            }
+        }
     }
 
     #[test]
