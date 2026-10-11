@@ -284,6 +284,9 @@ impl Database {
                 if let Some(pref) = edge.property_ref {
                     PropertyStore::free(&mut self.file, pref)?;
                 }
+                if let Some(lref) = edge.label_ref {
+                    PropertyStore::free(&mut self.file, lref)?;
+                }
             }
             self.topo.delete_edge(&mut self.file, eid)?;
         }
@@ -292,6 +295,7 @@ impl Database {
         let node = self.topo.read_node(&mut self.file, rid)?;
         let primary_type = node.node_type_id;
         let node_pref = node.property_ref;
+        let node_lref = node.label_ref;
         // Remove the node's tier-2 property index entries (primary type's indexed fields).
         let props = self.get_node_properties_raw(rid)?;
         self.maintain_property_index(primary_type, rid, &props, IndexOp::Remove)?;
@@ -306,6 +310,10 @@ impl Database {
         // Reclaim the node's own property space after the index no longer needs the bytes (A-2).
         if let Some(pref) = node_pref {
             PropertyStore::free(&mut self.file, pref)?;
+        }
+        // Same for the additional-label list, which the index removal above has already read.
+        if let Some(lref) = node_lref {
+            PropertyStore::free(&mut self.file, lref)?;
         }
         self.topo.free_node(&mut self.file, rid)
     }
@@ -421,9 +429,14 @@ impl Database {
         if !self.edge_exists_raw(rid) {
             return Err(GraphError::EdgeNotFound(format!("{:?}", rid)));
         }
-        // Reclaim the edge's property space before freeing the topology slot (A-2, O-1).
-        if let Some(pref) = self.topo.read_edge(&mut self.file, rid)?.property_ref {
+        // Reclaim the edge's property and label-list space before freeing the topology slot
+        // (A-2, O-1).
+        let edge = self.topo.read_edge(&mut self.file, rid)?;
+        if let Some(pref) = edge.property_ref {
             PropertyStore::free(&mut self.file, pref)?;
+        }
+        if let Some(lref) = edge.label_ref {
+            PropertyStore::free(&mut self.file, lref)?;
         }
         self.topo.delete_edge(&mut self.file, rid)
     }
@@ -816,6 +829,8 @@ impl Database {
                 normalized.push(id);
             }
         }
+        // Capture the old list's RID before overwriting so its space can be reclaimed, not leaked.
+        let old_lref = edge.label_ref;
         if normalized.is_empty() {
             edge.label_ref = None;
         } else {
@@ -823,7 +838,11 @@ impl Database {
             let lref = PropertyStore::write_raw(&mut self.file, &bytes)?;
             edge.label_ref = Some(lref);
         }
-        self.topo.write_edge(&mut self.file, &edge)
+        self.topo.write_edge(&mut self.file, &edge)?;
+        if let Some(old) = old_lref {
+            PropertyStore::free(&mut self.file, old)?;
+        }
+        Ok(())
     }
 
     /// Inserts an edge by type name. Returns an error if no schema has been applied.
@@ -1108,6 +1127,8 @@ impl Database {
             }
         }
 
+        // Capture the old list's RID before overwriting so its space can be reclaimed, not leaked.
+        let old_lref = node.label_ref;
         if normalized.is_empty() {
             node.label_ref = None;
         } else {
@@ -1115,7 +1136,11 @@ impl Database {
             let lref = PropertyStore::write_raw(&mut self.file, &bytes)?;
             node.label_ref = Some(lref);
         }
-        self.topo.write_node(&mut self.file, &node)
+        self.topo.write_node(&mut self.file, &node)?;
+        if let Some(old) = old_lref {
+            PropertyStore::free(&mut self.file, old)?;
+        }
+        Ok(())
     }
 }
 
@@ -1434,33 +1459,7 @@ impl Database {
             ));
         };
 
-        if self.file.header.schema_root != 0 {
-            if let Ok(ast) = crate::schema::store::load_schema(&mut self.file) {
-                crate::schema::store::save_schema(&mut new_db.file, &ast)?;
-            }
-        }
-
-        let mut rid_map: HashMap<RecordId, NodeRid> = HashMap::new();
-        let node_rids = self.all_live_node_rids()?;
-        for old_rid in node_rids {
-            if let Ok(node) = self.topo.read_node(&mut self.file, old_rid) {
-                let props = self.get_node_properties_raw(old_rid).unwrap_or_default();
-                let new_rid = new_db.insert_node(node.node_type_id, props)?;
-                rid_map.insert(old_rid, new_rid);
-            }
-        }
-
-        let edge_rids = self.all_live_edge_rids()?;
-        for old_eid in edge_rids {
-            if let Ok(edge) = self.topo.read_edge(&mut self.file, old_eid) {
-                if let (Some(&new_from), Some(&new_to)) =
-                    (rid_map.get(&edge.from_node), rid_map.get(&edge.to_node))
-                {
-                    let props = self.get_edge_properties_raw(old_eid).unwrap_or_default();
-                    new_db.insert_edge(edge.edge_type_id, new_from, new_to, props)?;
-                }
-            }
-        }
+        self.copy_live_contents_into(&mut new_db)?;
 
         *self = new_db;
         Ok(())
@@ -1472,38 +1471,54 @@ impl Database {
         let tmp_path = path.with_extension("tdb.vacuum");
         let mut new_db = Database::create(&tmp_path)?;
 
-        if db.file.header.schema_root != 0 {
-            if let Ok(ast) = crate::schema::store::load_schema(&mut db.file) {
-                crate::schema::store::save_schema(&mut new_db.file, &ast)?;
-            }
-        }
-
-        let mut rid_map: HashMap<RecordId, NodeRid> = HashMap::new();
-        let node_rids = db.all_live_node_rids()?;
-        for old_rid in node_rids {
-            if let Ok(node) = db.topo.read_node(&mut db.file, old_rid) {
-                let props = db.get_node_properties_raw(old_rid).unwrap_or_default();
-                let new_rid = new_db.insert_node(node.node_type_id, props)?;
-                rid_map.insert(old_rid, new_rid);
-            }
-        }
-
-        let edge_rids = db.all_live_edge_rids()?;
-        for old_eid in edge_rids {
-            if let Ok(edge) = db.topo.read_edge(&mut db.file, old_eid) {
-                if let (Some(&new_from), Some(&new_to)) =
-                    (rid_map.get(&edge.from_node), rid_map.get(&edge.to_node))
-                {
-                    let props = db.get_edge_properties_raw(old_eid).unwrap_or_default();
-                    new_db.insert_edge(edge.edge_type_id, new_from, new_to, props)?;
-                }
-            }
-        }
+        db.copy_live_contents_into(&mut new_db)?;
 
         new_db.flush()?;
         drop(new_db);
         drop(db);
         std::fs::rename(&tmp_path, path).map_err(GraphError::Io)?;
+        Ok(())
+    }
+
+    /// Copies the schema and every live node and edge into `dst`, which must be empty. Record
+    /// ids are not preserved; edges are re-pointed through the old→new node id map.
+    fn copy_live_contents_into(&mut self, dst: &mut Database) -> Result<(), GraphError> {
+        // Records keep their type ids across the copy, so the schema is copied verbatim rather
+        // than re-saved from the AST, which would renumber the types by definition order and
+        // drop dynamically registered names.
+        if self.file.header.schema_root != 0 {
+            crate::schema::store::copy_schema(&mut self.file, &mut dst.file)?;
+        }
+
+        let mut rid_map: HashMap<RecordId, NodeRid> = HashMap::new();
+        let node_rids = self.all_live_node_rids()?;
+        for old_rid in node_rids {
+            if let Ok(node) = self.topo.read_node(&mut self.file, old_rid) {
+                let props = self.get_node_properties_raw(old_rid).unwrap_or_default();
+                let labels = self.get_additional_labels(NodeRid(old_rid))?;
+                let new_rid = dst.insert_node_with_labels(node.node_type_id, labels, props)?;
+                rid_map.insert(old_rid, new_rid);
+            }
+        }
+
+        let edge_rids = self.all_live_edge_rids()?;
+        for old_eid in edge_rids {
+            if let Ok(edge) = self.topo.read_edge(&mut self.file, old_eid) {
+                if let (Some(&new_from), Some(&new_to)) =
+                    (rid_map.get(&edge.from_node), rid_map.get(&edge.to_node))
+                {
+                    let props = self.get_edge_properties_raw(old_eid).unwrap_or_default();
+                    let labels = self.get_edge_additional_labels(EdgeRid(old_eid))?;
+                    dst.insert_edge_with_labels(
+                        edge.edge_type_id,
+                        new_from,
+                        new_to,
+                        labels,
+                        props,
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -4075,6 +4090,271 @@ mod tests {
         let mut db2 = Database::open(&path).unwrap();
         let nodes = db2.list_nodes(None).unwrap();
         assert_eq!(nodes.len(), 1);
+    }
+
+    /// Without a schema: the rebuilt node keeps its whole type list and stays reachable through
+    /// the tier-1 label index under each label (E-1, review-2026-10-11a).
+    #[test]
+    fn vacuum_preserves_additional_node_labels() {
+        let mut db = Database::open_in_memory().unwrap();
+        let doomed = db.insert_node(1, HashMap::new()).unwrap();
+        let rid = db
+            .insert_node_with_labels(1, vec![2, 3], HashMap::new())
+            .unwrap();
+        assert_eq!(db.get_node_type_ids(rid).unwrap(), vec![1, 2, 3]);
+        db.delete_node(doomed).unwrap();
+
+        db.vacuum().unwrap();
+
+        let (new_rid, _) = db.list_nodes(None).unwrap().into_iter().next().unwrap();
+        assert_eq!(db.get_node_type_ids(new_rid).unwrap(), vec![1, 2, 3]);
+        for type_id in [1, 2, 3] {
+            assert_eq!(
+                index::rids_of_type(&db.topo, &mut db.file, type_id).unwrap(),
+                vec![new_rid.0],
+                "label index for type {type_id}"
+            );
+        }
+    }
+
+    /// Ids minted for the dynamic labels by `seed_multi_label_graph`.
+    struct SeededLabels {
+        vip: u16,
+        favorite: u16,
+    }
+
+    /// Builds a graph on top of `SCHEMA` that exercises every kind of label a rebuild has to
+    /// carry over: a schema-defined additional node label, a dynamically registered node label,
+    /// and a dynamically registered edge label. Leaves a deleted node behind so the rebuild
+    /// really moves records.
+    fn seed_multi_label_graph(db: &mut Database) -> SeededLabels {
+        let u1 = db
+            .insert_node_with_label_names(
+                "User",
+                vec!["Admin"],
+                HashMap::from([
+                    ("id".to_string(), json!("u1")),
+                    ("name".to_string(), json!("Alice")),
+                ]),
+            )
+            .unwrap();
+        let doomed = db
+            .insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("id".to_string(), json!("u0")),
+                    ("name".to_string(), json!("Gone")),
+                ]),
+            )
+            .unwrap();
+        db.insert_node_by_name(
+            "User",
+            HashMap::from([
+                ("id".to_string(), json!("u2")),
+                ("name".to_string(), json!("Bob")),
+            ]),
+        )
+        .unwrap();
+        let p1 = db
+            .insert_node_by_name(
+                "Project",
+                HashMap::from([
+                    ("id".to_string(), json!("p1")),
+                    ("title".to_string(), json!("Chiffon")),
+                ]),
+            )
+            .unwrap();
+        let vip = db.add_node_label_dynamic(u1, "Vip").unwrap();
+        assert!(vip.created);
+        let owns = db
+            .insert_edge_by_name(
+                "OWNS",
+                u1,
+                p1,
+                HashMap::from([("role".to_string(), json!("lead"))]),
+            )
+            .unwrap();
+        let favorite = db.add_edge_label_dynamic(owns, "Favorite").unwrap();
+        assert!(favorite.created);
+        db.delete_node(doomed).unwrap();
+        SeededLabels {
+            vip: vip.id,
+            favorite: favorite.id,
+        }
+    }
+
+    /// Checks that the graph built by `seed_multi_label_graph` is intact: label names resolve,
+    /// dynamic ids are unchanged, and label-filtered queries find the node under each label.
+    fn assert_multi_label_graph(db: &mut Database, seeded: &SeededLabels) {
+        let registry = db.load_schema_registry().unwrap();
+        assert_eq!(registry.node_type_id("Vip"), Some(seeded.vip));
+        assert_eq!(registry.edge_type_id("Favorite"), Some(seeded.favorite));
+
+        assert_eq!(db.count_nodes(None).unwrap(), 3);
+        assert_eq!(db.count_nodes(Some("User")).unwrap(), 2);
+        assert_eq!(db.count_nodes(Some("Admin")).unwrap(), 1);
+        assert_eq!(db.count_nodes(Some("Vip")).unwrap(), 1);
+        assert_eq!(db.count_nodes(Some("Project")).unwrap(), 1);
+
+        for label in ["Admin", "Vip"] {
+            let nodes = db.list_nodes(Some(label)).unwrap();
+            assert_eq!(nodes.len(), 1, "nodes labelled {label}");
+            let (rid, props) = &nodes[0];
+            assert_eq!(props.get("id"), Some(&json!("u1")));
+            assert_eq!(
+                db.get_node_label_names(*rid).unwrap(),
+                vec!["User", "Admin", "Vip"]
+            );
+        }
+
+        let edges = db.list_edges(None).unwrap();
+        assert_eq!(edges.len(), 1);
+        let (eid, _type_id, props) = &edges[0];
+        assert_eq!(props.get("role"), Some(&json!("lead")));
+        assert_eq!(
+            db.get_edge_label_names(*eid).unwrap(),
+            vec!["OWNS", "Favorite"]
+        );
+
+        assert_eq!(db.verify().unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn vacuum_preserves_labels_and_label_queries() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.apply_schema(SCHEMA).unwrap();
+        let seeded = seed_multi_label_graph(&mut db);
+        assert_multi_label_graph(&mut db, &seeded);
+
+        db.vacuum().unwrap();
+
+        assert_multi_label_graph(&mut db, &seeded);
+    }
+
+    #[test]
+    fn vacuum_file_preserves_labels_and_label_queries() {
+        let (mut db, path) = make_db_with_schema();
+        let seeded = seed_multi_label_graph(&mut db);
+        assert_multi_label_graph(&mut db, &seeded);
+        db.flush().unwrap();
+        drop(db);
+
+        Database::vacuum_file(&path).unwrap();
+
+        let mut db2 = Database::open(&path).unwrap();
+        assert_multi_label_graph(&mut db2, &seeded);
+    }
+
+    /// Type ids are persisted assignments, not definition order: a type added in front of the
+    /// existing ones gets a fresh id. The rebuild copies the nodes' ids verbatim, so it must copy
+    /// the assignments verbatim too, or every node silently changes type.
+    #[test]
+    fn vacuum_keeps_type_ids_that_differ_from_definition_order() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.apply_schema("node A { id: String } node B { id: String }")
+            .unwrap();
+        db.apply_schema("node C { id: String } node A { id: String } node B { id: String }")
+            .unwrap();
+        for name in ["A", "B", "C"] {
+            db.insert_node_by_name(name, HashMap::from([("id".to_string(), json!(name))]))
+                .unwrap();
+        }
+        let before = db.load_schema_registry().unwrap();
+
+        db.vacuum().unwrap();
+
+        let after = db.load_schema_registry().unwrap();
+        for name in ["A", "B", "C"] {
+            assert_eq!(after.node_type_id(name), before.node_type_id(name));
+            let nodes = db.list_nodes(Some(name)).unwrap();
+            assert_eq!(nodes.len(), 1, "nodes of type {name}");
+            assert_eq!(nodes[0].1.get("id"), Some(&json!(name)));
+        }
+    }
+
+    /// The id counters survive too: an id retired by removing a type must not be handed to the
+    /// next new type, or that type would inherit the removed type's leftover nodes.
+    #[test]
+    fn vacuum_does_not_reissue_retired_type_ids() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.apply_schema("node A { id: String } node B { id: String }")
+            .unwrap();
+        db.insert_node_by_name("B", HashMap::from([("id".to_string(), json!("b"))]))
+            .unwrap();
+        let retired = db.load_schema_registry().unwrap().node_type_id("B");
+        db.apply_schema("node A { id: String }").unwrap();
+
+        db.vacuum().unwrap();
+
+        db.apply_schema("node A { id: String } node C { id: String }")
+            .unwrap();
+        let registry = db.load_schema_registry().unwrap();
+        assert_ne!(registry.node_type_id("C"), retired);
+        assert_eq!(db.count_nodes(Some("C")).unwrap(), 0);
+    }
+
+    // ---- Label-list storage reclaim (E-2, review-2026-10-11a) ----
+
+    /// Rewriting a node's or an edge's additional labels frees the list it replaces, so the file
+    /// does not grow with the number of label changes.
+    #[test]
+    fn relabelling_does_not_grow_the_file() {
+        let mut db = Database::open_in_memory().unwrap();
+        let a = db.insert_node(1, HashMap::new()).unwrap();
+        let b = db.insert_node(1, HashMap::new()).unwrap();
+        let e = db.insert_edge(1, a, b, HashMap::new()).unwrap();
+        let churn = |db: &mut Database| {
+            db.add_node_label(a, 2).unwrap();
+            db.add_node_label(a, 3).unwrap();
+            db.remove_node_label(a, 2).unwrap();
+            db.remove_node_label(a, 3).unwrap();
+            db.add_edge_label(e, 2).unwrap();
+            db.add_edge_label(e, 3).unwrap();
+            db.remove_edge_label(e, 2).unwrap();
+            db.remove_edge_label(e, 3).unwrap();
+        };
+        churn(&mut db);
+        let pages = db.file.page_count().unwrap();
+
+        for _ in 0..2000 {
+            churn(&mut db);
+        }
+
+        assert_eq!(db.file.page_count().unwrap(), pages);
+        assert!(db.get_additional_labels(a).unwrap().is_empty());
+        assert!(db.get_edge_additional_labels(e).unwrap().is_empty());
+    }
+
+    /// Deleting a node or an edge frees its label list along with its properties, including the
+    /// lists of edges removed by the node-delete cascade.
+    #[test]
+    fn deleting_labelled_records_does_not_grow_the_file() {
+        let mut db = Database::open_in_memory().unwrap();
+        // Large enough that a handful of leaked lists fills a property page.
+        let labels: Vec<u16> = (2..300).collect();
+        let cycle = |db: &mut Database| {
+            let a = db
+                .insert_node_with_labels(1, labels.clone(), HashMap::new())
+                .unwrap();
+            let b = db.insert_node(1, HashMap::new()).unwrap();
+            let direct = db
+                .insert_edge_with_labels(1, a, b, labels.clone(), HashMap::new())
+                .unwrap();
+            db.insert_edge_with_labels(1, b, a, labels.clone(), HashMap::new())
+                .unwrap();
+            db.delete_edge(direct).unwrap();
+            db.delete_node(a).unwrap();
+            db.delete_node(b).unwrap();
+        };
+        cycle(&mut db);
+        let pages = db.file.page_count().unwrap();
+
+        for _ in 0..200 {
+            cycle(&mut db);
+        }
+
+        assert_eq!(db.file.page_count().unwrap(), pages);
+        assert_eq!(db.count_nodes(None).unwrap(), 0);
     }
 
     // ---- Integrity check tests ----

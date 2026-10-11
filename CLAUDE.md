@@ -32,10 +32,11 @@ space is still not reclaimed; crash atomicity is not guaranteed per API call).
 
 ### Branching (git flow)
 - **`develop` is the integration branch.** Cut feature branches from `develop` and merge them
-  back into `develop` (squash). Day-to-day work targets `develop`, never `main`.
+  back into `develop` with a regular merge (no squash). Day-to-day work targets `develop`, never
+  `main`.
 - **`main` is the released, stable line.** It is updated *only at release time* by merging
   `develop` → `main` (and tagging). Do **not** merge feature branches into `main` directly.
-- So: `feature/* → develop` (squash) for normal work; `develop → main` only on release.
+- So: `feature/* → develop` (regular merge) for normal work; `develop → main` only on release.
 - Merges are gated on explicit user instruction (see `CLAUDE.md` note on confirming
   hard-to-reverse actions); don't merge without being asked.
 

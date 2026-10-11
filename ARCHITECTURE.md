@@ -300,7 +300,8 @@ The file backend routes its page I/O through a single bounded LRU page cache (`s
 > a page returns to the free-list once its `live_count` hits 0. Reclaim is **page-granular**: a
 > partly-live page keeps its dead slots' bytes until it fully empties (intra-page compaction is a
 > deferred follow-up, A-2b). Reading a freed slot returns `PropertySlotFreed`, distinct from
-> `StorageCorrupted`.
+> `StorageCorrupted`. The additional-label list (`label_ref`) lives in the same store and is freed
+> the same way: when the label set is rewritten and when its node or edge is deleted.
 >
 > **Known limitations (not addressed on this branch).**
 > - **Property reclaim is page-granular, not compacting** (A-2b): a page with one immortal live slot
