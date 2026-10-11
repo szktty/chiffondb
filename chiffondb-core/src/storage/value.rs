@@ -259,7 +259,7 @@ fn write_property_bytes(db: &mut DatabaseFile, bytes: &[u8]) -> Result<RecordId,
         // Blob chain: each chunk page is mapped into the directory. `write_blob_chain` links
         // pages by relative index within `pages`; we translate those to the assigned logical
         // page numbers so the chain can be followed through the directory on read.
-        let needed = pages_needed(bytes.len()).max(1);
+        let needed = pages_needed(bytes.len());
         let mut pages = vec![[0u8; PAGE_SIZE]; needed];
         write_blob_chain(&mut pages, bytes)?;
         let mut first_logical = 0usize;
