@@ -358,6 +358,64 @@ mod tests {
                 proptest::prop_assert!(cache.get(expected).is_none());
             }
         }
+
+        /// Every put hands back exactly the victim a naive model predicts: the LRU page, and
+        /// only when it is dirty. Dirty is sticky across a clean re-put, and the victim carries
+        /// the page's latest bytes.
+        #[test]
+        fn dirty_victims_match_naive_lru_model(
+            capacity in 1usize..6,
+            ops in proptest::collection::vec(
+                (0u8..3, 0u32..10, proptest::prelude::any::<bool>()),
+                1..300,
+            ),
+        ) {
+            let mut cache = PageCache::new(capacity);
+            // Front = least-recently-used; (page id, dirty, payload byte).
+            let mut model: Vec<(u32, bool, u8)> = Vec::new();
+            for (step, (op, id, dirty)) in ops.into_iter().enumerate() {
+                let pos = model.iter().position(|m| m.0 == id);
+                match op {
+                    0 => {
+                        let got = cache.get(id).map(|data| data[0]);
+                        let want = pos.map(|p| {
+                            let entry = model.remove(p);
+                            model.push(entry);
+                            entry.2
+                        });
+                        proptest::prop_assert_eq!(got, want);
+                    }
+                    1 => {
+                        let byte = step as u8;
+                        let victim = cache.put(id, page(byte), dirty);
+                        let want = match pos {
+                            Some(p) => {
+                                let (_, was_dirty, _) = model.remove(p);
+                                model.push((id, was_dirty || dirty, byte));
+                                None
+                            }
+                            None => {
+                                let evicted = if model.len() >= capacity {
+                                    Some(model.remove(0))
+                                } else {
+                                    None
+                                };
+                                model.push((id, dirty, byte));
+                                evicted.filter(|e| e.1).map(|e| (e.0, e.2))
+                            }
+                        };
+                        proptest::prop_assert_eq!(victim.map(|v| (v.page_id, v.data[0])), want);
+                    }
+                    _ => {
+                        cache.remove(id);
+                        if let Some(p) = pos {
+                            model.remove(p);
+                        }
+                    }
+                }
+                proptest::prop_assert_eq!(cache.len(), model.len());
+            }
+        }
     }
 
     #[test]
