@@ -1,4 +1,32 @@
 use crate::schema::ast::{BoundParam, Definition, EdgeDef, FieldDef, NodeDef, SchemaAst, TypeExpr};
+use crate::schema::parser::is_bare_name;
+
+const PRIMITIVE_TYPE_NAMES: [&str; 7] = [
+    "Int", "Float", "Boolean", "DateTime", "String", "Json", "Blob",
+];
+
+fn quote(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+/// Writes a name so that it parses back to the same string, quoting it only when needed.
+fn unparse_name(name: &str) -> String {
+    if is_bare_name(name) {
+        name.to_string()
+    } else {
+        quote(name)
+    }
+}
+
+/// Like `unparse_name`, for a user type in type position, where a bare primitive name would be
+/// read back as the primitive.
+fn unparse_type_name(name: &str) -> String {
+    if PRIMITIVE_TYPE_NAMES.contains(&name) {
+        quote(name)
+    } else {
+        unparse_name(name)
+    }
+}
 
 /// Converts a SchemaAst back into schema DSL source text.
 /// This is the inverse of `parser::parse`: `parse(unparse(ast))` is guaranteed to be
@@ -20,21 +48,27 @@ fn unparse_definition(def: &Definition) -> String {
 }
 
 fn unparse_node_def(def: &NodeDef) -> String {
-    let mut header = format!("node {}", def.name);
+    let mut header = format!("node {}", unparse_name(&def.name));
     if !def.type_params.is_empty() {
         header.push('<');
-        header.push_str(&def.type_params.join(", "));
+        header.push_str(
+            &def.type_params
+                .iter()
+                .map(|p| unparse_name(p))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         header.push('>');
     }
     if let Some(extends) = &def.extends {
         header.push_str(" extends ");
-        header.push_str(extends);
+        header.push_str(&unparse_name(extends));
     }
     format!("{header} {{\n{}}}", unparse_fields(&def.fields, 1))
 }
 
 fn unparse_edge_def(def: &EdgeDef) -> String {
-    let mut header = format!("edge {}", def.name);
+    let mut header = format!("edge {}", unparse_name(&def.name));
     if !def.generic_params.is_empty() {
         header.push('<');
         header.push_str(
@@ -63,8 +97,8 @@ fn unparse_edge_def(def: &EdgeDef) -> String {
 
 fn unparse_bound_param(param: &BoundParam) -> String {
     match &param.bound {
-        Some(bound) => format!("{}: {}", param.name, bound),
-        None => param.name.clone(),
+        Some(bound) => format!("{}: {}", unparse_name(&param.name), unparse_name(bound)),
+        None => unparse_name(&param.name),
     }
 }
 
@@ -82,7 +116,7 @@ fn unparse_fields(fields: &[FieldDef], indent: usize) -> String {
             }
             format!(
                 "{pad}{}: {}{anns}\n",
-                f.name,
+                unparse_name(&f.name),
                 unparse_type_expr(&f.type_expr)
             )
         })
@@ -101,9 +135,9 @@ fn unparse_type_expr(t: &TypeExpr) -> String {
         TypeExpr::Vector(n) => format!("Vector<{n}>"),
         TypeExpr::List(inner) => format!("List<{}>", unparse_type_expr(inner)),
         TypeExpr::Map(k, v) => format!("Map<{}, {}>", unparse_type_expr(k), unparse_type_expr(v)),
-        TypeExpr::NodeRef(name) => format!("NodeRef<{name}>"),
-        TypeExpr::EdgeRef(name) => format!("EdgeRef<{name}>"),
-        TypeExpr::Named(name) => name.clone(),
+        TypeExpr::NodeRef(name) => format!("NodeRef<{}>", unparse_name(name)),
+        TypeExpr::EdgeRef(name) => format!("EdgeRef<{}>", unparse_name(name)),
+        TypeExpr::Named(name) => unparse_type_name(name),
     }
 }
 
@@ -216,5 +250,51 @@ mod tests {
             }
             "#,
         );
+    }
+
+    #[test]
+    fn unparse_unicode_names_stay_bare() {
+        let src = "node 人物 {\n  名前: String\n}\n";
+        let ast = parse(src).unwrap();
+        assert_eq!(unparse(&ast), src);
+    }
+
+    #[test]
+    fn unparse_quotes_only_names_that_need_it() {
+        let ast =
+            parse("node `My Type` { `first name`: String `plain`: Int `a``b`: Int }").unwrap();
+        assert_eq!(
+            unparse(&ast),
+            "node `My Type` {\n  `first name`: String\n  plain: Int\n  `a``b`: Int\n}\n"
+        );
+    }
+
+    #[test]
+    fn unparse_roundtrips_quoted_names_in_every_position() {
+        roundtrip(
+            r#"
+            node `基 底` { id: String }
+            node `人 物`<`型 T`> extends `基 底` {
+              `値 1`: `型 T`
+              `上 司`: NodeRef<`人 物`>
+              `所 属`: EdgeRef<`勤 務`>
+              tags: List<`基 底`>
+            }
+            edge `勤 務`<`相 手`: `基 底`> {
+              from: `人 物`
+              to: `相 手`
+              props: { `役 職`: String @index @unique }
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn unparse_quotes_user_type_named_like_a_primitive() {
+        let ast = parse("node `Int` { id: String }\nnode T { a: `Int` b: Int }").unwrap();
+        let text = unparse(&ast);
+        assert!(text.contains("a: `Int`\n"), "{text}");
+        assert!(text.contains("b: Int\n"), "{text}");
+        assert_eq!(parse(&text).unwrap(), ast);
     }
 }

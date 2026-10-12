@@ -28,7 +28,7 @@ props_block = { "props" ~ ":" ~ "{" ~ field_def* ~ "}" }
 // A field may carry trailing annotations, e.g. `name: String @index`. `@unique` is reserved
 // for Phase 6 (tier-3) and parsed here so the grammar is stable, though enforcement is later.
 field_def  = { ident ~ ":" ~ type_expr ~ annotation* }
-annotation = { "@" ~ ident }
+annotation = { "@" ~ plain_ident }
 
 // --- Type expressions ---
 type_expr = {
@@ -41,8 +41,10 @@ type_expr = {
   | ident
 }
 
-primitive_type = {
-    "Int" | "Float" | "Boolean" | "DateTime" | "String" | "Json" | "Blob"
+// The lookahead keeps a primitive from swallowing the head of a longer user type name
+// (`Integer`, `StringValue`), which would otherwise be unreferenceable.
+primitive_type = @{
+    ("Int" | "Float" | "Boolean" | "DateTime" | "String" | "Json" | "Blob") ~ !XID_CONTINUE
 }
 
 vector_type   = { "Vector" ~ "<" ~ integer ~ ">" }
@@ -61,5 +63,15 @@ generic_params = { "<" ~ bound_param ~ ("," ~ bound_param)* ~ ">" }
 bound_param    = { ident ~ (":" ~ ident)? }
 
 // --- Primitives ---
-ident   = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+// A name is either a bare Unicode identifier (UAX #31 XID, plus a leading `_`) or a
+// backtick-quoted one. The quoted form follows Cypher: anything but a line break is allowed, and
+// a literal backtick is written doubled. Names are compared byte-for-byte; no Unicode
+// normalization is applied.
+ident        = ${ quoted_ident | plain_ident }
+plain_ident  = @{ (XID_START | "_") ~ XID_CONTINUE* }
+quoted_ident = ${ "`" ~ quoted_body ~ "`" }
+quoted_body  = @{ ("``" | !("`" | "\n" | "\r") ~ ANY)+ }
+
+// Used by the unparser to decide whether a name can be written bare.
+bare_name = { SOI ~ plain_ident ~ EOI }
 integer = @{ ASCII_DIGIT+ }
