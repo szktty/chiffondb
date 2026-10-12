@@ -105,6 +105,26 @@ edge WROTE {
 
 Type names and property names are validated against the schema, so referencing an undefined type or property is reported as an error.
 
+### Names
+
+A type or property name is a Unicode identifier (`XID_Start` or `_`, then `XID_Continue`), so
+names such as `人物` or `名前` can be written as they are. Any other name — one containing
+spaces or punctuation, or starting with a digit — is written between backticks, as in Cypher;
+a literal backtick is doubled, and a line break is not allowed.
+
+```
+node 人物 {
+    名前:         String
+    `first name`: String
+    `売上（税込）`: Int
+}
+```
+
+The same spelling works in Cypher queries (`MATCH (n:人物) WHERE n.`first name` = "..."`), and
+`get_schema_text` quotes a name exactly when it needs it. Names are compared byte-for-byte: no
+Unicode normalization is applied, so the precomposed and decomposed forms of `が` are two
+different names. Normalize (NFC is the usual choice) before handing names to ChiffonDB.
+
 ## Data types
 
 | Type | Internal representation | Description |

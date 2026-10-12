@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Schema type and property names accept Unicode identifiers (`node 人物 { 名前: String }`), and
+  any other name can be written between backticks (`` `first name` ``), as in Cypher.
+  `get_schema_text` quotes a name only when it needs it. Names are not Unicode-normalized.
+
 ### Changed
 
 - Inserting a node no longer slows down as the number of nodes of the same type grows: the label
@@ -16,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A user type whose name starts with a primitive type name (`Integer`, `StringValue`) could not
+  be used as a field or edge endpoint type; the schema was rejected.
 - `README.md` and `llms-full.txt` still described the ~2000-node cap removed in 0.2.0.
 
 ## [0.2.0] - 2026-07-13

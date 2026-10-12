@@ -37,6 +37,12 @@ chiffondb-core/   Storage / schema / traversal engine (library)
 
 Schema files use the `.graph` extension. UTF-8 text.
 
+Type and property names are Unicode identifiers (`XID_Start` or `_`, then `XID_Continue`), e.g.
+`node 人物 { 名前: String }`. Any other name (spaces, punctuation, a leading digit) is written
+between backticks as in Cypher — `` `first name`: String `` — with a literal backtick doubled and
+no line break allowed. The same spelling works in Cypher queries. `get_schema_text` quotes a name
+only when it needs it. Names are compared byte-for-byte (no Unicode normalization).
+
 ### 2.1 Node definition
 
 ```

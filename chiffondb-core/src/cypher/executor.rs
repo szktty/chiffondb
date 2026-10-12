@@ -2248,4 +2248,171 @@ mod tests {
             panic!("expected Rows, got {result:?}");
         }
     }
+
+    // ---- Non-ASCII and quoted names ----
+
+    fn setup_unicode_db() -> Database {
+        let mut db = Database::open_in_memory().unwrap();
+        db.apply_schema(
+            "node 人物 { 名前: String @index 年齢: Int `first name`: String `売上（税込）`: Int }\n\
+             node `My Type` { `a-b`: String }\n\
+             edge 知人 { from: 人物 to: 人物 props: { いつから: String } }\n\
+             edge `works at` { from: 人物 to: `My Type` }",
+        )
+        .unwrap();
+        db
+    }
+
+    fn rows(result: CypherResult) -> Vec<std::collections::HashMap<String, Value>> {
+        match result {
+            CypherResult::Rows(rows) => rows,
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unicode_names_create_match_where() {
+        let mut db = setup_unicode_db();
+        execute_cypher_query(&mut db, r#"CREATE (n:人物 {名前: "花子", 年齢: 30})"#).unwrap();
+        execute_cypher_query(&mut db, r#"CREATE (n:人物 {名前: "太郎", 年齢: 25})"#).unwrap();
+
+        let r = rows(
+            execute_cypher_query(
+                &mut db,
+                r#"MATCH (n:人物) WHERE n.名前 = "花子" RETURN n.名前, n.年齢, n"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["n.名前"], Value::String("花子".into()));
+        assert_eq!(r[0]["n.年齢"], Value::from(30));
+        assert_eq!(
+            r[0]["n"]["properties"]["名前"],
+            Value::String("花子".into())
+        );
+
+        let r = rows(
+            execute_cypher_query(&mut db, "MATCH (n:人物) WHERE n.年齢 > 20 RETURN n.名前")
+                .unwrap(),
+        );
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn test_unicode_names_edge_set_delete() {
+        let mut db = setup_unicode_db();
+        execute_cypher_query(&mut db, r#"CREATE (n:人物 {名前: "花子"})"#).unwrap();
+        execute_cypher_query(&mut db, r#"CREATE (n:人物 {名前: "太郎"})"#).unwrap();
+        execute_cypher_query(
+            &mut db,
+            r#"MATCH (a:人物 {名前: "花子"}), (b:人物 {名前: "太郎"}) CREATE (a)-[r:知人 {いつから: "2024"}]->(b)"#,
+        )
+        .unwrap();
+
+        let r = rows(
+            execute_cypher_query(
+                &mut db,
+                r#"MATCH (a:人物)-[r:知人]->(b:人物) RETURN a.名前, r, b.名前"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["r"]["type"], Value::String("知人".into()));
+        assert_eq!(
+            r[0]["r"]["properties"]["いつから"],
+            Value::String("2024".into())
+        );
+        assert_eq!(r[0]["b.名前"], Value::String("太郎".into()));
+
+        execute_cypher_query(&mut db, r#"MATCH (n:人物 {名前: "太郎"}) SET n.年齢 = 26"#).unwrap();
+        let r = rows(
+            execute_cypher_query(&mut db, r#"MATCH (n:人物 {名前: "太郎"}) RETURN n.年齢"#)
+                .unwrap(),
+        );
+        assert_eq!(r[0]["n.年齢"], Value::from(26));
+
+        execute_cypher_query(&mut db, r#"MATCH (n:人物 {名前: "太郎"}) DETACH DELETE n"#).unwrap();
+        let r = rows(execute_cypher_query(&mut db, "MATCH (n:人物) RETURN n.名前").unwrap());
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn test_quoted_names_in_cypher() {
+        let mut db = setup_unicode_db();
+        execute_cypher_query(
+            &mut db,
+            r#"CREATE (n:人物 {名前: "花子", `first name`: "Hanako", `売上（税込）`: 1100})"#,
+        )
+        .unwrap();
+        execute_cypher_query(&mut db, r#"CREATE (t:`My Type` {`a-b`: "x"})"#).unwrap();
+        execute_cypher_query(
+            &mut db,
+            r#"MATCH (a:人物 {名前: "花子"}), (b:`My Type`) CREATE (a)-[r:`works at`]->(b)"#,
+        )
+        .unwrap();
+
+        let r = rows(
+            execute_cypher_query(
+                &mut db,
+                r#"MATCH (a:人物)-[r:`works at`]->(b:`My Type`) WHERE a.`first name` = "Hanako" AND a.`売上（税込）` > 1000 RETURN a.`first name` AS f, b.`a-b` AS ab, r"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["f"], Value::String("Hanako".into()));
+        assert_eq!(r[0]["ab"], Value::String("x".into()));
+        assert_eq!(r[0]["r"]["type"], Value::String("works at".into()));
+    }
+
+    #[test]
+    fn test_schema_text_with_unicode_names_roundtrips_through_apply_schema() {
+        let mut db = setup_unicode_db();
+        execute_cypher_query(&mut db, r#"CREATE (n:人物 {名前: "花子"})"#).unwrap();
+
+        // The RinneGraph flow: read the schema text, append a type, apply it again.
+        let text = db.get_schema_text().unwrap();
+        assert!(text.contains("node 人物 {"), "{text}");
+        assert!(text.contains("`first name`: String"), "{text}");
+        assert!(text.contains("node `My Type` {"), "{text}");
+        db.apply_schema(&format!("{text}\nnode 会社 {{ 社名: String }}\n"))
+            .unwrap();
+        assert_eq!(
+            db.get_schema_text().unwrap(),
+            format!("{text}\nnode 会社 {{\n  社名: String\n}}\n")
+        );
+
+        execute_cypher_query(&mut db, r#"CREATE (c:会社 {社名: "A社"})"#).unwrap();
+        let r = rows(execute_cypher_query(&mut db, "MATCH (n:人物) RETURN n.名前").unwrap());
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn test_unicode_names_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unicode.chiffon");
+        let schema = "node 人物 { 名前: String @index `first name`: String }";
+        {
+            let mut db = Database::create(&path).unwrap();
+            db.apply_schema(schema).unwrap();
+            execute_cypher_query(
+                &mut db,
+                r#"CREATE (n:人物 {名前: "花子", `first name`: "Hanako"})"#,
+            )
+            .unwrap();
+            db.flush().unwrap();
+        }
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(
+            db.get_schema_text().unwrap(),
+            "node 人物 {\n  名前: String @index\n  `first name`: String\n}\n"
+        );
+        let r = rows(
+            execute_cypher_query(
+                &mut db,
+                r#"MATCH (n:人物 {名前: "花子"}) RETURN n.`first name` AS f"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(r[0]["f"], Value::String("Hanako".into()));
+    }
 }
