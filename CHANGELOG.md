@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On a file-backed database, a schema change or a dynamic label registration made inside a
+  transaction was not undone by a rollback.
 - A user type whose name starts with a primitive type name (`Integer`, `StringValue`) could not
   be used as a field or edge endpoint type; the schema was rejected.
 - `README.md` and `llms-full.txt` still described the ~2000-node cap removed in 0.2.0.

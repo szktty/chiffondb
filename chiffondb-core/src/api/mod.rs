@@ -1290,6 +1290,25 @@ edge KNOWS {
         assert_eq!(conn2.count_nodes(None).unwrap(), 0);
     }
 
+    #[test]
+    fn rollback_reverts_schema_change_on_file_backend() {
+        let (mut conn, path) = make_file_connection();
+        let before = conn.get_schema_text().expect("schema text");
+        conn.begin_transaction().expect("begin");
+        conn.insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
+            .expect("insert in tx");
+        conn.apply_schema(format!("{before}\nnode Extra {{ id: String }}"))
+            .expect("apply in tx");
+        conn.rollback_transaction().expect("rollback");
+        assert_eq!(conn.get_schema_text().expect("schema text"), before);
+        assert_eq!(conn.count_nodes(None).unwrap(), 0);
+        drop(conn);
+
+        let mut conn2 = Connection::open(path.to_string_lossy().into_owned()).expect("reopen");
+        assert_eq!(conn2.get_schema_text().expect("schema text"), before);
+        assert_eq!(conn2.count_nodes(None).unwrap(), 0);
+    }
+
     // ---- File lock ----
 
     #[test]

@@ -252,8 +252,9 @@ fn write_schema_dto(db: &mut DatabaseFile, dto: &SchemaDto) -> Result<(), GraphE
 
     db.header.schema_root = first_page_id;
     db.header.schema_version += 1;
-    db.write_header()?;
-    db.flush()
+    // No checkpoint here: a schema write may run inside a transaction, and checkpointing would
+    // move the transaction's pages out of the WAL, where a rollback can no longer discard them.
+    db.write_header()
 }
 
 /// Copies the stored schema from `src` to `dst` verbatim: definitions, name→type_id assignments
