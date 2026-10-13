@@ -218,12 +218,28 @@ fn dto_to_type(t: TypeExprDto) -> TypeExpr {
 /// Saves the schema AST to the schema pages in the database file.
 /// If a schema already exists, validates the migration policy and increments schema_version.
 pub fn save_schema(db: &mut DatabaseFile, ast: &SchemaAst) -> Result<(), GraphError> {
+    save_schema_with(db, ast, true)
+}
+
+/// Saves a schema whose difference from the stored one has already been applied to the
+/// records (e.g. a field type change with converted values), skipping the migration policy.
+pub fn save_schema_unchecked(db: &mut DatabaseFile, ast: &SchemaAst) -> Result<(), GraphError> {
+    save_schema_with(db, ast, false)
+}
+
+fn save_schema_with(
+    db: &mut DatabaseFile,
+    ast: &SchemaAst,
+    check_migration: bool,
+) -> Result<(), GraphError> {
     // Inherit existing type_id assignments so that adding/removing a type never
     // shifts the id of a type that is still present.
     let previous = if db.header.schema_root != 0 {
         match load_schema_dto(db) {
             Ok(old) => {
-                crate::schema::migration::validate_migration(&dto_to_ast(old.clone()), ast)?;
+                if check_migration {
+                    crate::schema::migration::validate_migration(&dto_to_ast(old.clone()), ast)?;
+                }
                 Some(old)
             }
             Err(_) => None,

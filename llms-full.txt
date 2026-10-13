@@ -117,9 +117,13 @@ node Admin extends User {
 - Removing fields (the stored values of that type's records are dropped)
 
 **Forbidden changes (error on apply):**
-- Changing a field's type
+- Changing a field's type (use `change_node_field_type` / `change_edge_field_type`, which convert
+  the stored values)
 - Renaming a type
 - Changing an edge's `from`/`to`
+
+A schema text cannot express a rename: writing a field under a new name removes the old field
+and adds a new one. Use `rename_node_field` / `rename_edge_field` to keep the values.
 
 `schema_version` is incremented on each schema change.
 

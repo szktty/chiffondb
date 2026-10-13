@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Schema type and property names accept Unicode identifiers (`node 人物 { 名前: String }`), and
   any other name can be written between backticks (`` `first name` ``), as in Cypher.
   `get_schema_text` quotes a name only when it needs it. Names are not Unicode-normalized.
+- `rename_node_field` / `rename_edge_field` rename a field and move the stored values (and index
+  entries) to the new name.
+- `change_node_field_type` / `change_edge_field_type` change a field's type among `String`,
+  `Int`, `Float`, `Boolean` and `DateTime`, converting the stored values. A value with no exact
+  counterpart rejects the change, or becomes `null` on request; either way the affected records
+  are reported.
 
 ### Changed
 

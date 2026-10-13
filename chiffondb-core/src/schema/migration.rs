@@ -7,7 +7,8 @@
 ///     an older version is ignored on read and dropped on the next write)
 ///
 /// Prohibited changes:
-///   - Changing a field's type
+///   - Changing a field's type (done by `Database::change_*_field_type`, which converts the
+///     stored values and bypasses this check)
 ///   - Renaming a type (removing the old type and adding a new one is allowed, but renaming
 ///     a type while keeping the same type_id is not)
 ///   - Changing an edge's from/to types

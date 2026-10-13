@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::db::{Database, DatabaseGraphView, DbSnapshot};
+use crate::db::{Database, DatabaseGraphView, DbSnapshot, FieldTypeChange, OnConversionFailure};
 use crate::pathfinding::{PathDirection, PathOptions};
 use crate::traversal::executor::execute;
 
@@ -240,6 +240,76 @@ impl Connection {
         self.db_mut()?
             .apply_schema(&schema_text)
             .map_err(|e| e.to_string())
+    }
+
+    /// Renames a field of a node type, moving the stored values to the new name.
+    pub fn rename_node_field(
+        &mut self,
+        type_name: String,
+        old_name: String,
+        new_name: String,
+    ) -> Result<(), String> {
+        self.db_mut()?
+            .rename_node_field(&type_name, &old_name, &new_name)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Renames a prop of an edge type, moving the stored values to the new name.
+    pub fn rename_edge_field(
+        &mut self,
+        type_name: String,
+        old_name: String,
+        new_name: String,
+    ) -> Result<(), String> {
+        self.db_mut()?
+            .rename_edge_field(&type_name, &old_name, &new_name)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Changes the type of a node type's field to `new_type` (`String`, `Int`, `Float`,
+    /// `Boolean` or `DateTime`), converting the stored values.
+    ///
+    /// Returns a JSON object `{"applied", "converted", "failed", "failed_records"}`. When a
+    /// value cannot be converted and `null_on_failure` is `false`, nothing is changed and
+    /// `applied` is `false`; when it is `true`, such values become `null`. `failed` counts
+    /// them, and `failed_records` lists their rids (`{"page", "slot"}`), capped at 100.
+    pub fn change_node_field_type(
+        &mut self,
+        type_name: String,
+        field_name: String,
+        new_type: String,
+        null_on_failure: bool,
+    ) -> Result<String, String> {
+        let outcome = self
+            .db_mut()?
+            .change_node_field_type(
+                &type_name,
+                &field_name,
+                &new_type,
+                on_conversion_failure(null_on_failure),
+            )
+            .map_err(|e| e.to_string())?;
+        field_type_change_to_json(&outcome)
+    }
+
+    /// Edge counterpart of `change_node_field_type`.
+    pub fn change_edge_field_type(
+        &mut self,
+        type_name: String,
+        field_name: String,
+        new_type: String,
+        null_on_failure: bool,
+    ) -> Result<String, String> {
+        let outcome = self
+            .db_mut()?
+            .change_edge_field_type(
+                &type_name,
+                &field_name,
+                &new_type,
+                on_conversion_failure(null_on_failure),
+            )
+            .map_err(|e| e.to_string())?;
+        field_type_change_to_json(&outcome)
     }
 
     /// Returns the schema stored in the database as DSL source text.
@@ -668,6 +738,29 @@ impl Connection {
         self.begin_transaction()?;
         Ok(Transaction { conn: self })
     }
+}
+
+fn on_conversion_failure(null_on_failure: bool) -> OnConversionFailure {
+    if null_on_failure {
+        OnConversionFailure::SetNull
+    } else {
+        OnConversionFailure::Reject
+    }
+}
+
+fn field_type_change_to_json(outcome: &FieldTypeChange) -> Result<String, String> {
+    let failed_records: Vec<serde_json::Value> = outcome
+        .failed_records
+        .iter()
+        .map(|rid| serde_json::json!({ "page": rid.page_id.0, "slot": rid.slot_id.0 }))
+        .collect();
+    serde_json::to_string(&serde_json::json!({
+        "applied": outcome.applied,
+        "converted": outcome.converted,
+        "failed": outcome.failed,
+        "failed_records": failed_records,
+    }))
+    .map_err(|e| e.to_string())
 }
 
 // ---- Transaction ----
@@ -1334,6 +1427,72 @@ edge KNOWS {
         assert_eq!(conn.get_schema_text().expect("schema text"), before);
         let props = conn.get_node_properties(rid).expect("props after rollback");
         assert!(props.contains("Alice"), "{props}");
+    }
+
+    #[test]
+    fn field_changes_roll_back_with_the_transaction() {
+        let (mut conn, _path) = make_file_connection();
+        conn.insert_node(
+            "Person".to_string(),
+            r#"{"id": "7", "name": "Alice"}"#.to_string(),
+        )
+        .expect("insert");
+        let before_schema = conn.get_schema_text().expect("schema text");
+        let before_nodes = conn.list_nodes(None).expect("list");
+
+        conn.begin_transaction().expect("begin");
+        conn.rename_node_field("Person".into(), "name".into(), "label".into())
+            .expect("rename");
+        let outcome = conn
+            .change_node_field_type("Person".into(), "id".into(), "Int".into(), false)
+            .expect("change type");
+        let outcome: Value = serde_json::from_str(&outcome).expect("outcome json");
+        assert_eq!(
+            outcome,
+            serde_json::json!({
+                "applied": true, "converted": 1, "failed": 0, "failed_records": []
+            })
+        );
+        let in_tx = conn.list_nodes(None).expect("list in tx");
+        assert!(
+            in_tx.contains(r#""id":7"#) && in_tx.contains("label"),
+            "{in_tx}"
+        );
+        conn.rollback_transaction().expect("rollback");
+
+        assert_eq!(conn.get_schema_text().expect("schema text"), before_schema);
+        assert_eq!(conn.list_nodes(None).expect("list"), before_nodes);
+    }
+
+    #[test]
+    fn change_field_type_reports_unconvertible_records() {
+        let mut conn = make_connection();
+        let rid = conn
+            .insert_node("Person".to_string(), r#"{"id": "u1"}"#.to_string())
+            .expect("insert");
+
+        let outcome = conn
+            .change_node_field_type("Person".into(), "id".into(), "Int".into(), false)
+            .expect("change type");
+        let outcome: Value = serde_json::from_str(&outcome).expect("outcome json");
+        assert_eq!(
+            outcome,
+            serde_json::json!({
+                "applied": false,
+                "converted": 0,
+                "failed": 1,
+                "failed_records": [{ "page": rid.page, "slot": rid.slot }],
+            })
+        );
+
+        let outcome = conn
+            .change_edge_field_type("FOLLOWS".into(), "weight".into(), "String".into(), true)
+            .expect("change edge type");
+        assert!(outcome.contains(r#""applied":true"#), "{outcome}");
+        conn.rename_edge_field("FOLLOWS".into(), "weight".into(), "strength".into())
+            .expect("rename edge field");
+        let schema = conn.get_schema_text().expect("schema text");
+        assert!(schema.contains("strength: String"), "{schema}");
     }
 
     // ---- File lock ----

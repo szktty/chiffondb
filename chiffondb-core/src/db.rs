@@ -68,6 +68,49 @@ struct FieldPurge {
     dropped_indexed: Vec<PropertyPath>,
 }
 
+/// Record family a schema field belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordKind {
+    Node,
+    Edge,
+}
+
+impl RecordKind {
+    fn label(self) -> &'static str {
+        match self {
+            RecordKind::Node => "node",
+            RecordKind::Edge => "edge",
+        }
+    }
+}
+
+/// What a field type change does with a value that has no counterpart in the new type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnConversionFailure {
+    /// Change nothing and report the records that hold such values.
+    Reject,
+    /// Replace such values with `null` and report how many were replaced.
+    SetNull,
+}
+
+/// Outcome of `change_node_field_type` / `change_edge_field_type`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldTypeChange {
+    /// `false` when the change was rejected because of unconvertible values; the database is
+    /// then unchanged.
+    pub applied: bool,
+    /// Number of non-null values that now hold the new type.
+    pub converted: u64,
+    /// Number of values that could not be converted (set to `null` when `applied`).
+    pub failed: u64,
+    /// The records counted in `failed`, capped at `MAX_REPORTED_FAILURES`.
+    pub failed_records: Vec<RecordId>,
+}
+
+/// Upper bound on `FieldTypeChange::failed_records`, so the report stays bounded on a type
+/// with many unconvertible values. `failed` is always the exact count.
+pub const MAX_REPORTED_FAILURES: usize = 100;
+
 pub(crate) struct DbSnapshot {
     pub(crate) topo: TopologyStore,
     pub(crate) file: FileSnapshot,
@@ -779,6 +822,374 @@ impl Database {
             fields: Arc::clone(&fields),
         });
         Ok(Some(fields))
+    }
+
+    // ---- Field rename / type change ----
+
+    /// Renames a field of a node type and moves the stored values of that type's nodes to the
+    /// new name, together with their index entries. On error the database is left unchanged.
+    pub fn rename_node_field(
+        &mut self,
+        type_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), GraphError> {
+        self.rename_field(RecordKind::Node, type_name, old_name, new_name)
+    }
+
+    /// Renames a prop of an edge type and moves the stored values of that type's edges to the
+    /// new name. On error the database is left unchanged.
+    pub fn rename_edge_field(
+        &mut self,
+        type_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), GraphError> {
+        self.rename_field(RecordKind::Edge, type_name, old_name, new_name)
+    }
+
+    /// Changes the type of a node type's field, converting the stored values of that type's
+    /// nodes (see `schema::convert` for the rules). `new_type` is one of `String`, `Int`,
+    /// `Float`, `Boolean`, `DateTime`. `null` and absent values are left as they are.
+    ///
+    /// With `OnConversionFailure::Reject`, a single unconvertible value leaves the database
+    /// unchanged and the result lists the offending records. A converted value that breaks a
+    /// `@unique` constraint fails the whole operation with `UniqueViolation`.
+    pub fn change_node_field_type(
+        &mut self,
+        type_name: &str,
+        field_name: &str,
+        new_type: &str,
+        on_failure: OnConversionFailure,
+    ) -> Result<FieldTypeChange, GraphError> {
+        self.change_field_type(
+            RecordKind::Node,
+            type_name,
+            field_name,
+            new_type,
+            on_failure,
+        )
+    }
+
+    /// Edge counterpart of `change_node_field_type`.
+    pub fn change_edge_field_type(
+        &mut self,
+        type_name: &str,
+        field_name: &str,
+        new_type: &str,
+        on_failure: OnConversionFailure,
+    ) -> Result<FieldTypeChange, GraphError> {
+        self.change_field_type(
+            RecordKind::Edge,
+            type_name,
+            field_name,
+            new_type,
+            on_failure,
+        )
+    }
+
+    fn rename_field(
+        &mut self,
+        kind: RecordKind,
+        type_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), GraphError> {
+        let mut ast = load_schema(&mut self.file)?;
+        let type_id = self.schema_type_id(kind, type_name)?;
+        let fields = schema_fields_mut(&mut ast, kind, type_name)?;
+        let position = field_position(fields, kind, type_name, old_name)?;
+        if old_name == new_name {
+            return Ok(());
+        }
+        if fields.iter().any(|f| f.name == new_name) {
+            return Err(GraphError::SchemaError(format!(
+                "{} '{type_name}' already has a field '{new_name}'",
+                kind.label()
+            )));
+        }
+        let indexed = fields[position].indexed || fields[position].unique;
+        fields[position].name = new_name.to_string();
+        crate::schema::validator::validate(&ast)?;
+        // `get_schema_text` must keep producing text that `apply_schema` accepts.
+        let reparsed = crate::schema::parser::parse(&crate::schema::unparse::unparse(&ast))?;
+        if reparsed != ast {
+            return Err(GraphError::SchemaError(format!(
+                "invalid field name '{new_name}'"
+            )));
+        }
+
+        let snapshot = self.take_snapshot();
+        let result = self.rename_field_records(&ast, kind, type_id, old_name, new_name, indexed);
+        if result.is_err() {
+            self.restore_snapshot(snapshot);
+        }
+        result
+    }
+
+    fn rename_field_records(
+        &mut self,
+        ast: &crate::schema::ast::SchemaAst,
+        kind: RecordKind,
+        type_id: u16,
+        old_name: &str,
+        new_name: &str,
+        indexed: bool,
+    ) -> Result<(), GraphError> {
+        crate::schema::store::save_schema_unchecked(&mut self.file, ast)?;
+        for rid in self.rids_of_kind(kind, type_id)? {
+            let Some(mut props) = self.raw_props_of_type(kind, type_id, rid)? else {
+                continue;
+            };
+            // A value under the new name can only be a leftover of a field removed earlier.
+            let leftover = props.remove(new_name);
+            let value = props.remove(old_name);
+            if leftover.is_none() && value.is_none() {
+                continue;
+            }
+            if let Some(value) = value {
+                if indexed && kind == RecordKind::Node && is_indexable_value(&value) {
+                    let bytes = encode_value(&value)?;
+                    let mut index = PropertyIndex::new(&mut self.file);
+                    index.remove(IndexKey::new(type_id, old_name, &bytes), rid)?;
+                    index.add(IndexKey::new(type_id, new_name, &bytes), rid)?;
+                }
+                props.insert(new_name.to_string(), value);
+            }
+            self.replace_raw_props(kind, rid, &props)?;
+        }
+        Ok(())
+    }
+
+    fn change_field_type(
+        &mut self,
+        kind: RecordKind,
+        type_name: &str,
+        field_name: &str,
+        new_type: &str,
+        on_failure: OnConversionFailure,
+    ) -> Result<FieldTypeChange, GraphError> {
+        use crate::schema::convert::{conversion_supported, convert_value, scalar_type_from_name};
+
+        let to = scalar_type_from_name(new_type).ok_or_else(|| {
+            GraphError::SchemaError(format!(
+                "cannot change a field to type '{new_type}': expected String, Int, Float, Boolean or DateTime"
+            ))
+        })?;
+        let mut ast = load_schema(&mut self.file)?;
+        let type_id = self.schema_type_id(kind, type_name)?;
+        let fields = schema_fields_mut(&mut ast, kind, type_name)?;
+        let position = field_position(fields, kind, type_name, field_name)?;
+        let field = &mut fields[position];
+        let mut outcome = FieldTypeChange {
+            applied: true,
+            converted: 0,
+            failed: 0,
+            failed_records: Vec::new(),
+        };
+        if field.type_expr == to {
+            return Ok(outcome);
+        }
+        if !conversion_supported(&field.type_expr, &to) {
+            return Err(GraphError::SchemaError(format!(
+                "{} '{type_name}' field '{field_name}': changing the type to {new_type} is not supported",
+                kind.label()
+            )));
+        }
+        // Only nodes have property indexes and unique constraints.
+        let indexed = kind == RecordKind::Node && (field.indexed || field.unique);
+        let unique = kind == RecordKind::Node && field.unique;
+        field.type_expr = to.clone();
+
+        // Find the unconvertible values before writing anything, so a rejected change costs no
+        // rollback and reports every offending record.
+        let rids = self.rids_of_kind(kind, type_id)?;
+        for &rid in &rids {
+            let Some(props) = self.raw_props_of_type(kind, type_id, rid)? else {
+                continue;
+            };
+            match props.get(field_name) {
+                None | Some(Value::Null) => {}
+                Some(value) => {
+                    if convert_value(value, &to).is_none() {
+                        outcome.failed += 1;
+                        if outcome.failed_records.len() < MAX_REPORTED_FAILURES {
+                            outcome.failed_records.push(rid);
+                        }
+                    }
+                }
+            }
+        }
+        if outcome.failed > 0 && on_failure == OnConversionFailure::Reject {
+            outcome.applied = false;
+            return Ok(outcome);
+        }
+
+        let snapshot = self.take_snapshot();
+        let result = self
+            .convert_field_records(&ast, kind, type_id, &rids, field_name, &to, indexed, unique);
+        match result {
+            Ok(converted) => {
+                outcome.converted = converted;
+                Ok(outcome)
+            }
+            Err(e) => {
+                self.restore_snapshot(snapshot);
+                Err(e)
+            }
+        }
+    }
+
+    /// Saves `ast` and rewrites `field_name` of every record in `rids` to type `to`, setting
+    /// unconvertible values to `null`. Returns the number of converted values.
+    #[allow(clippy::too_many_arguments)]
+    fn convert_field_records(
+        &mut self,
+        ast: &crate::schema::ast::SchemaAst,
+        kind: RecordKind,
+        type_id: u16,
+        rids: &[RecordId],
+        field_name: &str,
+        to: &crate::schema::ast::TypeExpr,
+        indexed: bool,
+        unique: bool,
+    ) -> Result<u64, GraphError> {
+        crate::schema::store::save_schema_unchecked(&mut self.file, ast)?;
+        let mut converted = 0u64;
+        for &rid in rids {
+            let Some(mut props) = self.raw_props_of_type(kind, type_id, rid)? else {
+                continue;
+            };
+            let old_value = match props.get(field_name) {
+                None | Some(Value::Null) => continue,
+                Some(value) => value.clone(),
+            };
+            let new_value = crate::schema::convert::convert_value(&old_value, to);
+            if new_value.is_some() {
+                converted += 1;
+            }
+            let new_value = new_value.unwrap_or(Value::Null);
+            if new_value == old_value {
+                continue;
+            }
+            if indexed {
+                if is_indexable_value(&old_value) {
+                    let bytes = encode_value(&old_value)?;
+                    PropertyIndex::new(&mut self.file)
+                        .remove(IndexKey::new(type_id, field_name, &bytes), rid)?;
+                }
+                if is_indexable_value(&new_value) {
+                    let bytes = encode_value(&new_value)?;
+                    let key = IndexKey::new(type_id, field_name, &bytes);
+                    if unique {
+                        // Records not converted yet hold a value of another JSON kind, so only
+                        // already converted (or already conforming) records can match here.
+                        let candidates = PropertyIndex::new(&mut self.file).candidates(key)?;
+                        for other in candidates {
+                            if other == rid {
+                                continue;
+                            }
+                            let other_props = self.get_node_properties_raw(other)?;
+                            if other_props.get(field_name) == Some(&new_value) {
+                                return Err(GraphError::UniqueViolation {
+                                    field: field_name.to_string(),
+                                    value: new_value.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    PropertyIndex::new(&mut self.file).add(key, rid)?;
+                }
+            }
+            props.insert(field_name.to_string(), new_value);
+            self.replace_raw_props(kind, rid, &props)?;
+        }
+        Ok(converted)
+    }
+
+    fn schema_type_id(&mut self, kind: RecordKind, type_name: &str) -> Result<u16, GraphError> {
+        let registry = self.load_schema_registry()?;
+        match kind {
+            RecordKind::Node => registry.node_type_id(type_name),
+            RecordKind::Edge => registry.edge_type_id(type_name),
+        }
+        .ok_or_else(|| {
+            GraphError::SchemaError(format!("unknown {} type: {type_name}", kind.label()))
+        })
+    }
+
+    /// Candidate records of a type; `raw_props_of_type` filters out the ones that do not
+    /// belong to it.
+    fn rids_of_kind(
+        &mut self,
+        kind: RecordKind,
+        type_id: u16,
+    ) -> Result<Vec<RecordId>, GraphError> {
+        match kind {
+            RecordKind::Node => index::rids_of_type(&self.topo, &mut self.file, type_id),
+            RecordKind::Edge => self.topo.live_edge_rids(&mut self.file),
+        }
+    }
+
+    /// Stored properties of `rid` when its (primary) type is `type_id` and it has any; `None`
+    /// otherwise. Unlike the public getters, leftover values of removed fields are included.
+    fn raw_props_of_type(
+        &mut self,
+        kind: RecordKind,
+        type_id: u16,
+        rid: RecordId,
+    ) -> Result<Option<HashMap<String, Value>>, GraphError> {
+        let (record_type, pref) = match kind {
+            RecordKind::Node => {
+                let node = self.topo.read_node(&mut self.file, rid)?;
+                (node.node_type_id, node.property_ref)
+            }
+            RecordKind::Edge => {
+                let edge = self.topo.read_edge(&mut self.file, rid)?;
+                (edge.edge_type_id, edge.property_ref)
+            }
+        };
+        match pref {
+            Some(pref) if record_type == type_id => {
+                Ok(Some(PropertyStore::read(&mut self.file, pref)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Replaces the stored properties of `rid` and reclaims the old value's space. Index
+    /// maintenance is the caller's.
+    fn replace_raw_props(
+        &mut self,
+        kind: RecordKind,
+        rid: RecordId,
+        props: &HashMap<String, Value>,
+    ) -> Result<(), GraphError> {
+        let new_pref = if props.is_empty() {
+            None
+        } else {
+            Some(PropertyStore::write(&mut self.file, props)?)
+        };
+        let old_pref = match kind {
+            RecordKind::Node => {
+                let mut node = self.topo.read_node(&mut self.file, rid)?;
+                let old = node.property_ref;
+                node.property_ref = new_pref;
+                self.topo.write_node(&mut self.file, &node)?;
+                old
+            }
+            RecordKind::Edge => {
+                let mut edge = self.topo.read_edge(&mut self.file, rid)?;
+                let old = edge.property_ref;
+                edge.property_ref = new_pref;
+                self.topo.write_edge(&mut self.file, &edge)?;
+                old
+            }
+        };
+        if let Some(old) = old_pref {
+            PropertyStore::free(&mut self.file, old)?;
+        }
+        Ok(())
     }
 
     /// Returns a SchemaRegistry built from the schema stored in the database.
@@ -1585,6 +1996,46 @@ enum IndexOp {
 
 /// A value is indexable only if it is a scalar (the partial-index semantics of `PropertyPath`):
 /// arrays and objects have no equality key here and are excluded. `Null` is also excluded.
+/// The field list of the `kind` type named `type_name` in `ast`.
+fn schema_fields_mut<'a>(
+    ast: &'a mut crate::schema::ast::SchemaAst,
+    kind: RecordKind,
+    type_name: &str,
+) -> Result<&'a mut Vec<crate::schema::ast::FieldDef>, GraphError> {
+    use crate::schema::ast::Definition;
+    ast.definitions
+        .iter_mut()
+        .find_map(|d| match d {
+            Definition::Node(n) if kind == RecordKind::Node && n.name == type_name => {
+                Some(&mut n.fields)
+            }
+            Definition::Edge(e) if kind == RecordKind::Edge && e.name == type_name => {
+                Some(&mut e.props)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            GraphError::SchemaError(format!("unknown {} type: {type_name}", kind.label()))
+        })
+}
+
+fn field_position(
+    fields: &[crate::schema::ast::FieldDef],
+    kind: RecordKind,
+    type_name: &str,
+    field_name: &str,
+) -> Result<usize, GraphError> {
+    fields
+        .iter()
+        .position(|f| f.name == field_name)
+        .ok_or_else(|| {
+            GraphError::SchemaError(format!(
+                "{} '{type_name}' has no field '{field_name}'",
+                kind.label()
+            ))
+        })
+}
+
 fn is_indexable_value(v: &Value) -> bool {
     matches!(v, Value::Bool(_) | Value::Number(_) | Value::String(_))
 }
@@ -5841,5 +6292,417 @@ mod tests {
             .get_node_properties_raw(rid.0)
             .unwrap()
             .contains_key("age"));
+    }
+
+    // ---- Field rename ----
+
+    fn user_props(email: &str) -> HashMap<String, Value> {
+        HashMap::from([
+            ("email".to_string(), json!(email)),
+            ("name".to_string(), json!("n")),
+        ])
+    }
+
+    #[test]
+    fn rename_node_field_moves_values_and_index_entries() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        let rid = db.insert_node_by_name("User", user_props("a@x")).unwrap();
+
+        db.rename_node_field("User", "email", "mail").unwrap();
+
+        let props = db.get_node_properties(rid).unwrap();
+        assert_eq!(props.get("mail"), Some(&json!("a@x")));
+        assert!(!props.contains_key("email"));
+        assert!(!db
+            .get_node_properties_raw(rid.0)
+            .unwrap()
+            .contains_key("email"));
+        assert_eq!(
+            db.find_all_nodes(type_id, &PropertyPath::from("mail"), &json!("a@x"))
+                .unwrap(),
+            vec![rid.0]
+        );
+        let old_bytes = encode_value(&json!("a@x")).unwrap();
+        assert!(PropertyIndex::new(&mut db.file)
+            .candidates(IndexKey::new(type_id, "email", &old_bytes))
+            .unwrap()
+            .is_empty());
+
+        // The stored schema reads back as text that applies cleanly.
+        let text = db.get_schema_text().unwrap();
+        assert!(text.contains("mail: String @index"), "{text}");
+        db.apply_schema(&text).unwrap();
+        db.patch_node_properties(rid, HashMap::from([("name".to_string(), json!("m"))]))
+            .unwrap();
+    }
+
+    #[test]
+    fn rename_keeps_unique_constraint() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node User { email: String @unique }")
+            .unwrap();
+        let props = HashMap::from([("email".to_string(), json!("a@x"))]);
+        db.insert_node_by_name("User", props).unwrap();
+
+        db.rename_node_field("User", "email", "mail").unwrap();
+
+        let dup = HashMap::from([("mail".to_string(), json!("a@x"))]);
+        let err = db.insert_node_by_name("User", dup).unwrap_err();
+        assert!(matches!(err, GraphError::UniqueViolation { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn rename_accepts_non_ascii_name_and_drops_leftover() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node Person { id: String  age: String }")
+            .unwrap();
+        let type_id = node_type_id(&mut db, "Person");
+        // `年齢` is a leftover here: the type does not declare it.
+        let with_leftover = db
+            .insert_node(
+                type_id,
+                HashMap::from([
+                    ("id".to_string(), json!("1")),
+                    ("年齢".to_string(), json!(99)),
+                ]),
+            )
+            .unwrap();
+        let with_value = db
+            .insert_node(
+                type_id,
+                HashMap::from([
+                    ("id".to_string(), json!("2")),
+                    ("age".to_string(), json!("30")),
+                    ("年齢".to_string(), json!(99)),
+                ]),
+            )
+            .unwrap();
+
+        db.rename_node_field("Person", "age", "年齢").unwrap();
+
+        assert!(!db
+            .get_node_properties(with_leftover)
+            .unwrap()
+            .contains_key("年齢"));
+        assert_eq!(
+            db.get_node_properties(with_value).unwrap().get("年齢"),
+            Some(&json!("30"))
+        );
+        let text = db.get_schema_text().unwrap();
+        db.apply_schema(&text).unwrap();
+    }
+
+    #[test]
+    fn rename_rejects_bad_requests_and_changes_nothing() {
+        let (mut db, _) = make_db();
+        db.apply_schema(PERSON_FULL).unwrap();
+        let rid = db
+            .insert_node_by_name("Person", person_props(json!("30")))
+            .unwrap();
+        let before = db.get_schema_text().unwrap();
+
+        for (type_name, old, new) in [
+            ("Person", "age", "name"),
+            ("Person", "missing", "x"),
+            ("Ghost", "age", "x"),
+            ("Person", "age", ""),
+        ] {
+            let err = db.rename_node_field(type_name, old, new).unwrap_err();
+            assert!(matches!(err, GraphError::SchemaError(_)), "{err:?}");
+        }
+        assert!(db.rename_edge_field("Person", "age", "x").is_err());
+
+        assert_eq!(db.get_schema_text().unwrap(), before);
+        assert_eq!(
+            db.get_node_properties(rid).unwrap(),
+            person_props(json!("30"))
+        );
+    }
+
+    const KNOWS_SCHEMA: &str =
+        "node Person { id: String } edge KNOWS { from: Person to: Person props: { since: String } }";
+
+    fn make_knows_edge(db: &mut Database, since: Value) -> EdgeRid {
+        let id_props = |id: &str| HashMap::from([("id".to_string(), json!(id))]);
+        let a = db.insert_node_by_name("Person", id_props("a")).unwrap();
+        let b = db.insert_node_by_name("Person", id_props("b")).unwrap();
+        db.insert_edge_by_name("KNOWS", a, b, HashMap::from([("since".to_string(), since)]))
+            .unwrap()
+    }
+
+    #[test]
+    fn rename_edge_field_moves_values() {
+        let (mut db, _) = make_db();
+        db.apply_schema(KNOWS_SCHEMA).unwrap();
+        let eid = make_knows_edge(&mut db, json!("2020"));
+
+        db.rename_edge_field("KNOWS", "since", "from_year").unwrap();
+
+        assert_eq!(
+            db.get_edge_properties(eid).unwrap(),
+            HashMap::from([("from_year".to_string(), json!("2020"))])
+        );
+        let text = db.get_schema_text().unwrap();
+        db.apply_schema(&text).unwrap();
+    }
+
+    // ---- Field type change ----
+
+    #[test]
+    fn change_node_field_type_converts_values() {
+        let (mut db, _) = make_db();
+        db.apply_schema(PERSON_FULL).unwrap();
+        let converted = db
+            .insert_node_by_name("Person", person_props(json!(" 30 ")))
+            .unwrap();
+        let null = db
+            .insert_node_by_name("Person", person_props(Value::Null))
+            .unwrap();
+        let absent = db
+            .insert_node_by_name("Person", HashMap::from([("id".to_string(), json!("3"))]))
+            .unwrap();
+
+        let outcome = db
+            .change_node_field_type("Person", "age", "Int", OnConversionFailure::Reject)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            FieldTypeChange {
+                applied: true,
+                converted: 1,
+                failed: 0,
+                failed_records: Vec::new(),
+            }
+        );
+        assert_eq!(
+            db.get_node_properties(converted).unwrap().get("age"),
+            Some(&json!(30))
+        );
+        assert_eq!(
+            db.get_node_properties(null).unwrap().get("age"),
+            Some(&Value::Null)
+        );
+        assert!(!db.get_node_properties(absent).unwrap().contains_key("age"));
+
+        let text = db.get_schema_text().unwrap();
+        assert!(text.contains("age: Int"), "{text}");
+        db.apply_schema(&text).unwrap();
+        db.patch_node_properties(
+            converted,
+            HashMap::from([("name".to_string(), json!("Tanaka"))]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn change_type_rejects_unconvertible_values_by_default() {
+        let (mut db, _) = make_db();
+        db.apply_schema(PERSON_FULL).unwrap();
+        let good = db
+            .insert_node_by_name("Person", person_props(json!("30")))
+            .unwrap();
+        let bad = db
+            .insert_node_by_name("Person", person_props(json!("三十")))
+            .unwrap();
+        let before = db.get_schema_text().unwrap();
+
+        let outcome = db
+            .change_node_field_type("Person", "age", "Int", OnConversionFailure::Reject)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            FieldTypeChange {
+                applied: false,
+                converted: 0,
+                failed: 1,
+                failed_records: vec![bad.0],
+            }
+        );
+        assert_eq!(db.get_schema_text().unwrap(), before);
+        assert_eq!(
+            db.get_node_properties(good).unwrap().get("age"),
+            Some(&json!("30"))
+        );
+    }
+
+    #[test]
+    fn change_type_can_null_unconvertible_values() {
+        let (mut db, _) = make_db();
+        db.apply_schema(PERSON_FULL).unwrap();
+        let good = db
+            .insert_node_by_name("Person", person_props(json!("30")))
+            .unwrap();
+        let bad = db
+            .insert_node_by_name("Person", person_props(json!("三十")))
+            .unwrap();
+
+        let outcome = db
+            .change_node_field_type("Person", "age", "Int", OnConversionFailure::SetNull)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            FieldTypeChange {
+                applied: true,
+                converted: 1,
+                failed: 1,
+                failed_records: vec![bad.0],
+            }
+        );
+        assert_eq!(
+            db.get_node_properties(good).unwrap().get("age"),
+            Some(&json!(30))
+        );
+        assert_eq!(
+            db.get_node_properties(bad).unwrap().get("age"),
+            Some(&Value::Null)
+        );
+    }
+
+    #[test]
+    fn change_type_caps_reported_failures() {
+        let (mut db, _) = make_db();
+        db.apply_schema(PERSON_FULL).unwrap();
+        for _ in 0..MAX_REPORTED_FAILURES + 20 {
+            db.insert_node_by_name("Person", person_props(json!("x")))
+                .unwrap();
+        }
+
+        let outcome = db
+            .change_node_field_type("Person", "age", "Int", OnConversionFailure::Reject)
+            .unwrap();
+
+        assert_eq!(outcome.failed, (MAX_REPORTED_FAILURES + 20) as u64);
+        assert_eq!(outcome.failed_records.len(), MAX_REPORTED_FAILURES);
+    }
+
+    #[test]
+    fn change_type_rebuilds_index_entries() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node Item { code: String @index }")
+            .unwrap();
+        let type_id = node_type_id(&mut db, "Item");
+        let rid = db
+            .insert_node_by_name("Item", HashMap::from([("code".to_string(), json!("42"))]))
+            .unwrap();
+        let path = PropertyPath::from("code");
+
+        db.change_node_field_type("Item", "code", "Int", OnConversionFailure::Reject)
+            .unwrap();
+
+        assert_eq!(
+            db.find_all_nodes(type_id, &path, &json!(42)).unwrap(),
+            vec![rid.0]
+        );
+        let old_bytes = encode_value(&json!("42")).unwrap();
+        assert!(PropertyIndex::new(&mut db.file)
+            .candidates(IndexKey::new(type_id, "code", &old_bytes))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn change_type_fails_whole_on_unique_violation() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node Item { code: String @unique }")
+            .unwrap();
+        let type_id = node_type_id(&mut db, "Item");
+        let a = db
+            .insert_node_by_name("Item", HashMap::from([("code".to_string(), json!("1"))]))
+            .unwrap();
+        let b = db
+            .insert_node_by_name("Item", HashMap::from([("code".to_string(), json!(" 1"))]))
+            .unwrap();
+        let before = db.get_schema_text().unwrap();
+
+        let err = db
+            .change_node_field_type("Item", "code", "Int", OnConversionFailure::Reject)
+            .unwrap_err();
+
+        assert!(matches!(err, GraphError::UniqueViolation { .. }), "{err:?}");
+        assert_eq!(db.get_schema_text().unwrap(), before);
+        assert_eq!(
+            db.get_node_properties(a).unwrap().get("code"),
+            Some(&json!("1"))
+        );
+        assert_eq!(
+            db.get_node_properties(b).unwrap().get("code"),
+            Some(&json!(" 1"))
+        );
+        assert_eq!(
+            db.find_all_nodes(type_id, &PropertyPath::from("code"), &json!("1"))
+                .unwrap(),
+            vec![a.0]
+        );
+    }
+
+    #[test]
+    fn change_type_rejects_unsupported_requests() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node Item { flag: Boolean  data: Json  code: String }")
+            .unwrap();
+
+        for (field, new_type) in [
+            ("flag", "Int"),
+            ("data", "String"),
+            ("code", "Json"),
+            ("code", "List<Int>"),
+            ("missing", "Int"),
+        ] {
+            let err = db
+                .change_node_field_type("Item", field, new_type, OnConversionFailure::Reject)
+                .unwrap_err();
+            assert!(
+                matches!(err, GraphError::SchemaError(_)),
+                "{field}: {err:?}"
+            );
+        }
+        let same = db
+            .change_node_field_type("Item", "code", "String", OnConversionFailure::Reject)
+            .unwrap();
+        assert!(same.applied);
+    }
+
+    #[test]
+    fn change_edge_field_type_converts_values() {
+        let (mut db, _) = make_db();
+        db.apply_schema(KNOWS_SCHEMA).unwrap();
+        let eid = make_knows_edge(&mut db, json!("2020"));
+
+        let outcome = db
+            .change_edge_field_type("KNOWS", "since", "Int", OnConversionFailure::Reject)
+            .unwrap();
+
+        assert!(outcome.applied);
+        assert_eq!(outcome.converted, 1);
+        assert_eq!(
+            db.get_edge_properties(eid).unwrap().get("since"),
+            Some(&json!(2020))
+        );
+        db.patch_edge_properties(eid, HashMap::from([("since".to_string(), json!(2021))]))
+            .unwrap();
+    }
+
+    #[test]
+    fn int_to_float_and_back_round_trips() {
+        let (mut db, _) = make_db();
+        db.apply_schema("node Item { n: Int }").unwrap();
+        let rid = db
+            .insert_node_by_name("Item", HashMap::from([("n".to_string(), json!(3))]))
+            .unwrap();
+
+        db.change_node_field_type("Item", "n", "Float", OnConversionFailure::Reject)
+            .unwrap();
+        let value = db.get_node_properties(rid).unwrap().remove("n").unwrap();
+        assert!(value.as_number().unwrap().is_f64(), "{value}");
+
+        db.change_node_field_type("Item", "n", "Int", OnConversionFailure::Reject)
+            .unwrap();
+        assert_eq!(
+            db.get_node_properties(rid).unwrap().get("n"),
+            Some(&json!(3))
+        );
     }
 }
