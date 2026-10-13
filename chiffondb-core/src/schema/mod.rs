@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod convert;
 pub mod migration;
 pub mod parser;
 pub mod registry;

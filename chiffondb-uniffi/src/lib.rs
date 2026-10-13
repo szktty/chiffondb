@@ -226,6 +226,50 @@ impl Connection {
         self.with(|c| c.get_schema_text())
     }
 
+    /// Renames a field of a node type, moving the stored values to the new name.
+    pub fn rename_node_field(
+        &self,
+        type_name: String,
+        old_name: String,
+        new_name: String,
+    ) -> Result<()> {
+        self.with(|c| c.rename_node_field(type_name, old_name, new_name))
+    }
+
+    /// Renames a prop of an edge type, moving the stored values to the new name.
+    pub fn rename_edge_field(
+        &self,
+        type_name: String,
+        old_name: String,
+        new_name: String,
+    ) -> Result<()> {
+        self.with(|c| c.rename_edge_field(type_name, old_name, new_name))
+    }
+
+    /// Changes the type of a node type's field, converting the stored values. Returns a JSON
+    /// object `{"applied", "converted", "failed", "failed_records"}`; see
+    /// `chiffondb_core::api::Connection::change_node_field_type`.
+    pub fn change_node_field_type(
+        &self,
+        type_name: String,
+        field_name: String,
+        new_type: String,
+        null_on_failure: bool,
+    ) -> Result<String> {
+        self.with(|c| c.change_node_field_type(type_name, field_name, new_type, null_on_failure))
+    }
+
+    /// Edge counterpart of `change_node_field_type`.
+    pub fn change_edge_field_type(
+        &self,
+        type_name: String,
+        field_name: String,
+        new_type: String,
+        null_on_failure: bool,
+    ) -> Result<String> {
+        self.with(|c| c.change_edge_field_type(type_name, field_name, new_type, null_on_failure))
+    }
+
     /// Returns the declared node type names.
     pub fn node_type_names(&self) -> Result<Vec<String>> {
         self.with(|c| c.node_type_names())

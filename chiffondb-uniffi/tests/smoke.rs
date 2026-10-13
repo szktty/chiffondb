@@ -114,3 +114,31 @@ fn transactions_roll_back() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(conn.count_nodes(None)?, 0);
     Ok(())
 }
+
+#[test]
+fn field_rename_and_type_change() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::open_in_memory()?;
+    conn.apply_schema("node 人物 {\n  _id: String\n  名前: String\n  年齢: String\n}".to_string())?;
+    let rid = conn.insert_node(
+        "人物".to_string(),
+        r#"{"_id":"1","名前":"山田","年齢":"30"}"#.to_string(),
+    )?;
+
+    let outcome = conn.change_node_field_type(
+        "人物".to_string(),
+        "年齢".to_string(),
+        "Int".to_string(),
+        false,
+    )?;
+    assert!(outcome.contains(r#""applied":true"#), "{outcome}");
+    conn.rename_node_field("人物".to_string(), "名前".to_string(), "氏名".to_string())?;
+
+    let props = conn.get_node_properties(rid)?;
+    assert!(
+        props.contains(r#""年齢":30"#) && props.contains(r#""氏名":"山田""#),
+        "{props}"
+    );
+    conn.patch_node_properties(rid, r#"{"氏名":"田中"}"#.to_string())?;
+    conn.apply_schema(conn.get_schema_text()?)?;
+    Ok(())
+}
