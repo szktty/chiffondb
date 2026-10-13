@@ -114,7 +114,7 @@ node Admin extends User {
 **Allowed changes (validation passes on apply):**
 - Adding node/edge types
 - Adding fields (existing records have that field empty)
-- Removing fields (existing data stays in the property page but is ignored on read)
+- Removing fields (the stored values of that type's records are dropped)
 
 **Forbidden changes (error on apply):**
 - Changing a field's type

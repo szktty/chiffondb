@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removing a field from the schema now drops its stored values from that type's records.
+  Previously they stayed in the records and were still returned by reads.
+
 - Inserting a node no longer slows down as the number of nodes of the same type grows: the label
   index registers a new node on its chain's head page instead of walking the whole chain.
 - The page cache tracks recency in O(1) per access; previously each access scanned the cache, so
@@ -22,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- After a field was removed from the schema, `patch_node_properties` / `patch_edge_properties`
+  rejected every record that still held a value for it (`unknown field`). Such leftover values
+  are now ignored on read and dropped on the next write.
 - On a file-backed database, a schema change or a dynamic label registration made inside a
   transaction was not undone by a rollback.
 - A user type whose name starts with a primitive type name (`Integer`, `StringValue`) could not

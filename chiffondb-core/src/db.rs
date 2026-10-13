@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -33,6 +34,40 @@ pub struct LabelAssignment {
     pub created: bool,
 }
 
+/// Field names declared by each schema-defined type, keyed by type id. A type without a
+/// definition (dynamic label, removed type) has no entry, and its records are left unfiltered.
+#[derive(Debug, Default)]
+struct DeclaredFields {
+    node: HashMap<u16, HashSet<String>>,
+    edge: HashMap<u16, HashSet<String>>,
+}
+
+impl DeclaredFields {
+    /// Drops the keys a record still carries for fields its type no longer declares.
+    fn retain(declared: Option<&HashSet<String>>, props: &mut HashMap<String, Value>) {
+        if let Some(names) = declared {
+            props.retain(|key, _| names.contains(key));
+        }
+    }
+}
+
+/// `DeclaredFields` of the schema identified by `(schema_version, schema_root)`. Bounded by the
+/// schema size, not by the data.
+struct DeclaredFieldsCache {
+    schema_version: u32,
+    schema_root: u32,
+    fields: Arc<DeclaredFields>,
+}
+
+/// One existing type whose field set changes in a schema migration.
+struct FieldPurge {
+    type_id: u16,
+    /// Fields declared both before and after the change; everything else is dropped.
+    keep: HashSet<String>,
+    /// Indexed fields that are going away, whose index entries must be removed (nodes only).
+    dropped_indexed: Vec<PropertyPath>,
+}
+
 pub(crate) struct DbSnapshot {
     pub(crate) topo: TopologyStore,
     pub(crate) file: FileSnapshot,
@@ -45,6 +80,7 @@ pub(crate) struct DbSnapshot {
 pub struct Database {
     pub(crate) file: DatabaseFile,
     pub(crate) topo: TopologyStore,
+    declared_fields: Option<DeclaredFieldsCache>,
 }
 
 impl Database {
@@ -62,6 +98,7 @@ impl Database {
         Ok(Self {
             file,
             topo: TopologyStore::new(),
+            declared_fields: None,
         })
     }
 
@@ -71,6 +108,7 @@ impl Database {
         Ok(Self {
             file,
             topo: TopologyStore::new(),
+            declared_fields: None,
         })
     }
 
@@ -87,6 +125,7 @@ impl Database {
         Ok(Self {
             file,
             topo: TopologyStore::new(),
+            declared_fields: None,
         })
     }
 
@@ -122,6 +161,7 @@ impl Database {
         }
     }
 
+    #[cfg(test)]
     fn get_edge_properties_raw(
         &mut self,
         rid: RecordId,
@@ -164,17 +204,23 @@ impl Database {
         Ok(NodeRid(rid))
     }
 
-    /// Reads node properties.
+    /// Reads node properties. Values stored for fields the node's type no longer declares are
+    /// not returned.
     pub fn get_node_properties(
         &mut self,
         rid: NodeRid,
     ) -> Result<HashMap<String, Value>, GraphError> {
         let rid = rid.0;
         let node = self.topo.read_node(&mut self.file, rid)?;
-        match node.property_ref {
-            None => Ok(HashMap::new()),
-            Some(pref) => PropertyStore::read(&mut self.file, pref),
+        let pref = match node.property_ref {
+            None => return Ok(HashMap::new()),
+            Some(pref) => pref,
+        };
+        let mut props = PropertyStore::read(&mut self.file, pref)?;
+        if let Some(declared) = self.declared_fields()? {
+            DeclaredFields::retain(declared.node.get(&node.node_type_id), &mut props);
         }
+        Ok(props)
     }
 
     /// Updates node properties (overwrites existing values).
@@ -355,17 +401,23 @@ impl Database {
         Ok(EdgeRid(eid))
     }
 
-    /// Reads edge properties.
+    /// Reads edge properties. Values stored for props the edge's type no longer declares are
+    /// not returned.
     pub fn get_edge_properties(
         &mut self,
         rid: EdgeRid,
     ) -> Result<HashMap<String, Value>, GraphError> {
         let rid = rid.0;
         let edge = self.topo.read_edge(&mut self.file, rid)?;
-        match edge.property_ref {
-            None => Ok(HashMap::new()),
-            Some(pref) => PropertyStore::read(&mut self.file, pref),
+        let pref = match edge.property_ref {
+            None => return Ok(HashMap::new()),
+            Some(pref) => pref,
+        };
+        let mut props = PropertyStore::read(&mut self.file, pref)?;
+        if let Some(declared) = self.declared_fields()? {
+            DeclaredFields::retain(declared.edge.get(&edge.edge_type_id), &mut props);
         }
+        Ok(props)
     }
 
     /// Updates edge properties (overwrites existing values).
@@ -453,7 +505,7 @@ impl Database {
                 let rids = index::rids_of_type(&self.topo, &mut self.file, tid)?;
                 let mut result = Vec::new();
                 for rid in rids {
-                    let props = self.get_node_properties_raw(rid)?;
+                    let props = self.get_node_properties(NodeRid(rid))?;
                     result.push((NodeRid(rid), props));
                 }
                 return Ok(result);
@@ -463,7 +515,7 @@ impl Database {
         // No type_name, or schema not applied — full scan
         let mut result = Vec::new();
         for rid in self.topo.live_node_rids(&mut self.file)? {
-            let props = self.get_node_properties_raw(rid)?;
+            let props = self.get_node_properties(NodeRid(rid))?;
             result.push((NodeRid(rid), props));
         }
         Ok(result)
@@ -488,7 +540,7 @@ impl Database {
                     continue;
                 }
             }
-            let props = self.get_edge_properties_raw(rid)?;
+            let props = self.get_edge_properties(EdgeRid(rid))?;
             result.push((EdgeRid(rid), edge.edge_type_id, props));
         }
         Ok(result)
@@ -497,10 +549,236 @@ impl Database {
     // ---- Schema integration ----
 
     /// Parses and validates the schema text, then saves it to the database.
+    ///
+    /// When the field set of an existing type changes, values stored for fields that are not
+    /// declared both before and after the change are dropped from that type's records. This
+    /// removes the data of a deleted field, and keeps a stale value from resurfacing under a
+    /// field that is later re-added with the same name. On error the database is left unchanged.
     pub fn apply_schema(&mut self, schema_text: &str) -> Result<(), GraphError> {
         let ast = crate::schema::parser::parse(schema_text)?;
         crate::schema::validator::validate(&ast)?;
-        crate::schema::store::save_schema(&mut self.file, &ast)
+
+        let (node_purges, edge_purges) = match load_schema(&mut self.file) {
+            Ok(old) => self.plan_field_purges(&old, &ast)?,
+            Err(GraphError::SchemaError(_)) => (Vec::new(), Vec::new()),
+            Err(e) => return Err(e),
+        };
+        if node_purges.is_empty() && edge_purges.is_empty() {
+            return crate::schema::store::save_schema(&mut self.file, &ast);
+        }
+
+        let snapshot = self.take_snapshot();
+        let result = self.save_schema_and_purge(&ast, &node_purges, &edge_purges);
+        if result.is_err() {
+            self.restore_snapshot(snapshot);
+        }
+        result
+    }
+
+    fn save_schema_and_purge(
+        &mut self,
+        ast: &crate::schema::ast::SchemaAst,
+        node_purges: &[FieldPurge],
+        edge_purges: &[FieldPurge],
+    ) -> Result<(), GraphError> {
+        crate::schema::store::save_schema(&mut self.file, ast)?;
+        for purge in node_purges {
+            self.purge_node_fields(purge)?;
+        }
+        if !edge_purges.is_empty() {
+            self.purge_edge_fields(edge_purges)?;
+        }
+        Ok(())
+    }
+
+    /// Lists the types present in both `old` and `new` whose field names differ, as
+    /// `(node purges, edge purges)`.
+    fn plan_field_purges(
+        &mut self,
+        old: &crate::schema::ast::SchemaAst,
+        new: &crate::schema::ast::SchemaAst,
+    ) -> Result<(Vec<FieldPurge>, Vec<FieldPurge>), GraphError> {
+        use crate::schema::ast::{Definition, FieldDef};
+
+        fn fields_of<'a>(
+            ast: &'a crate::schema::ast::SchemaAst,
+            name: &str,
+            node: bool,
+        ) -> Option<&'a [FieldDef]> {
+            ast.definitions.iter().find_map(|d| match d {
+                Definition::Node(n) if node && n.name == name => Some(n.fields.as_slice()),
+                Definition::Edge(e) if !node && e.name == name => Some(e.props.as_slice()),
+                _ => None,
+            })
+        }
+
+        let registry = self.load_schema_registry()?;
+        let mut node_purges = Vec::new();
+        let mut edge_purges = Vec::new();
+        for def in &old.definitions {
+            let (name, old_fields, is_node) = match def {
+                Definition::Node(n) => (n.name.as_str(), n.fields.as_slice(), true),
+                Definition::Edge(e) => (e.name.as_str(), e.props.as_slice(), false),
+            };
+            let Some(new_fields) = fields_of(new, name, is_node) else {
+                continue;
+            };
+            let old_names: HashSet<&str> = old_fields.iter().map(|f| f.name.as_str()).collect();
+            let new_names: HashSet<&str> = new_fields.iter().map(|f| f.name.as_str()).collect();
+            if old_names == new_names {
+                continue;
+            }
+            let type_id = if is_node {
+                registry.node_type_id(name)
+            } else {
+                registry.edge_type_id(name)
+            };
+            let Some(type_id) = type_id else {
+                continue;
+            };
+            let purge = FieldPurge {
+                type_id,
+                keep: old_names
+                    .intersection(&new_names)
+                    .map(|n| n.to_string())
+                    .collect(),
+                dropped_indexed: old_fields
+                    .iter()
+                    .filter(|f| (f.indexed || f.unique) && !new_names.contains(f.name.as_str()))
+                    .map(|f| PropertyPath::Flat(f.name.clone()))
+                    .collect(),
+            };
+            if is_node {
+                node_purges.push(purge);
+            } else {
+                edge_purges.push(purge);
+            }
+        }
+        Ok((node_purges, edge_purges))
+    }
+
+    /// Rewrites every node whose primary type is `purge.type_id` and that carries a key outside
+    /// `purge.keep`.
+    fn purge_node_fields(&mut self, purge: &FieldPurge) -> Result<(), GraphError> {
+        for rid in index::rids_of_type(&self.topo, &mut self.file, purge.type_id)? {
+            let mut node = self.topo.read_node(&mut self.file, rid)?;
+            // The label set also lists nodes carrying this type as an additional label; their
+            // properties belong to another type's definition.
+            if node.node_type_id != purge.type_id {
+                continue;
+            }
+            let Some(old_pref) = node.property_ref else {
+                continue;
+            };
+            let mut props = PropertyStore::read(&mut self.file, old_pref)?;
+            if props.keys().all(|key| purge.keep.contains(key)) {
+                continue;
+            }
+            self.remove_index_entries(purge.type_id, rid, &props, &purge.dropped_indexed)?;
+            props.retain(|key, _| purge.keep.contains(key));
+            node.property_ref = if props.is_empty() {
+                None
+            } else {
+                Some(PropertyStore::write(&mut self.file, &props)?)
+            };
+            self.topo.write_node(&mut self.file, &node)?;
+            PropertyStore::free(&mut self.file, old_pref)?;
+        }
+        Ok(())
+    }
+
+    /// Edge counterpart of `purge_node_fields`. Edges have no per-type set, so all purges share
+    /// one scan.
+    fn purge_edge_fields(&mut self, purges: &[FieldPurge]) -> Result<(), GraphError> {
+        for rid in self.topo.live_edge_rids(&mut self.file)? {
+            let mut edge = self.topo.read_edge(&mut self.file, rid)?;
+            let Some(purge) = purges.iter().find(|p| p.type_id == edge.edge_type_id) else {
+                continue;
+            };
+            let Some(old_pref) = edge.property_ref else {
+                continue;
+            };
+            let mut props = PropertyStore::read(&mut self.file, old_pref)?;
+            if props.keys().all(|key| purge.keep.contains(key)) {
+                continue;
+            }
+            props.retain(|key, _| purge.keep.contains(key));
+            edge.property_ref = if props.is_empty() {
+                None
+            } else {
+                Some(PropertyStore::write(&mut self.file, &props)?)
+            };
+            self.topo.write_edge(&mut self.file, &edge)?;
+            PropertyStore::free(&mut self.file, old_pref)?;
+        }
+        Ok(())
+    }
+
+    /// Removes the tier-2 index entries of `rid` for `paths`, resolved against `props`.
+    fn remove_index_entries(
+        &mut self,
+        type_id: u16,
+        rid: RecordId,
+        props: &HashMap<String, Value>,
+        paths: &[PropertyPath],
+    ) -> Result<(), GraphError> {
+        let mut index = PropertyIndex::new(&mut self.file);
+        for path in paths {
+            let value = match path.resolve(props) {
+                Some(v) if is_indexable_value(v) => v,
+                _ => continue,
+            };
+            let value_bytes = encode_value(value)?;
+            index.remove(
+                IndexKey::new(type_id, &path.display_name(), &value_bytes),
+                rid,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Returns the declared field names per type, or `None` when no schema is stored.
+    fn declared_fields(&mut self) -> Result<Option<Arc<DeclaredFields>>, GraphError> {
+        let schema_version = self.file.header.schema_version;
+        let schema_root = self.file.header.schema_root;
+        if schema_root == 0 {
+            return Ok(None);
+        }
+        if let Some(cache) = &self.declared_fields {
+            if cache.schema_version == schema_version && cache.schema_root == schema_root {
+                return Ok(Some(Arc::clone(&cache.fields)));
+            }
+        }
+        let ast = match load_schema(&mut self.file) {
+            Ok(ast) => ast,
+            Err(GraphError::SchemaError(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let registry = self.load_schema_registry()?;
+        let mut fields = DeclaredFields::default();
+        for def in &ast.definitions {
+            match def {
+                crate::schema::ast::Definition::Node(n) => {
+                    if let Some(id) = registry.node_type_id(&n.name) {
+                        let names = n.fields.iter().map(|f| f.name.clone()).collect();
+                        fields.node.insert(id, names);
+                    }
+                }
+                crate::schema::ast::Definition::Edge(e) => {
+                    if let Some(id) = registry.edge_type_id(&e.name) {
+                        let names = e.props.iter().map(|f| f.name.clone()).collect();
+                        fields.edge.insert(id, names);
+                    }
+                }
+            }
+        }
+        let fields = Arc::new(fields);
+        self.declared_fields = Some(DeclaredFieldsCache {
+            schema_version,
+            schema_root,
+            fields: Arc::clone(&fields),
+        });
+        Ok(Some(fields))
     }
 
     /// Returns a SchemaRegistry built from the schema stored in the database.
@@ -1272,13 +1550,8 @@ impl<'a> DatabaseGraphView<'a> {
         let props = {
             let mut db = self.db.borrow_mut();
             let db = &mut **db;
-            match db.topo.read_node(&mut db.file, id_to_rid(id)) {
-                Ok(node) => match node.property_ref {
-                    Some(pref) => PropertyStore::read(&mut db.file, pref).unwrap_or_default(),
-                    None => HashMap::new(),
-                },
-                Err(_) => HashMap::new(),
-            }
+            db.get_node_properties(NodeRid(id_to_rid(id)))
+                .unwrap_or_default()
         };
         self.node_props.borrow_mut().insert(id, props);
     }
@@ -1292,13 +1565,8 @@ impl<'a> DatabaseGraphView<'a> {
         let props = {
             let mut db = self.db.borrow_mut();
             let db = &mut **db;
-            match db.topo.read_edge(&mut db.file, id_to_rid(id)) {
-                Ok(edge) => match edge.property_ref {
-                    Some(pref) => PropertyStore::read(&mut db.file, pref).unwrap_or_default(),
-                    None => HashMap::new(),
-                },
-                Err(_) => HashMap::new(),
-            }
+            db.get_edge_properties(EdgeRid(id_to_rid(id)))
+                .unwrap_or_default()
         };
         self.edge_props.borrow_mut().insert(id, props);
     }
@@ -1494,7 +1762,9 @@ impl Database {
         let node_rids = self.all_live_node_rids()?;
         for old_rid in node_rids {
             if let Ok(node) = self.topo.read_node(&mut self.file, old_rid) {
-                let props = self.get_node_properties_raw(old_rid).unwrap_or_default();
+                let props = self
+                    .get_node_properties(NodeRid(old_rid))
+                    .unwrap_or_default();
                 let labels = self.get_additional_labels(NodeRid(old_rid))?;
                 let new_rid = dst.insert_node_with_labels(node.node_type_id, labels, props)?;
                 rid_map.insert(old_rid, new_rid);
@@ -1507,7 +1777,9 @@ impl Database {
                 if let (Some(&new_from), Some(&new_to)) =
                     (rid_map.get(&edge.from_node), rid_map.get(&edge.to_node))
                 {
-                    let props = self.get_edge_properties_raw(old_eid).unwrap_or_default();
+                    let props = self
+                        .get_edge_properties(EdgeRid(old_eid))
+                        .unwrap_or_default();
                     let labels = self.get_edge_additional_labels(EdgeRid(old_eid))?;
                     dst.insert_edge_with_labels(
                         edge.edge_type_id,
@@ -1764,6 +2036,8 @@ impl Database {
         // Property lookups scan the topology, so there is no separate index to restore;
         // once topology/WAL are rolled back, find/list/count results follow automatically.
         self.file.restore(snap.file);
+        // A later schema write can reuse the rolled-back version number and root page.
+        self.declared_fields = None;
     }
 
     // ---- Integrity check ----
@@ -5339,5 +5613,233 @@ mod tests {
             matches!(err, GraphError::NodeNotFound(_)),
             "expected NodeNotFound on double-delete, got {err:?}"
         );
+    }
+
+    // ---- Removed fields ----
+
+    const PERSON_FULL: &str = "node Person { id: String  name: String  age: String }";
+    const PERSON_NO_AGE: &str = "node Person { id: String  name: String }";
+
+    fn person_props(age: Value) -> HashMap<String, Value> {
+        HashMap::from([
+            ("id".to_string(), json!("1")),
+            ("name".to_string(), json!("Yamada")),
+            ("age".to_string(), age),
+        ])
+    }
+
+    fn node_type_id(db: &mut Database, name: &str) -> u16 {
+        db.load_schema_registry()
+            .unwrap()
+            .node_type_id(name)
+            .unwrap()
+    }
+
+    #[test]
+    fn removed_field_is_dropped_from_records() {
+        let (mut db, _) = make_db();
+        db.apply_schema(PERSON_FULL).unwrap();
+        let rid = db
+            .insert_node_by_name("Person", person_props(json!("30")))
+            .unwrap();
+
+        db.apply_schema(PERSON_NO_AGE).unwrap();
+
+        assert!(!db.get_node_properties(rid).unwrap().contains_key("age"));
+        let listed = db.list_nodes(Some("Person")).unwrap();
+        assert!(!listed[0].1.contains_key("age"));
+        // The value is gone from storage, not just hidden.
+        assert!(!db
+            .get_node_properties_raw(rid.0)
+            .unwrap()
+            .contains_key("age"));
+
+        db.patch_node_properties(rid, HashMap::from([("name".to_string(), json!("Tanaka"))]))
+            .unwrap();
+        let props = db.get_node_properties(rid).unwrap();
+        assert_eq!(props.get("name"), Some(&json!("Tanaka")));
+        assert_eq!(props.get("id"), Some(&json!("1")));
+    }
+
+    /// A file written before removal purged values still has them in its records.
+    #[test]
+    fn leftover_value_of_removed_field_is_ignored() {
+        let (mut db, _) = make_db();
+        db.apply_schema(PERSON_NO_AGE).unwrap();
+        let type_id = node_type_id(&mut db, "Person");
+        // `insert_node` does not validate, so this plants the leftover value directly.
+        let rid = db.insert_node(type_id, person_props(json!("30"))).unwrap();
+
+        assert!(!db.get_node_properties(rid).unwrap().contains_key("age"));
+        assert!(!db.list_nodes(None).unwrap()[0].1.contains_key("age"));
+
+        db.patch_node_properties(rid, HashMap::from([("name".to_string(), json!("Tanaka"))]))
+            .unwrap();
+        let raw = db.get_node_properties_raw(rid.0).unwrap();
+        assert!(!raw.contains_key("age"));
+        assert_eq!(raw.get("name"), Some(&json!("Tanaka")));
+    }
+
+    #[test]
+    fn readded_field_does_not_resurface_old_value() {
+        let (mut db, _) = make_db();
+        db.apply_schema(PERSON_FULL).unwrap();
+        let rid = db
+            .insert_node_by_name("Person", person_props(json!("30")))
+            .unwrap();
+
+        db.apply_schema(PERSON_NO_AGE).unwrap();
+        db.apply_schema("node Person { id: String  name: String  age: Int }")
+            .unwrap();
+
+        assert!(!db.get_node_properties(rid).unwrap().contains_key("age"));
+        db.patch_node_properties(rid, HashMap::from([("name".to_string(), json!("Tanaka"))]))
+            .unwrap();
+        db.patch_node_properties(rid, HashMap::from([("age".to_string(), json!(30))]))
+            .unwrap();
+        assert_eq!(
+            db.get_node_properties(rid).unwrap().get("age"),
+            Some(&json!(30))
+        );
+    }
+
+    #[test]
+    fn adding_field_drops_leftover_value_of_same_name() {
+        let (mut db, _) = make_db();
+        db.apply_schema(PERSON_NO_AGE).unwrap();
+        let type_id = node_type_id(&mut db, "Person");
+        let rid = db.insert_node(type_id, person_props(json!("30"))).unwrap();
+
+        db.apply_schema("node Person { id: String  name: String  age: Int }")
+            .unwrap();
+
+        let props = db.get_node_properties(rid).unwrap();
+        assert!(!props.contains_key("age"));
+        assert_eq!(props.get("name"), Some(&json!("Yamada")));
+    }
+
+    #[test]
+    fn update_still_rejects_undeclared_field() {
+        let (mut db, _) = make_db();
+        db.apply_schema(PERSON_FULL).unwrap();
+        let rid = db
+            .insert_node_by_name("Person", person_props(json!("30")))
+            .unwrap();
+        db.apply_schema(PERSON_NO_AGE).unwrap();
+
+        let err = db
+            .patch_node_properties(rid, HashMap::from([("age".to_string(), json!("31"))]))
+            .unwrap_err();
+        assert!(matches!(err, GraphError::ValidationError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn removed_edge_prop_is_dropped_from_records() {
+        let (mut db, _) = make_db();
+        let with_note =
+            "node Person { id: String } edge KNOWS { from: Person to: Person props: { since: Int  note: String } }";
+        let without_note =
+            "node Person { id: String } edge KNOWS { from: Person to: Person props: { since: Int } }";
+        db.apply_schema(with_note).unwrap();
+        let id_props = |id: &str| HashMap::from([("id".to_string(), json!(id))]);
+        let a = db.insert_node_by_name("Person", id_props("a")).unwrap();
+        let b = db.insert_node_by_name("Person", id_props("b")).unwrap();
+        let eid = db
+            .insert_edge_by_name(
+                "KNOWS",
+                a,
+                b,
+                HashMap::from([
+                    ("since".to_string(), json!(2020)),
+                    ("note".to_string(), json!("x")),
+                ]),
+            )
+            .unwrap();
+
+        db.apply_schema(without_note).unwrap();
+
+        assert!(!db.get_edge_properties(eid).unwrap().contains_key("note"));
+        assert!(!db.list_edges(Some("KNOWS")).unwrap()[0]
+            .2
+            .contains_key("note"));
+        assert!(!db
+            .get_edge_properties_raw(eid.0)
+            .unwrap()
+            .contains_key("note"));
+        db.patch_edge_properties(eid, HashMap::from([("since".to_string(), json!(2021))]))
+            .unwrap();
+        assert_eq!(
+            db.get_edge_properties(eid).unwrap(),
+            HashMap::from([("since".to_string(), json!(2021))])
+        );
+    }
+
+    #[test]
+    fn removing_indexed_field_removes_its_index_entries() {
+        let (mut db, type_id) = make_db_with_indexed_schema();
+        let rid = db
+            .insert_node_by_name(
+                "User",
+                HashMap::from([
+                    ("email".to_string(), json!("a@x")),
+                    ("name".to_string(), json!("n")),
+                ]),
+            )
+            .unwrap();
+        let path = PropertyPath::from("email");
+
+        db.apply_schema("node User { name: String }").unwrap();
+        db.apply_schema("node User { email: String @index  name: String }")
+            .unwrap();
+
+        let value_bytes = encode_value(&json!("a@x")).unwrap();
+        let key = IndexKey::new(type_id, "email", &value_bytes);
+        assert!(PropertyIndex::new(&mut db.file)
+            .candidates(key)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .find_all_nodes(type_id, &path, &json!("a@x"))
+            .unwrap()
+            .is_empty());
+        assert!(!db.get_node_properties(rid).unwrap().contains_key("email"));
+    }
+
+    /// Properties are validated against the primary type only, so a node that merely carries
+    /// the changed type as an additional label keeps its values.
+    #[test]
+    fn purge_leaves_nodes_of_other_primary_type() {
+        let (mut db, _) = make_db();
+        db.apply_schema(
+            "node Person { id: String  age: String } node Pet { id: String  age: String }",
+        )
+        .unwrap();
+        let props = HashMap::from([
+            ("id".to_string(), json!("p")),
+            ("age".to_string(), json!("3")),
+        ]);
+        let pet = db.insert_node_by_name("Pet", props.clone()).unwrap();
+        db.add_node_label_by_name(pet, "Person").unwrap();
+
+        db.apply_schema("node Person { id: String } node Pet { id: String  age: String }")
+            .unwrap();
+
+        assert_eq!(db.get_node_properties(pet).unwrap(), props);
+    }
+
+    #[test]
+    fn vacuum_drops_leftover_values() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.apply_schema(PERSON_NO_AGE).unwrap();
+        let type_id = node_type_id(&mut db, "Person");
+        db.insert_node(type_id, person_props(json!("30"))).unwrap();
+
+        db.vacuum().unwrap();
+
+        let rid = db.list_nodes(Some("Person")).unwrap()[0].0;
+        assert!(!db
+            .get_node_properties_raw(rid.0)
+            .unwrap()
+            .contains_key("age"));
     }
 }

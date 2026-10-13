@@ -3,7 +3,8 @@
 /// Allowed changes:
 ///   - Adding node/edge types
 ///   - Adding fields
-///   - Removing fields (existing data is retained but ignored on read)
+///   - Removing fields (`Database::apply_schema` drops the stored values; a value left behind by
+///     an older version is ignored on read and dropped on the next write)
 ///
 /// Prohibited changes:
 ///   - Changing a field's type

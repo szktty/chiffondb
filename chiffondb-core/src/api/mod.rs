@@ -237,9 +237,9 @@ impl Connection {
 
     /// Parses, validates, and saves the schema text to the database.
     pub fn apply_schema(&mut self, schema_text: String) -> Result<(), String> {
-        let ast = crate::schema::parser::parse(&schema_text).map_err(|e| e.to_string())?;
-        crate::schema::validator::validate(&ast).map_err(|e| e.to_string())?;
-        crate::schema::store::save_schema(&mut self.db_mut()?.file, &ast).map_err(|e| e.to_string())
+        self.db_mut()?
+            .apply_schema(&schema_text)
+            .map_err(|e| e.to_string())
     }
 
     /// Returns the schema stored in the database as DSL source text.
@@ -1307,6 +1307,33 @@ edge KNOWS {
         let mut conn2 = Connection::open(path.to_string_lossy().into_owned()).expect("reopen");
         assert_eq!(conn2.get_schema_text().expect("schema text"), before);
         assert_eq!(conn2.count_nodes(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn rollback_restores_values_of_removed_field() {
+        let (mut conn, _path) = make_file_connection();
+        let rid = conn
+            .insert_node(
+                "Person".to_string(),
+                r#"{"id": "u1", "name": "Alice"}"#.to_string(),
+            )
+            .expect("insert");
+        let before = conn.get_schema_text().expect("schema text");
+
+        conn.begin_transaction().expect("begin");
+        conn.apply_schema(before.replace("  name: String\n", ""))
+            .expect("remove field");
+        let in_tx = RecordId {
+            page: rid.page,
+            slot: rid.slot,
+        };
+        let props = conn.get_node_properties(in_tx).expect("props in tx");
+        assert!(!props.contains("name"), "{props}");
+        conn.rollback_transaction().expect("rollback");
+
+        assert_eq!(conn.get_schema_text().expect("schema text"), before);
+        let props = conn.get_node_properties(rid).expect("props after rollback");
+        assert!(props.contains("Alice"), "{props}");
     }
 
     // ---- File lock ----
