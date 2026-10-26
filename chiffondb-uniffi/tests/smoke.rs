@@ -142,3 +142,28 @@ fn field_rename_and_type_change() -> Result<(), Box<dyn std::error::Error>> {
     conn.apply_schema(conn.get_schema_text()?)?;
     Ok(())
 }
+
+#[test]
+fn dynamic_labels_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::open_in_memory()?;
+    conn.apply_schema("node Node {\n  title: String\n}\n".to_string())?;
+
+    let a = conn.insert_node("Node".to_string(), r#"{"title":"a"}"#.to_string())?;
+    conn.add_node_label_dynamic(a.clone(), "Idea".to_string())?;
+    let labels = conn.get_node_labels(a.clone())?;
+    assert!(labels.contains("Node") && labels.contains("Idea"), "{labels}");
+    assert_eq!(conn.count_nodes(Some("Idea".to_string()))?, 1);
+
+    conn.remove_node_label(a, "Idea".to_string())?;
+    assert_eq!(conn.count_nodes(Some("Idea".to_string()))?, 0);
+
+    let b = conn.insert_node_with_dynamic_labels(
+        "Node".to_string(),
+        vec!["Place".to_string()],
+        r#"{"title":"b"}"#.to_string(),
+    )?;
+    assert!(conn.get_node_labels(b)?.contains("Place"));
+
+    conn.shutdown()?;
+    Ok(())
+}

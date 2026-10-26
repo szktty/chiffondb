@@ -178,6 +178,29 @@ impl Connection {
         self.with(|c| c.get_node_labels(rid.into()))
     }
 
+    /// Adds a label to a node, registering the name if it is unknown.
+    /// Returns `{id, created}` as a JSON object string.
+    pub fn add_node_label_dynamic(&self, rid: RecordId, label_name: String) -> Result<String> {
+        self.with(|c| c.add_node_label_dynamic(rid.into(), label_name))
+    }
+
+    /// Removes a label from a node (by label name).
+    pub fn remove_node_label(&self, rid: RecordId, label_name: String) -> Result<()> {
+        self.with(|c| c.remove_node_label(rid.into(), label_name))
+    }
+
+    /// Inserts a node of `type_name` carrying `labels`, registering unknown
+    /// label names on the fly.
+    pub fn insert_node_with_dynamic_labels(
+        &self,
+        type_name: String,
+        labels: Vec<String>,
+        props_json: String,
+    ) -> Result<RecordId> {
+        self.with(|c| c.insert_node_with_dynamic_labels(type_name, labels, props_json))
+            .map(|r| RecordId::from(r.rid))
+    }
+
     /// Inserts an edge of `type_name` between two nodes.
     pub fn insert_edge(
         &self,
